@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(py -m pip install pandas openpyxl python-docx)"
+      "Bash(py -m pip install pandas openpyxl python-docx)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }

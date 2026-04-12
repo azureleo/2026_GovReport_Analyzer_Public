@@ -1,6 +1,6 @@
 # LLM 기반 지자체 탄소중립 계획 정보 추출 시스템
 
-지자체 탄소중립 녹색성장 기본계획 PDF를 입력받아, 환경부 가이드라인에 따른 구조화된 Excel 파일을 자동 생성하는 멀티 에이전트 시스템입니다.
+지자체 탄소중립 녹색성장 기본계획 문서(PDF, HWP, HWPX)를 입력받아, 환경부 가이드라인에 따른 구조화된 Excel 파일을 자동 생성하는 멀티 에이전트 시스템입니다.
 
 ---
 
@@ -29,6 +29,7 @@
 
 ### 핵심 기능
 
+- **PDF / HWP / HWPX** 문서 형식 지원
 - PDF 텍스트·표·이미지 동시 분석
 - 환경부 가이드라인 기반 5개 시트 자동 생성
 - 배치 처리 방식으로 500페이지 이상 대용량 PDF 처리 가능
@@ -42,7 +43,7 @@
 본 시스템은 **5개의 전문 에이전트** 가 파이프라인으로 연결된 멀티 에이전트 구조입니다.
 
 ```
-입력 PDF
+입력 문서 (PDF / HWP / HWPX)
     │
     ▼
 ┌─────────────────────────────────────────────────┐
@@ -108,6 +109,7 @@
 └── utils/                    # 공통 유틸리티
     ├── llm_client.py         # Gemini API 래퍼 (JSON 파싱, 재시도 로직)
     ├── pdf_reader.py         # PyMuPDF 기반 PDF 파싱
+    ├── hwp_reader.py         # kordoc 기반 HWP/HWPX 파싱
     └── excel_writer.py       # openpyxl 기반 Excel 생성
 ```
 
@@ -119,6 +121,7 @@
 
 - **Python 3.10 이상**
 - **Google Gemini API 키** ([Google AI Studio](https://aistudio.google.com/)에서 무료 발급 가능)
+- **Node.js 18 이상** (HWP/HWPX 파일 처리 시 필요, PDF만 사용 시 불필요)
 
 ### 패키지 설치
 
@@ -156,7 +159,14 @@ GEMINI_API_KEY=AIzaSy여기에_발급받은_키를_입력
 ### 기본 실행
 
 ```bash
+# PDF 파일
 py main.py "서울특별시_탄소중립계획.pdf"
+
+# HWP 파일
+py main.py "서울특별시_탄소중립계획.hwp"
+
+# HWPX 파일
+py main.py "서울특별시_탄소중립계획.hwpx"
 ```
 
 실행 시 자동으로 `탄소중립_추출결과_YYYYMMDD_HHMMSS.xlsx` 파일이 생성됩니다.
@@ -170,10 +180,10 @@ py main.py "서울특별시_탄소중립계획.pdf" --output "서울_결과.xlsx
 ### 전체 옵션
 
 ```
-사용법: py main.py <pdf_path> [옵션]
+사용법: py main.py <input_path> [옵션]
 
 필수 인수:
-  pdf_path              입력 PDF 파일 경로
+  input_path            입력 문서 파일 경로 (PDF, HWP, HWPX 지원)
 
 선택 옵션:
   -o, --output PATH     출력 Excel 파일 경로
@@ -187,8 +197,11 @@ py main.py "서울특별시_탄소중립계획.pdf" --output "서울_결과.xlsx
 ### 실행 예시
 
 ```bash
-# 기본 실행
+# PDF 기본 실행
 py main.py "서울특별시_탄소중립계획.pdf"
+
+# HWP 파일 실행
+py main.py "서울특별시_탄소중립계획.hwp"
 
 # 출력 경로 지정
 py main.py "경기도_수원시_탄소중립계획.pdf" -o "수원_결과.xlsx"
@@ -311,13 +324,21 @@ YEARS = list(range(2018, 2035))   # 2018~2034년
 
 ## 8. 동작 원리 상세
 
-### STEP 0: PDF 파싱
+### STEP 0: 문서 파싱 (PDF / HWP / HWPX)
 
-PyMuPDF(`fitz`)를 사용하여 PDF 전체를 파싱합니다.
+입력 파일 형식에 따라 적절한 파서를 자동 선택합니다.
 
+**PDF 파일**: PyMuPDF(`fitz`)를 사용
 - **텍스트**: 각 페이지의 본문 텍스트 추출
 - **표**: PDF 내 표 구조를 텍스트 형태로 변환
 - **이미지**: 그래프·표가 포함된 페이지를 PNG로 렌더링 (DPI 150)
+
+**HWP/HWPX 파일**: [kordoc](https://github.com/chrisryugj/kordoc) (Node.js) 를 subprocess로 호출
+- **JSON 모드 우선**: `npx kordoc file.hwp --format json` → 블록 기반 구조화 파싱
+- **Markdown fallback**: JSON 파싱 실패 시 Markdown 모드로 재시도
+- **표 추출**: kordoc의 table 블록 또는 Markdown 표를 HTML로 변환
+- **페이지 분할**: HWP는 물리적 페이지 구분이 없으므로 섹션(제목) 기준으로 논리 분할
+- HWP 5.x (OLE2/CFB) 및 HWPX (ZIP+XML) 형식 모두 지원
 
 ### STEP 1: 가이드라인 로드
 
@@ -394,6 +415,7 @@ openpyxl을 사용하여 5개 시트 Excel 파일을 생성합니다.
 |---|---|
 | **Google Gemini 2.5 Flash Lite** | LLM 텍스트·이미지 분석 |
 | **PyMuPDF (fitz)** | PDF 파싱 (텍스트, 표, 이미지 렌더링) |
+| **kordoc (Node.js)** | HWP/HWPX 파싱 (텍스트, 표 추출) |
 | **openpyxl** | Excel 파일 생성 및 스타일 지정 |
 | **Pillow** | PDF → 이미지 변환 처리 |
 | **python-dotenv** | 환경변수(.env) 관리 |
@@ -422,10 +444,12 @@ openpyxl을 사용하여 5개 시트 Excel 파일을 생성합니다.
 - Gemini 무료 플랜은 분당 호출 수 제한이 있어 처리 속도가 느릴 수 있습니다.
 - 503 오류 발생 시 지수적 백오프로 자동 재시도합니다 (최대 3회).
 
-### PDF 형식
+### 문서 형식
 
 - 텍스트 레이어가 없는 이미지 PDF는 이미지 분석 에이전트만 사용되어 정확도가 낮아집니다.
 - 한글 PDF에 최적화되어 있습니다.
+- HWP/HWPX 파일 처리 시 Node.js 18 이상이 필요합니다. kordoc는 `npx`로 자동 설치됩니다.
+- HWP 파일은 이미지 추출을 지원하지 않으므로 텍스트·표 기반으로만 분석합니다.
 
 ---
 

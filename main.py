@@ -2,12 +2,15 @@
 LLM 기반 지자체 탄소중립 계획 정보 추출 시스템
 
 사용법:
-    python main.py <PDF경로> [--output 출력경로] [--guideline HWP경로] [--api-key API키]
+    python main.py <문서경로> [--output 출력경로] [--guideline HWP경로] [--api-key API키]
+
+지원 형식: PDF, HWP, HWPX
 
 예시:
     python main.py "서울특별시_탄소중립계획.pdf"
+    python main.py "서울특별시_탄소중립계획.hwp"
     python main.py "서울특별시_탄소중립계획.pdf" --output "서울_추출결과.xlsx"
-    python main.py "서울특별시_탄소중립계획.pdf" --api-key "sk-ant-..."
+    python main.py "서울특별시_탄소중립계획.pdf" --api-key "AIza..."
 """
 
 import argparse
@@ -39,10 +42,6 @@ def check_dependencies():
     except ImportError:
         missing.append("pymupdf")
     try:
-        import anthropic
-    except ImportError:
-        missing.append("anthropic")
-    try:
         import openpyxl
     except ImportError:
         missing.append("openpyxl")
@@ -64,8 +63,8 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument(
-        "pdf_path",
-        help="입력 PDF 파일 경로 (지자체 탄소중립 녹색성장 기본계획)",
+        "input_path",
+        help="입력 문서 파일 경로 (PDF, HWP, HWPX 지원)",
     )
     parser.add_argument(
         "--output", "-o",
@@ -116,18 +115,33 @@ def main():
         print("  방법 3: 프로젝트 폴더 .env 파일에 GEMINI_API_KEY=AIza... 작성")
         sys.exit(1)
 
-    # PDF 파일 존재 확인
-    pdf_path = Path(args.pdf_path)
-    if not pdf_path.exists():
-        print(f"[오류] PDF 파일을 찾을 수 없습니다: {pdf_path}")
+    # 입력 파일 존재 확인
+    input_path = Path(args.input_path)
+    if not input_path.exists():
+        print(f"[오류] 입력 파일을 찾을 수 없습니다: {input_path}")
         sys.exit(1)
+
+    # 지원 형식 확인
+    supported_ext = {".pdf", ".hwp", ".hwpx"}
+    if input_path.suffix.lower() not in supported_ext:
+        print(f"[오류] 지원하지 않는 파일 형식: {input_path.suffix}")
+        print(f"  지원 형식: {', '.join(supported_ext)}")
+        sys.exit(1)
+
+    # HWP/HWPX 파일인 경우 Node.js 의존성 확인
+    if input_path.suffix.lower() in (".hwp", ".hwpx"):
+        import shutil
+        if not shutil.which("node"):
+            print("[오류] HWP 파일 처리를 위해 Node.js가 필요합니다.")
+            print("  설치: https://nodejs.org/")
+            sys.exit(1)
 
     # 출력 경로 결정
     if args.output:
         output_path = Path(args.output)
     else:
         date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = pdf_path.parent / f"탄소중립_추출결과_{date_str}.xlsx"
+        output_path = input_path.parent / f"탄소중립_추출결과_{date_str}.xlsx"
 
     # 이미지 분석 설정 override
     if args.no_images:
@@ -135,10 +149,12 @@ def main():
         # 이미지 에이전트가 이미지를 건너뛰도록 render_graph_pages 비활성화
         print("[설정] 이미지·그래프 분석 비활성화")
 
+    file_type = input_path.suffix.upper().lstrip(".")
+
     print("\n" + "=" * 60)
     print("  LLM 기반 탄소중립 계획 정보 추출 시스템")
     print("=" * 60)
-    print(f"  입력 PDF : {pdf_path}")
+    print(f"  입력 파일 ({file_type}): {input_path}")
     print(f"  출력 경로: {output_path}")
     print(f"  가이드라인: {args.guideline or '내장 스키마 사용'}")
     print(f"  재시도 횟수: {args.retries}")
@@ -151,7 +167,7 @@ def main():
 
     try:
         result_path = supervisor.run(
-            pdf_path=pdf_path,
+            input_path=input_path,
             output_path=output_path,
             hwp_path=args.guideline,
             max_pipeline_retries=args.retries,

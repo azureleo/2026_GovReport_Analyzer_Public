@@ -11,6 +11,7 @@ from pathlib import Path
 
 import config
 from utils.pdf_reader import extract_pdf, PDFContent
+from utils.hwp_reader import extract_hwp, is_hwp_file
 from utils import llm_client
 from agents.guideline_agent import GuidelineAgent
 from agents.extractor_agent import ExtractorAgent
@@ -95,25 +96,37 @@ class Supervisor:
 
     def run(
         self,
-        pdf_path: str | Path,
-        output_path: str | Path,
+        input_path: str | Path = None,
+        output_path: str | Path = None,
         hwp_path: str | None = None,
         max_pipeline_retries: int = 2,
+        pdf_path: str | Path = None,  # 하위 호환성
     ) -> Path:
-        pdf_path = Path(pdf_path)
+        # 하위 호환성: pdf_path가 전달되면 input_path로 사용
+        if input_path is None and pdf_path is not None:
+            input_path = pdf_path
+        if input_path is None:
+            raise ValueError("입력 파일 경로를 지정해주세요.")
+
+        input_path = Path(input_path)
         output_path = Path(output_path)
+
+        file_type = "HWP" if is_hwp_file(input_path) else "PDF"
 
         self._log("=" * 60)
         self._log("[감독관] 파이프라인 시작")
-        self._log(f"  - 입력 PDF : {pdf_path}")
+        self._log(f"  - 입력 {file_type}: {input_path}")
         self._log(f"  - 출력 경로: {output_path}")
         self._log("=" * 60)
 
-        # STEP 0: PDF 파싱
-        self._log("\n[감독관] STEP 0: PDF 파싱 중...")
+        # STEP 0: 문서 파싱 (PDF 또는 HWP)
+        self._log(f"\n[감독관] STEP 0: {file_type} 파싱 중...")
         t0 = time.time()
-        pdf_content: PDFContent = extract_pdf(pdf_path, render_graph_pages=True)
-        self._log(f"[감독관] PDF 파싱 완료: {pdf_content.total_pages}페이지 ({time.time()-t0:.1f}초)")
+        if is_hwp_file(input_path):
+            pdf_content: PDFContent = extract_hwp(input_path)
+        else:
+            pdf_content: PDFContent = extract_pdf(input_path, render_graph_pages=True)
+        self._log(f"[감독관] {file_type} 파싱 완료: {pdf_content.total_pages}페이지 ({time.time()-t0:.1f}초)")
 
         # STEP 1: 가이드라인
         self._log("\n[감독관] STEP 1: 가이드라인 에이전트 실행...")
