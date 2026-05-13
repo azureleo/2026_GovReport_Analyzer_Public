@@ -58,7 +58,7 @@ def check_dependencies():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="지자체 탄소중립 기본계획 PDF → 엑셀 정보 추출 시스템",
+        description="지자체 탄소중립 기본계획 문서(PDF/HWP/HWPX) → 엑셀 정보 추출 시스템",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -79,7 +79,7 @@ def main():
     parser.add_argument(
         "--api-key", "-k",
         default=None,
-        help="Anthropic API 키 (환경변수 ANTHROPIC_API_KEY로도 설정 가능)",
+        help="Gemini API 키 (환경변수 GEMINI_API_KEY로도 설정 가능)",
     )
     parser.add_argument(
         "--retries", "-r",
@@ -128,11 +128,18 @@ def main():
         print(f"  지원 형식: {', '.join(supported_ext)}")
         sys.exit(1)
 
+    guideline_path = Path(args.guideline) if args.guideline else None
+    if guideline_path and not guideline_path.exists():
+        print(f"[오류] 가이드라인 파일을 찾을 수 없습니다: {guideline_path}")
+        sys.exit(1)
+
     # HWP/HWPX 파일인 경우 Node.js 의존성 확인
-    if input_path.suffix.lower() in (".hwp", ".hwpx"):
+    needs_node = input_path.suffix.lower() in (".hwp", ".hwpx")
+    needs_node = needs_node or (guideline_path is not None and guideline_path.suffix.lower() in (".hwp", ".hwpx"))
+    if needs_node:
         import shutil
         if not shutil.which("node"):
-            print("[오류] HWP 파일 처리를 위해 Node.js가 필요합니다.")
+            print("[오류] HWP/HWPX 파일 처리를 위해 Node.js가 필요합니다.")
             print("  설치: https://nodejs.org/")
             sys.exit(1)
 
@@ -145,8 +152,6 @@ def main():
 
     # 이미지 분석 설정 override
     if args.no_images:
-        import config as cfg
-        # 이미지 에이전트가 이미지를 건너뛰도록 render_graph_pages 비활성화
         print("[설정] 이미지·그래프 분석 비활성화")
 
     file_type = input_path.suffix.upper().lstrip(".")
@@ -171,6 +176,7 @@ def main():
             output_path=output_path,
             hwp_path=args.guideline,
             max_pipeline_retries=args.retries,
+            include_images=not args.no_images,
         )
         print(f"\n완료! 결과 파일: {result_path}")
         return 0

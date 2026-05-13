@@ -100,6 +100,7 @@ class Supervisor:
         output_path: str | Path = None,
         hwp_path: str | None = None,
         max_pipeline_retries: int = 2,
+        include_images: bool = True,
         pdf_path: str | Path = None,  # 하위 호환성
     ) -> Path:
         # 하위 호환성: pdf_path가 전달되면 input_path로 사용
@@ -125,7 +126,7 @@ class Supervisor:
         if is_hwp_file(input_path):
             pdf_content: PDFContent = extract_hwp(input_path)
         else:
-            pdf_content: PDFContent = extract_pdf(input_path, render_graph_pages=True)
+            pdf_content: PDFContent = extract_pdf(input_path, render_graph_pages=include_images)
         self._log(f"[감독관] {file_type} 파싱 완료: {pdf_content.total_pages}페이지 ({time.time()-t0:.1f}초)")
 
         # STEP 1: 가이드라인
@@ -147,14 +148,17 @@ class Supervisor:
             )
             self._log(extractor.report())
 
-            image_agent = ImageAgent()
             municipality = raw_data.get("municipality_name", "알 수 없음")
-            raw_data = image_agent.extract(
-                pages=pdf_content.pages,
-                text_results=raw_data,
-                municipality=municipality,
-            )
-            self._log(image_agent.report())
+            if include_images:
+                image_agent = ImageAgent()
+                raw_data = image_agent.extract(
+                    pages=pdf_content.pages,
+                    text_results=raw_data,
+                    municipality=municipality,
+                )
+                self._log(image_agent.report())
+            else:
+                self._log("[에이전트2b 이미지분석] 비활성화 (--no-images)")
 
             organizer = OrganizerAgent()
             final_data = organizer.organize(raw_data, pdf_content.full_text[:6000])

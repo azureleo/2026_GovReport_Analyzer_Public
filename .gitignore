@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.env
+
+node_modules/
+npm-debug.log*
+
+.claude/
+
+*.xlsx
+*_결과*.xlsx
+탄소중립_추출결과_*.xlsx
+
+*.tmp
+*.log

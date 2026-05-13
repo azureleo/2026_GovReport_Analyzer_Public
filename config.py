@@ -60,11 +60,37 @@ SUMMARY_ITEMS = [
     "배출유형-전략 간 연결성",
 ]
 
-# PDF 페이지 배치 처리 크기 (클수록 API 호출 감소, 컨텍스트 증가)
-BATCH_SIZE = 10
+# PDF 페이지 배치 처리 크기.
+# 너무 크면 출력 JSON이 길어져 파싱 실패가 늘 수 있어 안정성 위주로 둔다.
+BATCH_SIZE = 15
 
-# 이미지 분석 최대 개수 (너무 많으면 비용·시간 급증)
+# 문서 구조 라우팅 설정
+# 관련 페이지 앞뒤 몇 페이지까지 함께 LLM에 전달할지 결정
+DOCUMENT_ROUTE_CONTEXT_PAGES = 1
+# 시트별 후보 페이지로 선택할 최소 점수
+DOCUMENT_ROUTE_MIN_SCORE = 3
+# 시트별 라우팅 후보 페이지 상한. 너무 넓게 잡히면 비용과 JSON 파싱 실패가 증가한다.
+DOCUMENT_ROUTE_MAX_PAGES = {
+    "vehicle": 80,
+    "energy": 120,
+    "ghg": 220,
+    "strategy": 240,
+    "summary": 60,
+}
+
+# 이미지 분석 최대 개수 (triage 통과 후보 중 상위 N개만 Gemini Vision 분석)
+# 테스트 중에는 50 권장. 최종 산출용으로 더 많이 확인할 때만 100~150으로 올린다.
 MAX_IMAGES = 50
+
+# ChartQA 스타일 이미지 triage 설정
+# True이면 전체 이미지에 대해 로컬 휴리스틱으로 그래프/표/도표 후보를 먼저 선별
+IMAGE_TRIAGE_ENABLED = True
+# triage 점수 기준. 낮출수록 더 많이 분석하고, 높일수록 더 엄격하게 거른다.
+IMAGE_TRIAGE_MIN_SCORE = 5
+# 점수가 낮더라도 페이지 전체 렌더링 이미지는 문맥상 중요하면 보존할지 여부
+IMAGE_TRIAGE_KEEP_RENDERED_CONTEXT = True
+# DePlot 아이디어를 차용해 그래프/차트 이미지를 표 형태 JSON으로 먼저 변환
+IMAGE_CHART_TABLE_EXTRACTION = True
 
 # 이미지 DPI (PDF → 이미지 변환 시)
 IMAGE_DPI = 150

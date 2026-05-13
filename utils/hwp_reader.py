@@ -14,6 +14,7 @@ import logging
 import re
 import shutil
 import subprocess
+import os
 from pathlib import Path
 
 from utils.pdf_reader import PageContent, PDFContent
@@ -21,14 +22,59 @@ from utils.pdf_reader import PageContent, PDFContent
 logger = logging.getLogger(__name__)
 
 
-def _check_node_available() -> bool:
-    """Node.js가 설치되어 있는지 확인"""
-    return shutil.which("node") is not None
+def _project_root() -> Path:
+    """현재 프로젝트 루트 경로."""
+    return Path(__file__).resolve().parents[1]
 
 
-def _check_npx_available() -> bool:
-    """npx가 사용 가능한지 확인"""
-    return shutil.which("npx") is not None
+def _which_cmd(name: str) -> str | None:
+    """
+    Windows에서 subprocess가 바로 실행할 수 있는 명령을 우선 탐색.
+
+    shutil.which("npx")가 npx.ps1을 반환하는 경우가 있는데, shell=False 환경의
+    subprocess는 PowerShell 스크립트를 직접 실행하지 못하므로 .cmd를 우선 사용합니다.
+    """
+    candidates = [name]
+    if os.name == "nt":
+        candidates = [f"{name}.cmd", f"{name}.exe", f"{name}.bat", name]
+
+    for candidate in candidates:
+        found = shutil.which(candidate)
+        if found and not found.lower().endswith(".ps1"):
+            return found
+    return None
+
+
+def _resolve_kordoc_command() -> list[str]:
+    """
+    kordoc 실행 명령을 결정.
+
+    우선순위:
+      1. 프로젝트 로컬 node_modules/.bin/kordoc.cmd
+      2. 전역 kordoc 명령
+      3. npx -y kordoc
+    """
+    bin_dir = _project_root() / "node_modules" / ".bin"
+    local_candidates = ["kordoc.cmd", "kordoc.exe", "kordoc.bat", "kordoc"]
+    for candidate in local_candidates:
+        local = bin_dir / candidate
+        if local.exists():
+            return [str(local)]
+
+    global_kordoc = _which_cmd("kordoc")
+    if global_kordoc:
+        return [global_kordoc]
+
+    npx = _which_cmd("npx")
+    if npx:
+        return [npx, "-y", "kordoc"]
+
+    raise RuntimeError(
+        "kordoc 실행 파일을 찾을 수 없습니다.\n"
+        "  방법 1: 프로젝트 폴더에서 npm install\n"
+        "  방법 2: npm install -g kordoc\n"
+        "  방법 3: Node.js 설치 후 터미널을 새로 열기"
+    )
 
 
 def _run_kordoc_json(file_path: Path) -> dict:
@@ -38,13 +84,7 @@ def _run_kordoc_json(file_path: Path) -> dict:
     Returns:
         dict: kordoc JSON 출력 (blocks, metadata, markdown 등)
     """
-    if not _check_npx_available():
-        raise RuntimeError(
-            "npx를 찾을 수 없습니다. Node.js를 설치해주세요.\n"
-            "  설치: https://nodejs.org/"
-        )
-
-    cmd = ["npx", "-y", "kordoc", str(file_path), "--format", "json"]
+    cmd = _resolve_kordoc_command() + [str(file_path), "--format", "json"]
     logger.info(f"kordoc 실행: {' '.join(cmd)}")
 
     try:
@@ -52,14 +92,14 @@ def _run_kordoc_json(file_path: Path) -> dict:
             cmd,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=300,
             encoding="utf-8",
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError("kordoc 실행 시간 초과 (120초)")
+        raise RuntimeError("kordoc 실행 시간 초과 (300초)")
     except FileNotFoundError:
         raise RuntimeError(
-            "npx를 실행할 수 없습니다. Node.js가 설치되어 있는지 확인해주세요."
+            "kordoc를 실행할 수 없습니다. Node.js와 kordoc 설치 상태를 확인해주세요."
         )
 
     if result.returncode != 0:
@@ -78,13 +118,13 @@ def _run_kordoc_markdown(file_path: Path) -> str:
     kordoc를 Markdown 모드로 실행하여 텍스트 출력을 반환.
     JSON 파싱 실패 시 fallback으로 사용.
     """
-    cmd = ["npx", "-y", "kordoc", str(file_path)]
+    cmd = _resolve_kordoc_command() + [str(file_path)]
 
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=300,
         encoding="utf-8",
     )
 
@@ -169,24 +209,72 @@ def _extract_tables_from_text(text: str) -> list[str]:
     return tables
 
 
+def _table_block_to_markdown(table: dict) -> str:
+    """kordoc table 블록을 Markdown 표 문자열로 변환."""
+    rows = table.get("cells") or []
+    if not rows:
+        return ""
+
+    md_rows: list[str] = []
+    for row in rows:
+        cells = []
+        for cell in row:
+            if isinstance(cell, dict):
+                text = cell.get("text", "")
+            else:
+                text = str(cell)
+            cells.append(re.sub(r"\s+", " ", text).strip())
+        md_rows.append("| " + " | ".join(cells) + " |")
+
+    if len(md_rows) >= 1:
+        col_count = md_rows[0].count("|") - 1
+        separator = "| " + " | ".join(["---"] * col_count) + " |"
+        md_rows.insert(1, separator)
+
+    return "\n".join(md_rows)
+
+
+def _block_to_text(block: dict) -> str:
+    """kordoc JSON block에서 텍스트를 안정적으로 추출."""
+    if not isinstance(block, dict):
+        return ""
+
+    if block.get("content"):
+        return str(block.get("content", "")).strip()
+    if block.get("text"):
+        return str(block.get("text", "")).strip()
+
+    table = block.get("table")
+    if isinstance(table, dict):
+        return _table_block_to_markdown(table)
+
+    return ""
+
+
 def _blocks_to_pages(data: dict) -> list[dict]:
     """
     kordoc JSON 출력의 blocks를 페이지 단위로 그룹핑.
     blocks에 pageIndex가 있으면 사용, 없으면 순차 분할.
     """
     blocks = data.get("blocks", [])
+    markdown = data.get("markdown", "")
     if not blocks:
         # blocks가 없으면 markdown fallback
-        md = data.get("markdown", "")
-        return _split_markdown_into_pages(md)
+        return _split_markdown_into_pages(markdown)
 
-    # pageIndex 기준 그룹핑 시도
+    # pageIndex/pageNumber 기준 그룹핑 시도
     pages_map: dict[int, list] = {}
-    has_page_index = any(b.get("pageIndex") is not None for b in blocks)
+    has_page_index = any(
+        b.get("pageIndex") is not None or b.get("pageNumber") is not None
+        for b in blocks
+    )
 
     if has_page_index:
         for block in blocks:
-            pi = block.get("pageIndex", 0)
+            if block.get("pageNumber") is not None:
+                pi = int(block.get("pageNumber", 1)) - 1
+            else:
+                pi = int(block.get("pageIndex", 0))
             pages_map.setdefault(pi, []).append(block)
     else:
         # pageIndex 없으면 전체를 하나의 페이지로
@@ -200,7 +288,7 @@ def _blocks_to_pages(data: dict) -> list[dict]:
 
         for b in page_blocks:
             btype = b.get("type", "")
-            content = b.get("content", "")
+            content = _block_to_text(b)
 
             if btype == "table":
                 # 표 블록
@@ -216,6 +304,12 @@ def _blocks_to_pages(data: dict) -> list[dict]:
             "tables": tables,
             "page_num": pi + 1,
         })
+
+    # kordoc JSON의 blocks 구조가 버전에 따라 비어 있거나 불완전할 수 있다.
+    # markdown 전문이 훨씬 풍부하면 markdown 기반 분할을 우선 사용한다.
+    block_text_len = sum(len(p.get("text", "")) for p in result)
+    if markdown and len(markdown) > max(block_text_len * 2, 3000):
+        return _split_markdown_into_pages(markdown)
 
     return result
 

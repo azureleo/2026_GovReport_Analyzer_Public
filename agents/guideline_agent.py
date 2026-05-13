@@ -4,13 +4,21 @@
 환경부 「지자체 탄소중립 녹색성장 기본계획 수립 및 추진상황 점검 가이드라인」에 따라
 추출해야 할 정보의 스키마를 정의하고 반환합니다.
 
-HWP 파일을 직접 파싱하기 어려운 환경을 고려하여,
-가이드라인의 핵심 내용을 코드 내에 구조화하였습니다.
-(엑셀 템플릿과 가이드라인 7p, 부록3·4를 기반으로 작성)
+기본 스키마는 코드 내에 내장되어 있으며, HWP 가이드라인 파일이 제공되면
+kordoc 기반 HWP 파서를 통해 문서 내용을 읽고 시트별 보조 지침으로 반영합니다.
 """
 
 import json
+import logging
+import re
+from copy import deepcopy
+from pathlib import Path
+
 import config
+from utils.hwp_reader import extract_hwp, is_hwp_file
+
+
+logger = logging.getLogger(__name__)
 
 
 GUIDELINE_SCHEMA = {
@@ -130,6 +138,109 @@ GUIDELINE_SCHEMA = {
 }
 
 
+_EXTRACTOR_KEY_MAP = {
+    "vehicle": "vehicle_by_use",
+    "energy": "energy_by_use",
+    "ghg": "greenhouse_gas",
+    "strategy": "reduction_strategy",
+    "summary": "summary_card",
+}
+
+
+_GUIDELINE_CONTEXT_RULES = {
+    "vehicle_by_use": [
+        "자동차", "차량", "등록대수", "주행거리", "수송", "활동자료",
+    ],
+    "energy_by_use": [
+        "에너지", "최종에너지", "석유", "도시가스", "전력", "열", "신재생", "toe", "TJ",
+    ],
+    "greenhouse_gas": [
+        "온실가스", "배출량", "흡수", "직접배출", "간접배출", "관리권한", "BAU", "NDC", "목표",
+    ],
+    "reduction_strategy": [
+        "감축", "감축사업", "이행", "추진상황", "실적", "성과지표", "공통", "특화", "부록",
+    ],
+    "summary_card": [
+        "비전", "목표", "전략", "기본계획", "추진방향", "배출유형", "녹색성장",
+    ],
+}
+
+
+def _compact_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    return text
+
+
+def _split_guideline_sentences(text: str) -> list[str]:
+    """가이드라인 전문을 검색 가능한 짧은 조각으로 분할."""
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for raw in text.splitlines():
+        line = _compact_text(raw)
+        if not line:
+            continue
+
+        # 제목/표 캡션 후보는 단독 조각으로도 보존
+        if re.match(r"^(\d+(\.\d+)*|제\s*\d+\s*[장절]|부록|표\s*\d+|그림\s*\d+)", line):
+            if current:
+                chunks.append(" ".join(current))
+                current = []
+                current_len = 0
+            chunks.append(line)
+            continue
+
+        current.append(line)
+        current_len += len(line)
+        if current_len >= 550:
+            chunks.append(" ".join(current))
+            current = []
+            current_len = 0
+
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def _score_guideline_chunk(chunk: str, keywords: list[str]) -> int:
+    score = 0
+    score += sum(3 for kw in keywords if kw in chunk)
+    if any(unit in chunk for unit in ["tCO2", "CO2eq", "천톤", "백만원", "대", "km", "%"]):
+        score += 1
+    if any(term in chunk for term in ["작성", "산정", "기준", "부문", "양식", "항목", "점검"]):
+        score += 1
+    return score
+
+
+def _extract_guideline_context(full_text: str, max_chunks: int = 4) -> dict[str, list[str]]:
+    """시트별로 관련성이 높은 HWP 가이드라인 문맥을 추출."""
+    chunks = _split_guideline_sentences(full_text)
+    result: dict[str, list[str]] = {}
+
+    for schema_key, keywords in _GUIDELINE_CONTEXT_RULES.items():
+        ranked = sorted(
+            ((_score_guideline_chunk(chunk, keywords), chunk) for chunk in chunks),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        selected = []
+        seen = set()
+        for score, chunk in ranked:
+            if score <= 0:
+                break
+            compact = _compact_text(chunk)
+            if not compact or compact in seen:
+                continue
+            seen.add(compact)
+            selected.append(compact[:500])
+            if len(selected) >= max_chunks:
+                break
+        result[schema_key] = selected
+
+    return result
+
+
 class GuidelineAgent:
     """
     에이전트 1: 가이드라인 분석 에이전트
@@ -140,7 +251,39 @@ class GuidelineAgent:
 
     def __init__(self, hwp_path: str | None = None):
         self.hwp_path = hwp_path
-        self.schema = GUIDELINE_SCHEMA
+        self.schema = deepcopy(GUIDELINE_SCHEMA)
+        self.guideline_text = ""
+        self.guideline_context: dict[str, list[str]] = {}
+        self.guideline_loaded = False
+        self.guideline_error = ""
+
+        if hwp_path:
+            self._load_hwp_guideline(hwp_path)
+
+    def _load_hwp_guideline(self, hwp_path: str):
+        """HWP/HWPX 가이드라인을 실제로 파싱해 시트별 보조 지침으로 저장."""
+        path = Path(hwp_path)
+        if not path.exists():
+            self.guideline_error = f"파일 없음: {path}"
+            logger.warning(self.guideline_error)
+            return
+        if not is_hwp_file(path):
+            self.guideline_error = f"지원하지 않는 가이드라인 형식: {path.suffix}"
+            logger.warning(self.guideline_error)
+            return
+
+        try:
+            content = extract_hwp(path)
+            self.guideline_text = content.full_text
+            self.guideline_context = _extract_guideline_context(content.full_text)
+            self.guideline_loaded = bool(self.guideline_text.strip())
+
+            for schema_key, snippets in self.guideline_context.items():
+                if schema_key in self.schema and isinstance(self.schema[schema_key], dict):
+                    self.schema[schema_key]["guideline_context"] = snippets
+        except Exception as exc:
+            self.guideline_error = str(exc)
+            logger.warning(f"가이드라인 HWP 파싱 실패: {exc}")
 
     def get_schema(self) -> dict:
         """추출 스키마 반환"""
@@ -161,11 +304,19 @@ class GuidelineAgent:
         lines.append("\n## 추출 힌트")
         for hint in info.get("extraction_hints", []):
             lines.append(f"- {hint}")
+        guideline_context = info.get("guideline_context", [])
+        if guideline_context:
+            lines.append("\n## HWP 가이드라인에서 추출한 관련 지침")
+            for idx, snippet in enumerate(guideline_context, start=1):
+                lines.append(f"{idx}. {snippet}")
         return "\n".join(lines)
 
     def get_all_prompts(self) -> dict[str, str]:
-        """모든 시트의 추출 프롬프트를 딕셔너리로 반환"""
-        return {key: self.get_extraction_prompt(key) for key in self.schema if key != "description"}
+        """모든 시트의 추출 프롬프트를 extractor 키 기준으로 반환"""
+        return {
+            extractor_key: self.get_extraction_prompt(schema_key)
+            for extractor_key, schema_key in _EXTRACTOR_KEY_MAP.items()
+        }
 
     def report(self) -> str:
         """에이전트 상태 보고"""
@@ -174,5 +325,13 @@ class GuidelineAgent:
             f"[에이전트1 가이드라인] 로드 완료\n"
             f"  - 추출 대상 시트: {len(sheets)}개\n"
             f"  - 시트 목록: {', '.join(sheets)}\n"
-            f"  - HWP 가이드라인 파일: {'있음 (' + self.hwp_path + ')' if self.hwp_path else '없음 (내장 스키마 사용)'}"
+            f"  - HWP 가이드라인 파일: {self._guideline_status()}"
         )
+
+    def _guideline_status(self) -> str:
+        if not self.hwp_path:
+            return "없음 (내장 스키마 사용)"
+        if self.guideline_loaded:
+            total_snippets = sum(len(v) for v in self.guideline_context.values())
+            return f"파싱 완료 ({self.hwp_path}, 관련 지침 {total_snippets}개 반영)"
+        return f"파싱 실패/미반영 ({self.hwp_path}; {self.guideline_error or '원인 미상'})"

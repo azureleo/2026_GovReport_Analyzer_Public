@@ -210,11 +210,44 @@ def _filter_ghg_outliers(rows: list[dict]) -> list[dict]:
     return rows
 
 
+def _maybe_rescale_ghg_value(val: float, median: float) -> float | None:
+    """
+    GHG 값의 천 단위/소수점 파싱 오류를 보정.
+
+    보고서 표에서 25,432.000처럼 표시된 값이 LLM 응답에서 25432000으로
+    붙는 경우가 있다. 이 값은 삭제보다 /1000 보정이 더 타당하다.
+    """
+    if not isinstance(val, (int, float)) or val <= 0:
+        return None
+
+    # 가장 흔한 오류는 "천톤CO2eq" 표의 25,432.000을 25,432,000처럼
+    # 읽는 경우이므로 /1000을 우선한다.
+    preferred = val / 1000
+    if 1 <= preferred <= 100_000:
+        return preferred
+
+    candidates = [val / 10_000, val / 1_000_000]
+    plausible = []
+    for scaled in candidates:
+        # 지자체 GHG 단위로 자주 등장하는 천톤CO2eq 규모.
+        if 1 <= scaled <= 100_000:
+            plausible.append(scaled)
+
+    if not plausible:
+        return None
+
+    if median > 0:
+        # 중앙값과 가장 가까운 스케일을 선택하되, 중앙값이 비율/퍼센트 값으로 오염된
+        # 경우에도 천톤CO2eq로 보이는 값은 보존한다.
+        return min(plausible, key=lambda x: abs(x - median))
+    return plausible[0]
+
+
 def _filter_ghg_outliers_cross_group(rows: list[dict]) -> list[dict]:
     """
     중복 제거 후 종류(현황/전망/목표) 그룹 내 이상치 탐지.
-    그룹 내 모든 연도값의 중앙값 대비 200배 초과 값을 제거.
-    단위 혼재(tCO2eq vs 천tCO2eq)로 인한 대규모 오류 제거.
+    그룹 내 모든 연도값의 중앙값 대비 큰 값은 먼저 천 단위 보정을 시도하고,
+    보정도 불가능한 경우에만 제거한다.
     """
     import statistics
     from collections import defaultdict
@@ -246,6 +279,14 @@ def _filter_ghg_outliers_cross_group(rows: list[dict]) -> list[dict]:
                 continue
             for year, val in list(yearly.items()):
                 if isinstance(val, (int, float)) and val > threshold:
+                    scaled = _maybe_rescale_ghg_value(val, median)
+                    if scaled is not None:
+                        logger.warning(
+                            f"GHG 그룹이상치 스케일 보정: 종류={kind}, 부문={row.get('부문')}, "
+                            f"{year}={val:.0f} → {scaled:g} (그룹중앙값={median:.1f})"
+                        )
+                        yearly[year] = scaled
+                        continue
                     logger.warning(
                         f"GHG 그룹이상치 제거: 종류={kind}, 부문={row.get('부문')}, "
                         f"{year}={val:.0f} (그룹중앙값={median:.1f})"

@@ -9,6 +9,7 @@
 """
 
 import logging
+import re
 
 import config
 from utils.pdf_reader import PageContent
@@ -115,6 +116,48 @@ JSON 형식:
 }
 
 
+# 문서 구조 라우팅용 가중 키워드.
+# Extractor 호출 전에 페이지 단위로 점수를 매겨 "정말 관련 있는 페이지"만 시트별 배치에 넣는다.
+_ROUTE_CONFIGS = {
+    "vehicle": {
+        "strong": ["자동차 등록", "차량 등록", "등록대수", "용도별 자동차", "차종별", "주행거리"],
+        "weak": _SHEET_CONFIGS["vehicle"]["keywords"],
+        "negative": ["설문", "자문회의", "해외", "IPCC"],
+    },
+    "energy": {
+        "strong": ["최종에너지", "에너지 소비", "에너지사용량", "에너지원별", "부문별 에너지", "TJ", "toe"],
+        "weak": _SHEET_CONFIGS["energy"]["keywords"],
+        "negative": ["예산", "재정투자", "설문"],
+    },
+    "ghg": {
+        "strong": [
+            "온실가스 배출량", "배출량 현황", "배출량 전망", "감축목표",
+            "BAU", "NDC", "인벤토리", "관리권한 배출량", "tCO2", "CO2eq",
+        ],
+        "weak": _SHEET_CONFIGS["ghg"]["keywords"],
+        "negative": ["재정투자", "예산", "설문", "교육 프로그램", "COP28"],
+    },
+    "strategy": {
+        "strong": [
+            "부문별 감축", "감축사업", "이행계획", "세부사업", "감축량",
+            "연차별", "성과지표", "공통사업", "특화사업", "추진계획",
+        ],
+        "weak": _SHEET_CONFIGS["strategy"]["keywords"],
+        "negative": ["목차", "표 목차", "그림 목차", "설문"],
+    },
+    "summary": {
+        "strong": ["비전", "추진전략", "기본방향", "감축목표", "핵심전략", "계획의 개요"],
+        "weak": _SHEET_CONFIGS["summary"]["keywords"],
+        "negative": ["표 목차", "그림 목차", "참고문헌", "부록"],
+    },
+}
+
+
+_HEADING_PATTERN = re.compile(
+    r"^\s*((제\s*\d+\s*[장절])|(\d+(\.\d+){0,3})|([ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+[.\s]))"
+)
+
+
 def _build_page_text(pages: list[PageContent]) -> str:
     parts = []
     for page in pages:
@@ -128,6 +171,94 @@ def _build_page_text(pages: list[PageContent]) -> str:
 def _has_keywords(text: str, keywords: list[str]) -> bool:
     """배치 텍스트에 해당 유형의 키워드가 하나라도 있는지 확인"""
     return any(kw in text for kw in keywords)
+
+
+def _page_title_score(text: str, keywords: list[str]) -> int:
+    """페이지 앞부분/제목형 라인에 키워드가 있으면 가중치를 더 준다."""
+    score = 0
+    head = text[:1200]
+    for line in head.splitlines()[:18]:
+        line = line.strip()
+        if not line:
+            continue
+        is_heading = bool(_HEADING_PATTERN.match(line)) or len(line) <= 36
+        if is_heading and any(kw in line for kw in keywords):
+            score += 2
+    return score
+
+
+def _score_page_for_sheet(page: PageContent, sheet_key: str) -> int:
+    """페이지가 특정 시트 추출에 얼마나 관련 있는지 결정론적으로 점수화."""
+    cfg = _ROUTE_CONFIGS[sheet_key]
+    text = page.text or ""
+    table_text = "\n".join(page.tables or [])
+    combined = f"{text}\n{table_text}"
+
+    score = 0
+    score += sum(3 for kw in cfg["strong"] if kw in combined)
+    score += sum(1 for kw in cfg["weak"] if kw in combined)
+    score += _page_title_score(text, cfg["strong"] + cfg["weak"])
+
+    if page.tables:
+        score += 2
+    if sheet_key == "ghg" and re.search(r"\b20(1[8-9]|2[0-9]|3[0-4])\b", combined):
+        score += 1
+    if sheet_key == "strategy" and any(t in combined for t in ["계획(감축량)", "계획(예산)", "계획(지표)", "실적"]):
+        score += 2
+    if sheet_key == "summary" and page.page_number <= 40:
+        score += 1
+
+    score -= sum(2 for kw in cfg["negative"] if kw in combined)
+    return score
+
+
+def _route_pages_by_sheet(
+    pages: list[PageContent],
+    context_pages: int = config.DOCUMENT_ROUTE_CONTEXT_PAGES,
+    min_score: int = config.DOCUMENT_ROUTE_MIN_SCORE,
+) -> dict[str, list[PageContent]]:
+    """
+    전체 문서를 시트별 후보 페이지로 라우팅.
+
+    점수가 높은 페이지와 그 앞뒤 일부 문맥 페이지만 LLM에 전달하여
+    토큰 낭비와 관련 없는 숫자 혼입을 줄인다.
+    """
+    by_num = {p.page_number: p for p in pages}
+    routed: dict[str, list[PageContent]] = {}
+
+    max_pages_by_sheet = getattr(config, "DOCUMENT_ROUTE_MAX_PAGES", {})
+
+    for sheet_key in _SHEET_CONFIGS:
+        scored_pages: list[tuple[int, int]] = []
+        for page in pages:
+            score = _score_page_for_sheet(page, sheet_key)
+            if score >= min_score:
+                scored_pages.append((score, page.page_number))
+
+        # 점수가 높은 핵심 페이지를 먼저 고르고, 이후 앞뒤 문맥 페이지를 붙인다.
+        # 단, summary처럼 광범위하게 매칭되는 시트는 상한을 두어 반복 호출을 막는다.
+        scored_pages.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        max_pages = max_pages_by_sheet.get(sheet_key)
+        anchor_limit = max_pages if isinstance(max_pages, int) and max_pages > 0 else None
+        anchor_nums = [page_num for _, page_num in scored_pages[:anchor_limit]]
+
+        selected_nums: set[int] = set()
+        for page_num in anchor_nums:
+            for n in range(page_num - context_pages, page_num + context_pages + 1):
+                if n in by_num:
+                    selected_nums.add(n)
+
+        if isinstance(max_pages, int) and max_pages > 0 and len(selected_nums) > max_pages:
+            ranked_selected = sorted(
+                selected_nums,
+                key=lambda n: _score_page_for_sheet(by_num[n], sheet_key),
+                reverse=True,
+            )
+            selected_nums = set(ranked_selected[:max_pages])
+
+        routed[sheet_key] = [by_num[n] for n in sorted(selected_nums)]
+
+    return routed
 
 
 class ExtractorAgent:
@@ -149,7 +280,13 @@ class ExtractorAgent:
         resp = llm_client.call_text(prompt, system="당신은 한국 행정구역 명칭 전문가입니다.")
         return llm_client.parse_json(resp).get("municipality_name", "알 수 없음")
 
-    def _extract_sheet(self, sheet_key: str, batch_text: str, municipality: str) -> list:
+    def _extract_sheet(
+        self,
+        sheet_key: str,
+        batch_text: str,
+        municipality: str,
+        guideline_prompt: str = "",
+    ) -> list:
         """단일 시트 유형 추출 (키워드 프리필터 포함)"""
         cfg = _SHEET_CONFIGS[sheet_key]
 
@@ -157,7 +294,21 @@ class ExtractorAgent:
         if not _has_keywords(batch_text, cfg["keywords"]):
             return []
 
-        full_prompt = f"지자체명: {municipality}\n\n[배치 텍스트]\n{batch_text}\n\n{cfg['prompt']}"
+        guideline_block = ""
+        if guideline_prompt:
+            guideline_block = (
+                "\n\n[환경부 HWP 가이드라인 기반 보조 지침]\n"
+                f"{guideline_prompt}\n"
+                "위 지침과 배치 텍스트가 충돌할 경우, 배치 텍스트의 실제 수치와 단위를 우선하되 "
+                "필드 구성과 분류 체계는 가이드라인을 따르세요.\n"
+            )
+
+        full_prompt = (
+            f"지자체명: {municipality}"
+            f"{guideline_block}\n\n"
+            f"[배치 텍스트]\n{batch_text}\n\n"
+            f"{cfg['prompt']}"
+        )
         resp = llm_client.call_text(full_prompt, system=EXTRACTION_SYSTEM)
         parsed = llm_client.parse_json(resp)
 
@@ -185,7 +336,7 @@ class ExtractorAgent:
         self,
         pages: list[PageContent],
         full_text: str,
-        extraction_prompts: dict[str, str],   # guideline_agent 호환용 (미사용)
+        extraction_prompts: dict[str, str],
         batch_size: int = config.BATCH_SIZE,
     ) -> dict:
         print("[에이전트2 텍스트추출] 지자체명 추출 중...")
@@ -193,24 +344,34 @@ class ExtractorAgent:
         self._raw_results["municipality_name"] = municipality
         print(f"[에이전트2 텍스트추출] 지자체명: {municipality}")
 
-        batches = [pages[i:i + batch_size] for i in range(0, len(pages), batch_size)]
-        total_batches = len(batches)
-        print(f"[에이전트2 텍스트추출] 총 {len(pages)}페이지 / {total_batches}배치 / 시트별 분리 호출")
+        routed_pages = _route_pages_by_sheet(pages)
+        route_summary = {k: len(v) for k, v in routed_pages.items()}
+        print(f"[에이전트2 텍스트추출] 문서 구조 라우팅 완료(시트별 후보 페이지 수): {route_summary}")
 
-        for batch_num, batch in enumerate(batches, start=1):
-            batch_text = _build_page_text(batch)
-            page_range = f"p{batch[0].page_number}~{batch[-1].page_number}"
-            batch_counts = {}
+        total_candidate_pages = sum(route_summary.values())
+        print(
+            f"[에이전트2 텍스트추출] 총 {len(pages)}페이지 → "
+            f"시트별 후보 페이지 합계 {total_candidate_pages}개(시트 간 중복 포함) / 시트별 분리 호출"
+        )
 
-            for sheet_key in ["vehicle", "energy", "ghg", "strategy", "summary"]:
-                items = self._extract_sheet(sheet_key, batch_text, municipality)
+        for sheet_key in ["vehicle", "energy", "ghg", "strategy", "summary"]:
+            sheet_pages = routed_pages.get(sheet_key, [])
+            if not sheet_pages:
+                print(f"  [{sheet_key}] 후보 페이지 없음, 건너뜀")
+                continue
+
+            batches = [sheet_pages[i:i + batch_size] for i in range(0, len(sheet_pages), batch_size)]
+            total_batches = len(batches)
+
+            for batch_num, batch in enumerate(batches, start=1):
+                batch_text = _build_page_text(batch)
+                page_nums = [p.page_number for p in batch]
+                page_range = f"p{page_nums[0]}~{page_nums[-1]}" if len(page_nums) > 1 else f"p{page_nums[0]}"
+                guideline_prompt = extraction_prompts.get(sheet_key, "")
+                items = self._extract_sheet(sheet_key, batch_text, municipality, guideline_prompt)
                 self._raw_results[sheet_key].extend(items)
-                batch_counts[sheet_key] = len(items)
-
-            # 하나라도 추출된 경우만 출력 (빈 배치는 생략)
-            non_zero = {k: v for k, v in batch_counts.items() if v > 0}
-            status = str(non_zero) if non_zero else "키워드 없음, 건너뜀"
-            print(f"  배치 {batch_num:>2}/{total_batches} ({page_range}): {status}")
+                status = f"{len(items)}건" if items else "추출 없음"
+                print(f"  [{sheet_key}] 배치 {batch_num:>2}/{total_batches} ({page_range}): {status}")
 
         total = {k: len(self._raw_results[k]) for k in ["vehicle", "energy", "ghg", "strategy", "summary"]}
         print(f"[에이전트2 텍스트추출] 완료. 누적: {total}")
