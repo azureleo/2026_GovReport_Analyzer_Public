@@ -1,7 +1,7 @@
 """
 구조화된 데이터를 엑셀 파일로 작성하는 유틸리티
 
-탄소_출력파일.xlsx 와 동일한 5-시트 구조를 생성합니다.
+추출 결과를 여러 시트의 Excel 파일로 생성합니다.
 """
 
 from pathlib import Path
@@ -255,6 +255,67 @@ def _write_strategy_sheet(wb: openpyxl.Workbook, data: list[dict]):
     })
 
 
+def _write_strategy_qualitative_sheet(wb: openpyxl.Workbook, data: list[dict]):
+    """
+    시트: 감축전략(정성사업)
+    연도별 수치가 없거나 정성사업으로 판단된 감축전략 행을 분리 보관합니다.
+    """
+    ws = wb["감축전략(정성사업)"]
+    headers = config.EXCEL_HEADERS["감축전략(정성사업)"]
+    _apply_header_row(ws, headers)
+    _freeze_panes(ws, "I2")
+
+    base_keys = [
+        "지자체명", "배출유형", "감축전략_부문",
+        "감축사업명", "감축사업명_세부", "구분", "성과지표", "종류",
+    ]
+
+    for row_idx, row_data in enumerate(data, start=2):
+        for col_idx, key in enumerate(base_keys, start=1):
+            val = row_data.get(key, "")
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.border = _thin_border()
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            if row_idx % 2 == 0:
+                cell.fill = _alt_fill()
+
+    _set_column_widths(ws, {
+        1: 20, 2: 10, 3: 14, 4: 28, 5: 28, 6: 8, 7: 28, 8: 14,
+    })
+
+
+def _write_chart_observations_sheet(wb: openpyxl.Workbook, data: list[dict]):
+    """
+    시트: 이미지·그래프 판독결과
+    그래프에서 읽은 값과 본 시트 반영 여부를 추적합니다.
+    """
+    ws = wb["이미지·그래프 판독결과"]
+    headers = config.EXCEL_HEADERS["이미지·그래프 판독결과"]
+    _apply_header_row(ws, headers)
+    _freeze_panes(ws, "G2")
+
+    keys = [
+        "지자체명", "페이지", "대상시트", "그래프유형", "제목", "단위",
+        "항목", "연도", "값", "신뢰도", "반영여부", "근거",
+    ]
+
+    for row_idx, row_data in enumerate(data, start=2):
+        for col_idx, key in enumerate(keys, start=1):
+            val = row_data.get(key, "")
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.border = _thin_border()
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            if row_idx % 2 == 0:
+                cell.fill = _alt_fill()
+            if key == "값" and isinstance(val, (int, float)):
+                cell.number_format = "#,##0.00"
+
+    _set_column_widths(ws, {
+        1: 18, 2: 8, 3: 12, 4: 10, 5: 36, 6: 14,
+        7: 22, 8: 8, 9: 12, 10: 10, 11: 10, 12: 45,
+    })
+
+
 def _write_summary_sheet(wb: openpyxl.Workbook, data: list[dict]):
     """
     시트: 지자체별 요약카드
@@ -307,7 +368,7 @@ def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
     output_path = Path(output_path)
 
     wb = openpyxl.Workbook()
-    # 기본 시트 제거 후 5개 시트 생성
+    # 기본 시트 제거 후 설정된 출력 시트 생성
     del wb[wb.sheetnames[0]]
     for sheet_name in config.EXCEL_HEADERS:
         wb.create_sheet(sheet_name)
@@ -316,6 +377,8 @@ def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
     _write_energy_sheet(wb, extracted_data.get("energy", []))
     _write_ghg_sheet(wb, extracted_data.get("ghg", []))
     _write_strategy_sheet(wb, extracted_data.get("strategy", []))
+    _write_strategy_qualitative_sheet(wb, extracted_data.get("strategy_qualitative", []))
+    _write_chart_observations_sheet(wb, extracted_data.get("chart_observations", []))
     _write_summary_sheet(wb, extracted_data.get("summary", []))
 
     wb.save(str(output_path))

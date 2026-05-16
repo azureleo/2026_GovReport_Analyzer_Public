@@ -8,6 +8,7 @@ PDF에서 추출한 이미지(그래프, 차트, 도표)를 Gemini Vision으로 
 import logging
 import base64
 import io
+import json
 
 import config
 from utils.pdf_reader import PageContent
@@ -38,10 +39,19 @@ DePlot 방식처럼 그래프 이미지를 먼저 선형화된 표 데이터로 
 규칙:
 1. 막대그래프, 꺾은선그래프, 영역그래프, 원그래프, 데이터 표만 변환하세요.
 2. 지도, 사진, 포스터, 목차, 설명용 삽화는 type을 "해당없음"으로 반환하세요.
-3. 단위가 "천 tCO2eq", "천톤CO2eq"이면 unit에 그대로 적고 값은 이미지에 보이는 숫자 그대로 반환하세요.
-4. 25,432.000처럼 천 단위/소수 표기가 있으면 25432000으로 붙이지 말고 25432 또는 25432.0으로 반환하세요.
-5. 수치가 불분명하면 null로 두고 confidence를 낮추세요.
-6. 반드시 JSON만 반환하세요."""
+3. target_sheet는 이미지 내용에 따라 vehicle, energy, ghg, strategy, summary 중 하나로 분류하세요.
+4. 단위가 "천 tCO2eq", "천톤CO2eq"이면 unit에 그대로 적고 값은 이미지에 보이는 숫자 그대로 반환하세요.
+5. 25,432.000처럼 천 단위/소수 표기가 있으면 25432000으로 붙이지 말고 25432 또는 25432.0으로 반환하세요.
+6. 수치가 불분명하면 null로 두고 confidence를 낮추세요.
+7. 막대/선의 값이 축 눈금만으로 추정된 값이면 fields에 {"estimated": true}를 넣고 confidence는 medium 이하로 두세요.
+8. 반드시 JSON만 반환하세요.
+
+시트별 fields 예시:
+- vehicle: {"용도": "승용", "차종": "전기", "대수": 123, "주행거리": 45.1}
+- energy: {"용도": "가정", "전력": 123, "가스": 456, "석유_에너지유": 12}
+- ghg: {"연도": 2030, "항목": "건물", "종류": "목표", "값": 12345}
+- strategy: {"감축전략_부문": "건물", "감축사업명": "공공건물 그린리모델링", "종류": "계획(감축량)", "연도": 2030, "값": 123}
+"""
 
 
 def _is_relevant_image(image: dict) -> bool:
@@ -58,6 +68,11 @@ _CHART_CONTEXT_KEYWORDS = [
 
 _NEGATIVE_CONTEXT_KEYWORDS = [
     "목차", "표 목차", "그림 목차", "사진", "행사", "공모전", "모집", "설문", "자문회의",
+]
+
+_LOCAL_DIRECT_DATA_KEYWORDS = [
+    "배출량", "배출 현황", "배출 전망", "감축목표", "감축사업", "추진계획",
+    "최종에너지", "에너지 소비", "자동차 등록", "주행거리",
 ]
 
 
@@ -155,6 +170,32 @@ def _context_score(page: PageContent) -> tuple[int, list[str]]:
     return score, reasons
 
 
+def _has_reference_context(page: PageContent, image: dict, municipality: str) -> tuple[bool, list[str]]:
+    """
+    보고서 작성 지자체의 직접 데이터가 아니라 참고자료/해외사례/목차성 페이지인지 판별한다.
+
+    이 단계는 Vision 호출 전 비용 절감용 필터다. 지자체명과 직접 데이터 키워드가 함께 있으면
+    참고 키워드가 일부 있어도 보존한다.
+    """
+    text = " ".join([page.text or "", image.get("caption", "") or ""])
+    lowered = text.casefold()
+    hits = [
+        keyword
+        for keyword in config.IMAGE_CHART_REFERENCE_KEYWORDS
+        if keyword.casefold() in lowered
+    ]
+    if not hits:
+        return False, []
+
+    local_names = {municipality, municipality.replace("특별시", ""), municipality.replace("광역시", "")}
+    has_local_name = any(name and name in text for name in local_names)
+    has_direct_data = any(keyword in text for keyword in _LOCAL_DIRECT_DATA_KEYWORDS)
+
+    if has_local_name and has_direct_data:
+        return False, hits
+    return True, hits
+
+
 def _triage_image(page: PageContent, image: dict) -> dict:
     image_score, image_reasons = _image_feature_score(image)
     context_score, context_reasons = _context_score(page)
@@ -207,6 +248,39 @@ def _normalize_chart_year(year) -> str | None:
     if year_int not in config.YEARS:
         return None
     return str(year_int)
+
+
+def _chart_year_int(year) -> int | None:
+    try:
+        return int(float(str(year).strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def _is_reference_chart(analysis: dict) -> bool:
+    """해외사례/참고자료성 이미지는 본 데이터 자동 반영에서 제외."""
+    text = " ".join(
+        str(analysis.get(k, "") or "")
+        for k in ["title", "summary", "unit", "chart_type"]
+    ).casefold()
+    return any(keyword.casefold() in text for keyword in config.IMAGE_CHART_REFERENCE_KEYWORDS)
+
+
+def _is_table_like_chart(analysis: dict) -> bool:
+    return str(analysis.get("chart_type", "")).strip() == "표"
+
+
+def _has_chart_value(item: dict) -> bool:
+    fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+    if item.get("값") is not None:
+        return True
+    return any(
+        fields.get(k) is not None
+        for k in [
+            "대수", "주행거리", "석유_에너지유", "석유_LPG",
+            "석유_비에너지유", "가스", "전력", "열", "신재생",
+        ]
+    )
 
 
 def _infer_chart_kind(item: dict, analysis: dict) -> str:
@@ -274,6 +348,7 @@ class ImageAgent:
 이미지가 그래프/차트/표라면 DePlot 방식으로 다음 JSON 형식의 표 데이터로 변환하세요:
 {{
   "type": "chart_table|해당없음",
+  "target_sheet": "vehicle|energy|ghg|strategy|summary",
   "chart_type": "막대|꺾은선|영역|원|표|복합|기타",
   "title": "그래프/표 제목",
   "unit": "단위 원문",
@@ -284,14 +359,17 @@ class ImageAgent:
       "항목": "계열명 또는 부문명",
       "종류": "현황|전망|목표|기타",
       "값": 12345,
-      "단위": "단위 원문"
+      "단위": "단위 원문",
+      "fields": {{"시트별 추가 필드": "값"}}
     }}
   ],
   "summary": "이미지 내용 요약 1문장",
   "confidence": "high|medium|low"
 }}
 
-탄소중립 보고서의 온실가스 배출량/전망/목표 그래프라면 항목에는 건물, 수송, 폐기물, 기타, 합계 같은 부문명을 넣으세요.
+온실가스 배출량/전망/목표 그래프라면 target_sheet는 ghg, 항목에는 건물, 수송, 폐기물, 기타, 합계 같은 부문명을 넣으세요.
+감축사업별 계획/실적/예산/감축량 표라면 target_sheet는 strategy로 두고 fields에 사업명과 부문을 넣으세요.
+차량 등록대수/주행거리 표라면 target_sheet는 vehicle, 에너지 소비량 표라면 target_sheet는 energy로 두세요.
 이미지에 숫자축만 있고 정확한 값을 읽기 어려우면 대략값을 만들지 말고 null로 반환하세요."""
 
         resp = llm_client.call_vision(image["base64"], prompt, system=CHART_TABLE_SYSTEM)
@@ -308,15 +386,172 @@ class ImageAgent:
         parsed["municipality"] = municipality
         return parsed
 
-    def _merge_image_ghg(self, text_results: dict, analyses: list[dict], municipality: str) -> dict:
+    def _infer_target_sheet(self, analysis: dict) -> str:
+        target = analysis.get("target_sheet")
+        if target in {"vehicle", "energy", "ghg", "strategy", "summary"}:
+            return target
+        text = " ".join(str(analysis.get(k, "")) for k in ["title", "summary", "unit"])
+        if any(k in text for k in ["자동차", "차량", "등록대수", "주행거리"]):
+            return "vehicle"
+        if any(k in text for k in ["에너지", "전력", "도시가스", "석유", "신재생", "TJ", "toe"]):
+            return "energy"
+        if any(k in text for k in ["감축사업", "성과지표", "예산", "이행", "계획(감축량)"]):
+            return "strategy"
+        return "ghg"
+
+    def _confidence_rank(self, confidence: str | None) -> int:
+        return {"low": 1, "medium": 2, "high": 3}.get(str(confidence or "").lower(), 1)
+
+    def _chart_merge_decision(self, analysis: dict, item: dict, target_sheet: str) -> tuple[bool, str, list[str]]:
+        """
+        그래프 판독값의 본 시트 자동 반영 여부를 보수적으로 결정한다.
+
+        Gemini가 confidence를 과하게 high로 주는 경우가 있어, 프로젝트 범위/참고자료/표 여부를
+        코드에서 한 번 더 확인한다.
+        """
+        reasons: list[str] = []
+        min_conf = getattr(config, "IMAGE_CHART_MERGE_MIN_CONFIDENCE", "medium")
+        confidence = analysis.get("confidence", "low")
+        if self._confidence_rank(confidence) < self._confidence_rank(min_conf):
+            reasons.append("신뢰도 기준 미달")
+
+        fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+        if fields.get("estimated") is True:
+            reasons.append("축 기반 추정값")
+        if target_sheet == "summary":
+            reasons.append("요약/참고성 자료")
+        if _is_reference_chart(analysis):
+            reasons.append("참고자료/해외사례")
+        if not _has_chart_value(item):
+            reasons.append("값 없음")
+
+        year_int = _chart_year_int(item.get("연도"))
+        if year_int is None:
+            reasons.append("연도 없음/비숫자")
+        if year_int is not None and year_int not in config.IMAGE_CHART_MERGE_YEARS:
+            reasons.append("연도 범위 외")
+
+        chart_type = str(analysis.get("chart_type", "") or "")
+        if chart_type in {"꺾은선", "막대", "영역", "복합"} and not _is_table_like_chart(analysis):
+            # 그래프 축에서 읽은 값은 감사 시트에는 남기되, 본 데이터 자동 병합은 표보다 훨씬 보수적으로 한다.
+            reasons.append("그래프 추정 후보")
+
+        can_merge = not reasons
+        if can_merge:
+            return True, "high", []
+        if _has_chart_value(item) and not any(r in reasons for r in ["참고자료/해외사례", "연도 범위 외"]):
+            return False, "medium", reasons
+        return False, "low", reasons
+
+    def _can_merge_chart(self, analysis: dict, item: dict, target_sheet: str) -> bool:
+        can_merge, _, _ = self._chart_merge_decision(analysis, item, target_sheet)
+        return can_merge
+
+    def _append_chart_observation(
+        self,
+        text_results: dict,
+        analysis: dict,
+        item: dict,
+        target_sheet: str,
+        merged: bool,
+        confidence: str | None = None,
+        reasons: list[str] | None = None,
+    ):
+        fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+        reason_text = "; ".join(reasons or [])
+        base_evidence = json.dumps(fields, ensure_ascii=False) if fields else analysis.get("summary", "")
+        evidence_text = f"{base_evidence} | {reason_text}" if reason_text else base_evidence
+        evidence = {
+            "지자체명": analysis.get("municipality", ""),
+            "페이지": analysis.get("page_number"),
+            "대상시트": target_sheet,
+            "그래프유형": analysis.get("chart_type", ""),
+            "제목": analysis.get("title", ""),
+            "단위": item.get("단위") or analysis.get("unit", ""),
+            "항목": item.get("항목") or fields.get("용도") or fields.get("감축사업명") or "",
+            "연도": item.get("연도"),
+            "값": item.get("값"),
+            "신뢰도": confidence or analysis.get("confidence", "low"),
+            "반영여부": "반영" if merged else "검토",
+            "근거": evidence_text,
+        }
+        text_results.setdefault("chart_observations", []).append(evidence)
+
+    def _merge_image_results(self, text_results: dict, analyses: list[dict], municipality: str) -> dict:
         existing_ghg = text_results.get("ghg", [])
+        existing_vehicle = text_results.setdefault("vehicle", [])
+        existing_energy = text_results.setdefault("energy", [])
+        existing_strategy = text_results.setdefault("strategy", [])
 
         for analysis in analyses:
             chart_rows = analysis.get("table", []) if analysis.get("type") == "chart_table" else []
+            target_sheet = self._infer_target_sheet(analysis)
             if isinstance(chart_rows, list):
                 for item in chart_rows:
                     if not isinstance(item, dict):
                         continue
+                    fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+                    merged_item = {**fields, **item}
+                    can_merge, final_confidence, merge_reasons = self._chart_merge_decision(analysis, item, target_sheet)
+                    self._append_chart_observation(
+                        text_results, analysis, item, target_sheet,
+                        can_merge, final_confidence, merge_reasons
+                    )
+
+                    if not can_merge:
+                        continue
+                    if target_sheet == "summary":
+                        continue
+
+                    if target_sheet == "vehicle":
+                        existing_vehicle.append({
+                            "지자체명": municipality,
+                            "용도": merged_item.get("용도") or merged_item.get("항목") or "",
+                            "차종": merged_item.get("차종") or "",
+                            "대수": _parse_chart_value(merged_item.get("대수") or merged_item.get("값")),
+                            "주행거리": _parse_chart_value(merged_item.get("주행거리")),
+                        })
+                        continue
+
+                    if target_sheet == "energy":
+                        existing_energy.append({
+                            "지자체명": municipality,
+                            "용도": merged_item.get("용도") or merged_item.get("항목") or "",
+                            "석유_에너지유": _parse_chart_value(merged_item.get("석유_에너지유")),
+                            "석유_LPG": _parse_chart_value(merged_item.get("석유_LPG")),
+                            "석유_비에너지유": _parse_chart_value(merged_item.get("석유_비에너지유")),
+                            "가스": _parse_chart_value(merged_item.get("가스")),
+                            "전력": _parse_chart_value(
+                                merged_item.get("전력")
+                                if merged_item.get("전력") is not None
+                                else (merged_item.get("값") if "전력" in str(merged_item.get("항목", "")) else None)
+                            ),
+                            "열": _parse_chart_value(merged_item.get("열")),
+                            "신재생": _parse_chart_value(merged_item.get("신재생")),
+                        })
+                        continue
+
+                    if target_sheet == "strategy":
+                        year_key = _normalize_chart_year(merged_item.get("연도"))
+                        yearly = {}
+                        if year_key:
+                            val = _parse_chart_value(merged_item.get("값"))
+                            if val is not None:
+                                yearly[year_key] = val
+                        existing_strategy.append({
+                            "지자체명": municipality,
+                            "배출유형": merged_item.get("배출유형") or "직접배출",
+                            "감축전략_부문": merged_item.get("감축전략_부문") or merged_item.get("항목") or "",
+                            "감축사업명": merged_item.get("감축사업명") or analysis.get("title") or "",
+                            "감축사업명_세부": merged_item.get("감축사업명_세부") or "",
+                            "구분": merged_item.get("구분") or "공통",
+                            "성과지표": merged_item.get("성과지표") or "",
+                            "종류": merged_item.get("종류") if merged_item.get("종류") in config.STRATEGY_TYPES else "계획(지표)",
+                            "연도별": yearly,
+                            "근거": f"이미지 p.{analysis.get('page_number')}",
+                        })
+                        continue
+
                     year = item.get("연도")
                     value = item.get("값")
                     if year is None or value is None:
@@ -375,6 +610,9 @@ class ImageAgent:
                     existing_ghg.append(new_row)
 
         text_results["ghg"] = existing_ghg
+        text_results["vehicle"] = existing_vehicle
+        text_results["energy"] = existing_energy
+        text_results["strategy"] = existing_strategy
         return text_results
 
     def extract(self, pages: list[PageContent], text_results: dict, municipality: str) -> dict:
@@ -386,7 +624,18 @@ class ImageAgent:
         ]
 
         if config.IMAGE_TRIAGE_ENABLED:
-            triaged = [_triage_image(page, image) for page, image in raw_images]
+            triaged = []
+            reference_filtered = 0
+            for page, image in raw_images:
+                item = _triage_image(page, image)
+                if config.IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT:
+                    is_reference, ref_hits = _has_reference_context(page, image, municipality)
+                    if is_reference:
+                        item["passed"] = False
+                        item["score"] -= 20
+                        item["reasons"].append("reference_context:" + ",".join(ref_hits[:4]))
+                        reference_filtered += 1
+                triaged.append(item)
             passed = [item for item in triaged if item["passed"]]
             passed.sort(key=lambda item: item["score"], reverse=True)
 
@@ -395,13 +644,15 @@ class ImageAgent:
                 "passed": len(passed),
                 "filtered": len(raw_images) - len(passed),
                 "min_score": config.IMAGE_TRIAGE_MIN_SCORE,
+                "reference_filtered": reference_filtered,
             }
 
             pages_with_images = [(item["page"], item["image"]) for item in passed]
             print(
                 "[에이전트2b 이미지분석] ChartQA-style triage: "
                 f"후보 {len(raw_images)}개 → 통과 {len(pages_with_images)}개 "
-                f"(필터 {len(raw_images) - len(pages_with_images)}개, 기준 {config.IMAGE_TRIAGE_MIN_SCORE})"
+                f"(필터 {len(raw_images) - len(pages_with_images)}개, "
+                f"참고자료 {reference_filtered}개, 기준 {config.IMAGE_TRIAGE_MIN_SCORE})"
             )
             for item in passed[:5]:
                 print(
@@ -445,7 +696,7 @@ class ImageAgent:
         self._image_results = analyses
         print(f"[에이전트2b 이미지분석] 유효 분석 {len(analyses)}개 완료")
 
-        return self._merge_image_ghg(text_results, analyses, municipality)
+        return self._merge_image_results(text_results, analyses, municipality)
 
     def report(self) -> str:
         types: dict[str, int] = {}
@@ -459,6 +710,7 @@ class ImageAgent:
             triage_line = (
                 f"\n  - triage: 원본 {triage.get('raw', 0)}개 → "
                 f"통과 {triage.get('passed', 0)}개 / 필터 {triage.get('filtered', 0)}개"
+                f" / 참고자료 제외 {triage.get('reference_filtered', 0)}개"
             )
         return (
             f"[에이전트2b 이미지분석] 완료\n"

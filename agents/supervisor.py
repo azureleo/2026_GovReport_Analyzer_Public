@@ -17,6 +17,7 @@ from agents.guideline_agent import GuidelineAgent
 from agents.extractor_agent import ExtractorAgent
 from agents.image_agent import ImageAgent
 from agents.organizer_agent import OrganizerAgent
+from agents.gap_fill_agent import GapFillAgent
 from agents.excel_agent import ExcelAgent
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,16 @@ def _quality_score(final_data: dict) -> tuple[float, list[str]]:
     if len(final_data.get("strategy", [])) == 0:
         issues.append("감축 전략 데이터 없음")
         score -= 10
+    qualitative_strategy = final_data.get("strategy_qualitative", [])
+    if qualitative_strategy:
+        issues.append(f"정성/연도값 미기재 감축전략 별도 분리 ({len(qualitative_strategy)}건)")
+
+    vehicle = final_data.get("vehicle", [])
+    if vehicle:
+        count_filled = sum(1 for row in vehicle if row.get("대수") is not None)
+        if count_filled / len(vehicle) < 0.5:
+            issues.append("자동차 대수 채움률 낮음")
+            score -= 5
 
     empty_summary = [s for s in final_data.get("summary", []) if not s.get("내용")]
     if empty_summary:
@@ -162,6 +173,19 @@ class Supervisor:
 
             organizer = OrganizerAgent()
             final_data = organizer.organize(raw_data, pdf_content.full_text[:6000])
+
+            if config.GAP_FILL_ENABLED:
+                gap_fill_agent = GapFillAgent()
+                gap_filled_raw = gap_fill_agent.enhance(
+                    raw_data=raw_data,
+                    cleaned=final_data,
+                    pages=pdf_content.pages,
+                )
+                self._log(gap_fill_agent.report())
+                if gap_filled_raw is not raw_data:
+                    organizer = OrganizerAgent()
+                    final_data = organizer.organize(gap_filled_raw, pdf_content.full_text[:6000])
+
             self._log(organizer.report())
 
             score, issues = _quality_score(final_data)

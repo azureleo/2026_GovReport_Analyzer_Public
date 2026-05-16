@@ -46,6 +46,14 @@ EXCEL_HEADERS = {
         ["지자체명", "배출유형", "감축전략_부문",
          "감축사업명", "감축사업명_세부", "구분", "성과지표", "종류"] + YEARS
     ),
+    "감축전략(정성사업)": [
+        "지자체명", "배출유형", "감축전략_부문",
+        "감축사업명", "감축사업명_세부", "구분", "성과지표", "종류"
+    ],
+    "이미지·그래프 판독결과": [
+        "지자체명", "페이지", "대상시트", "그래프유형", "제목", "단위",
+        "항목", "연도", "값", "신뢰도", "반영여부", "근거"
+    ],
     "지자체별 요약카드": [
         "지자체명", "항목", "내용", "근거"
     ],
@@ -91,6 +99,44 @@ IMAGE_TRIAGE_MIN_SCORE = 5
 IMAGE_TRIAGE_KEEP_RENDERED_CONTEXT = True
 # DePlot 아이디어를 차용해 그래프/차트 이미지를 표 형태 JSON으로 먼저 변환
 IMAGE_CHART_TABLE_EXTRACTION = True
+# 그래프 판독값을 본 시트에 자동 병합할 최소 신뢰도.
+# low는 별도 판독결과 시트에만 남기고 본 데이터에는 병합하지 않는다.
+IMAGE_CHART_MERGE_MIN_CONFIDENCE = "medium"
+# 그래프 판독값 자동 반영 시 허용할 연도. 기준연도 2005 등은 판독결과 시트에만 남긴다.
+IMAGE_CHART_MERGE_YEARS = YEARS
+# 참고자료/해외사례/목차성 이미지는 판독결과에는 남기되 본 시트에는 자동 반영하지 않는다.
+IMAGE_CHART_REFERENCE_KEYWORDS = [
+    "뉴욕시", "런던", "파리", "도쿄", "세계도시", "주요국", "국내외",
+    "COP", "IPCC", "UN", "EU", "OECD", "사례", "동향", "목차",
+    "우리나라", "국가 온실가스", "국가 감축목표", "중앙정부", "NDC",
+]
+# True이면 참고자료/해외사례/목차성 페이지 이미지를 Vision 호출 전에 제외한다.
+IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT = True
+
+# 1차 추출 후 빈칸이 큰 행만 좁은 문맥으로 다시 보완
+GAP_FILL_ENABLED = True
+GAP_FILL_MAX_TARGETS = {
+    "vehicle": 20,
+    "energy": 20,
+    "ghg": 30,
+    "strategy": 60,
+}
+GAP_FILL_CONTEXT_PAGES = 8
+GAP_FILL_TARGET_BATCH_SIZE = 10
+
+# 자동차/에너지처럼 원문 구간이 보고서마다 달라지는 시트는
+# 전체 문서에서 관련 구간을 다시 점수화해 집중 재추출한다.
+FOCUSED_GAP_FILL_ENABLED = True
+FOCUSED_GAP_FILL_CONTEXT_PAGES = 2
+FOCUSED_GAP_FILL_MAX_ANCHORS = {
+    "vehicle": 10,
+    "energy": 10,
+}
+FOCUSED_GAP_FILL_MIN_SCORE = {
+    "vehicle": 5,
+    "energy": 5,
+}
+FOCUSED_GAP_FILL_BATCH_PAGES = 6
 
 # 이미지 DPI (PDF → 이미지 변환 시)
 IMAGE_DPI = 150

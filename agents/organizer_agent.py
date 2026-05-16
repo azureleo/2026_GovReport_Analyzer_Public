@@ -57,6 +57,9 @@ _GAS_TYPES = {"CO2", "CH4", "N2O", "HFCs", "PFCs", "SF6", "NF3", "HFC", "PFC"}
 # 유효한 GHG 데이터 종류
 _VALID_GHG_TYPES = {"현황", "전망", "목표"}
 
+_CHART_STRONG_TYPES = {"표"}
+_CHART_ESTIMATED_TYPES = {"막대", "꺾은선", "영역", "복합"}
+
 # ── 배출유형 정규화 ──
 _TYPE_MAP = {
     "직접 배출": "직접배출", "직접배출량": "직접배출",
@@ -67,6 +70,96 @@ _TYPE_MAP = {
     "배출량": "직접배출",
 }
 
+
+def _chart_year_int(year: Any) -> int | None:
+    try:
+        return int(float(str(year).strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def _is_reference_chart_row(row: dict) -> bool:
+    text = " ".join(
+        str(row.get(k, "") or "")
+        for k in ["제목", "근거", "단위", "그래프유형"]
+    ).casefold()
+    return any(keyword.casefold() in text for keyword in config.IMAGE_CHART_REFERENCE_KEYWORDS)
+
+
+def _clean_chart_observations(raw_rows: list[dict], municipality: str) -> list[dict]:
+    """이미지·그래프 판독 결과를 감사 가능한 후보 목록으로 정제한다."""
+    cleaned: list[dict] = []
+    seen: set[tuple] = set()
+
+    for r in raw_rows:
+        if not isinstance(r, dict):
+            continue
+
+        value = _to_float(r.get("값"))
+        year = _chart_year_int(r.get("연도"))
+        chart_type = str(r.get("그래프유형", "") or "")
+        target_sheet = str(r.get("대상시트", "") or "")
+        title = str(r.get("제목", "") or "").strip()
+        item = str(r.get("항목", "") or "").strip()
+        unit = str(r.get("단위", "") or "").strip()
+        evidence = str(r.get("근거", "") or "").strip()
+
+        key = (
+            r.get("페이지"), target_sheet, chart_type, title,
+            unit, item, year, value,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+
+        reasons: list[str] = []
+        if value is None:
+            reasons.append("값 없음")
+        if year is None:
+            reasons.append("연도 없음/비숫자")
+        if year is not None and year not in config.IMAGE_CHART_MERGE_YEARS:
+            reasons.append("연도 범위 외")
+        if _is_reference_chart_row(r):
+            reasons.append("참고자료/해외사례")
+        if target_sheet == "summary":
+            reasons.append("요약/참고성 자료")
+        if chart_type in _CHART_ESTIMATED_TYPES:
+            reasons.append("그래프 추정 후보")
+        if "estimated" in evidence.lower():
+            reasons.append("축 기반 추정값")
+
+        original_status = str(r.get("반영여부", "") or "")
+        can_remain_merged = original_status == "반영" and not reasons and chart_type in _CHART_STRONG_TYPES
+        status = "반영" if can_remain_merged else "검토"
+
+        if can_remain_merged:
+            confidence = "high"
+        elif value is not None and not _is_reference_chart_row(r):
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        if reasons:
+            reason_text = "; ".join(dict.fromkeys(reasons))
+            evidence = f"{evidence} | {reason_text}" if evidence else reason_text
+
+        cleaned.append({
+            "지자체명": r.get("지자체명") or municipality,
+            "페이지": r.get("페이지"),
+            "대상시트": target_sheet,
+            "그래프유형": chart_type,
+            "제목": title,
+            "단위": unit,
+            "항목": item,
+            "연도": year if year is not None else r.get("연도"),
+            "값": value,
+            "신뢰도": confidence,
+            "반영여부": status,
+            "근거": evidence,
+        })
+
+    return cleaned
+
 # ── GHG 데이터 종류 정규화 ──
 _GHG_DATA_TYPE_MAP = {
     "현황(실적)": "현황", "실적": "현황",
@@ -76,6 +169,7 @@ _GHG_DATA_TYPE_MAP = {
 
 # ── 자동차 용도 정규화 ──
 _VEHICLE_USAGE_MAP = {
+    "전체": "전체", "총계": "전체", "합계": "전체",
     "승용차": "승용", "승용 차": "승용",
     "화물차": "화물", "화물 차": "화물",
     "이륜차": "이륜", "이륜 차": "이륜",
@@ -140,6 +234,8 @@ def _is_code_only_name(name: str) -> bool:
 _VEHICLE_AGGREGATE_TYPES = {"내연기관", "내연기관차"}
 # 내연기관을 구성하는 세분 차종
 _ICE_SUBTYPES = {"경유", "휘발유", "LPG", "CNG"}
+_VALID_VEHICLE_USAGES = {"전체", "승용", "화물", "버스", "이륜", "특수", "승합"}
+_VALID_VEHICLE_TYPES = {"전체", "경유", "휘발유", "LPG", "전기", "수소", "하이브리드", "CNG", "기타", "내연기관", "내연기관차"}
 
 
 def _deduplicate_vehicle(rows: list[dict]) -> list[dict]:
@@ -147,6 +243,13 @@ def _deduplicate_vehicle(rows: list[dict]) -> list[dict]:
     # 용도 정규화
     for r in rows:
         r["용도"] = _VEHICLE_USAGE_MAP.get(r.get("용도", "").strip(), r.get("용도", ""))
+
+    rows = [
+        r for r in rows
+        if r.get("용도") in _VALID_VEHICLE_USAGES
+        and r.get("차종") in _VALID_VEHICLE_TYPES
+        and (r.get("대수") is not None or r.get("주행거리") is not None)
+    ]
 
     # 내연기관(합산) 행 제거: 같은 용도에 경유/휘발유/LPG 세분값이 있으면 제거
     from collections import defaultdict
@@ -190,6 +293,21 @@ def _filter_energy_aggregates(rows: list[dict]) -> list[dict]:
                 continue
         result.append(r)
     return result
+
+
+def _deduplicate_energy(rows: list[dict]) -> list[dict]:
+    """에너지 데이터: 같은 지자체+용도 행을 병합하고 완전 중복을 제거한다."""
+    cols = ["석유_에너지유", "석유_LPG", "석유_비에너지유", "가스", "전력", "열", "신재생"]
+    merged: dict[tuple, dict] = {}
+    for row in rows:
+        key = (row.get("지자체명", ""), row.get("용도", ""))
+        if key not in merged:
+            merged[key] = dict(row)
+            continue
+        for col in cols:
+            if merged[key].get(col) is None and row.get(col) is not None:
+                merged[key][col] = row[col]
+    return list(merged.values())
 
 
 def _filter_ghg_outliers(rows: list[dict]) -> list[dict]:
@@ -319,6 +437,33 @@ def _filter_strategy_code_duplicates(rows: list[dict]) -> list[dict]:
     return result
 
 
+def _split_zero_year_strategy(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """연도값이 없는 감축전략 행을 기존 시트에서 분리해 별도 시트로 보낸다."""
+    quantitative: list[dict] = []
+    qualitative: list[dict] = []
+    marker_patterns = [
+        "정성사업/연도값 원문미기재",
+        "정성사업/연도값 원문 미기재",
+        "정성사업/연도값 미기재",
+        "정성사업/원문미기재",
+    ]
+    for row in rows:
+        yearly = row.get("연도별") or {}
+        filled = sum(1 for year in config.YEARS if yearly.get(str(year)) is not None)
+        if filled == 0:
+            row = dict(row)
+            current = (row.get("성과지표") or "").strip()
+            for marker in marker_patterns:
+                current = current.replace(f"({marker})", "")
+                current = current.replace(marker, "")
+            row["성과지표"] = current.strip()
+            row.pop("보완상태", None)
+            qualitative.append(row)
+        else:
+            quantitative.append(row)
+    return quantitative, qualitative
+
+
 def _to_float(val: Any) -> float | None:
     if val is None:
         return None
@@ -398,6 +543,7 @@ def _local_clean(raw: dict) -> dict:
     # 모든 에너지 수치가 None인 행 제거
     _energy_val_cols = ["석유_에너지유", "석유_LPG", "석유_비에너지유", "가스", "전력", "열", "신재생"]
     energy = [r for r in energy if any(r.get(c) is not None for c in _energy_val_cols)]
+    energy = _deduplicate_energy(energy)
 
     # ── 온실가스: 부문 정규화 + 이상치 제거 + 중복 제거 ──
     ghg_raw = [
@@ -441,6 +587,7 @@ def _local_clean(raw: dict) -> dict:
     ]
     strategy_raw = _filter_strategy_code_duplicates(strategy_raw)
     strategy = _deduplicate(strategy_raw, ["지자체명", "감축사업명", "감축사업명_세부", "종류"])
+    strategy, strategy_qualitative = _split_zero_year_strategy(strategy)
 
     # 요약카드: config.SUMMARY_ITEMS 5개만 유지
     # 파이프 포함 항목 파싱: "부문|내용|근거|전략|연결성" → 첫 부분만 항목으로
@@ -476,10 +623,18 @@ def _local_clean(raw: dict) -> dict:
 
     summary = [summary_pool[item] for item in config.SUMMARY_ITEMS]
 
+    chart_observations = _clean_chart_observations(
+        raw.get("chart_observations", []),
+        municipality,
+    )
+
     return {
         "municipality_name": municipality,
         "vehicle": vehicle, "energy": energy,
-        "ghg": ghg, "strategy": strategy, "summary": summary,
+        "ghg": ghg, "strategy": strategy,
+        "strategy_qualitative": strategy_qualitative,
+        "chart_observations": chart_observations,
+        "summary": summary,
     }
 
 
@@ -545,7 +700,7 @@ class OrganizerAgent:
 
     def get_excel_ready(self) -> dict:
         d = self._final_data
-        return {k: d.get(k, []) for k in ["vehicle", "energy", "ghg", "strategy", "summary"]}
+        return {k: d.get(k, []) for k in ["vehicle", "energy", "ghg", "strategy", "strategy_qualitative", "chart_observations", "summary"]}
 
     def report(self) -> str:
         d = self._final_data
