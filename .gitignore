@@ -1,0 +1,14 @@
+.env
+node_modules/
+__pycache__/
+*.pyc
+*.log
+*.tmp
+
+# 입력/출력 데이터
+*.pdf
+*.hwp
+*.hwpx
+*.xlsx
+outputs/
+data/
