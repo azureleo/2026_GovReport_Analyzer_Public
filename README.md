@@ -307,3 +307,10 @@ Gemini Vision API 수요가 높아 일시적으로 재시도하는 상황입니�
 | HWP/HWPX | kordoc(Node.js) |
 | Excel | openpyxl |
 | 이미지 처리 | Pillow |
+
+## 참고 공식 자료
+
+본 저장소에는 원본 PDF/HWP 문서를 포함하지 않습니다. 실행에 필요한 공식 문서는 아래 배포처에서 다운로드한 뒤 프로젝트 폴더 또는 `data/input/` 폴더에 배치해 사용합니다.
+
+- [환경부 지자체 탄소중립 녹색성장 기본계획 수립 및 추진상황 점검 가이드라인](https://www.mcee.go.kr/home/web/policy_data/read.do;jsessionid=Wc8kwUtnO74561ZFhSVcB7urgRSeGGMaGty2K9aI.mehome1?pagerOffset=260&maxPageItems=10&maxIndexPages=10&searchKey=&searchValue=&menuId=10260&orgCd=&condition.toInpYmd=null&condition.fromInpYmd=null&condition.orderSeqId=7408&condition.rnSeq=317&condition.deleteYn=N&condition.deptNm=null&seq=8324)
+- [지자체별 탄소중립 녹색성장 기본계획 보고서](https://gihoo.or.kr/localGovMeasures.es?mid=a30215000000&bid=0012)
