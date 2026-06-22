@@ -1,49 +1,43 @@
-# LLM 기반 지자체 탄소중립 계획 정보 추출 시스템
+# 가이드라인 기반 지자체 탄소중립 계획 정보 추출 시스템
 
-지자체 탄소중립·녹색성장 기본계획 문서에서 온실가스 배출량, 에너지 사용량, 감축전략, 요약 정보를 추출해 환경부 양식에 가까운 Excel 파일로 정리하는 Python 프로젝트입니다.
+환경부 「지자체 탄소중립 녹색성장 기본계획 수립 및 추진상황 점검 가이드라인」(`carbon_guideline.md`) 기반으로 지자체 보고서에서 **16개 표준 시트**의 구조화 데이터를 추출해 Excel 파일로 정리하는 Python 프로젝트입니다.
 
-PDF를 주 입력으로 지원하며, HWP/HWPX 문서는 `kordoc`를 통해 텍스트와 표를 읽어 기존 파이프라인에 연결합니다.
+PDF를 주 입력으로 지원하며, HWP/HWPX 문서는 `kordoc`를 통해 텍스트와 표를 읽어 파이프라인에 연결합니다.
 
-## 2026년 5월 15일 업데이트
+## 2026년 6월 업데이트: 가이드라인 기반 16시트 구조 전환
 
-기존 파이프라인 구조는 유지하되, 추출 결과의 신뢰도와 정확성을 높이기 위해 다음 개선을 추가했습니다.
+전체 파이프라인을 `carbon_guideline.md` 기반으로 재설계했습니다.
 
-- **문서 구조 라우팅 강화**: 전체 문서를 고정 배치로만 나누지 않고, 자동차·에너지·온실가스·감축전략·요약카드별 관련 페이지를 먼저 선별한 뒤 추출합니다.
-- **HWP/HWPX 입력 보강**: `kordoc` 기반 HWP/HWPX 파서를 연결해 PDF 외 문서도 기존 파이프라인에 투입할 수 있게 했습니다.
-- **자동차·에너지 집중 보완**: 보고서마다 위치가 다른 자동차 등록대수, 주행거리, 최종에너지, 에너지원별 소비량 구간을 전체 문서에서 다시 점수화해 집중 재추출합니다.
-- **Gap-Fill 보완 단계 추가**: 1차 정제 후 자동차, 에너지, GHG, 감축전략의 빈칸이 큰 행만 좁은 문맥으로 다시 조회해 누락값을 보완합니다.
-- **감축전략 정성사업 분리**: 연도별 수치가 없는 정성사업은 삭제하지 않고 `감축전략(정성사업)` 시트로 분리해 보관합니다.
-- **이미지·그래프 판독 시트 추가**: ChartQA-style triage와 DePlot-inspired chart-to-table 변환 결과를 `이미지·그래프 판독결과` 시트에 남기고, 신뢰도와 반영 여부를 함께 기록합니다.
-- **참고자료 이미지 사전 필터링**: `우리나라 NDC`, `주요국`, `세계도시`, `COP`, `IPCC`, `동향`, `목차` 등 지자체 직접 데이터가 아닌 이미지는 Vision 호출 전에 최대한 제외합니다.
-- **그래프 자동 반영 기준 강화**: 연도·값이 명확한 표 기반 행만 본 데이터에 자동 병합하고, 막대·선 그래프 추정값이나 연도 없는 값은 검토 후보로만 남깁니다.
-- **정제 로직 확대**: 부문명, 자동차 용도·차종, 에너지 합산행, 중복 행, 천 단위 스케일 오류, 이상치, JSON 파싱 실패 대응을 보강했습니다.
+- **16개 표준 시트**: 가이드라인 §5.2절에 정의된 문서메타, 계획개요, 지역여건, 배출현황(지역/관리권한), 배출전망, 감축목표, 비전전략, 감축사업목록, 연차별이행계획, 정량감축량, 재정투자계획, 대응기반강화, 이행관리환류, 점검실적, 변경과제 + 시각자료목록
+- **가이드라인 마크다운 직접 로드**: HWP 파싱 없이 `carbon_guideline.md`에서 시트별 보조 지침을 바로 생성
+- **기본 LLM 백엔드**: Gemini API (`GEMINI_API_KEY` 필요)
+- **로컬 에이전트 지원**: `--agent codex` 또는 `--agent claude`로 로컬 CLI 사용 가능
+- **이미지 분석**: 기본 포함. 그래프·표 이미지에서 수치를 추출해 해당 시트에 병합
 
 ## 주요 기능
 
 - PDF, HWP, HWPX 입력 지원
-- 환경부 가이드라인 HWP를 보조 지침으로 반영
-- 문서 구조 라우팅으로 시트별 관련 페이지 선별
-- Gemini JSON 모드 기반 구조화 추출
-- ChartQA-style 이미지 triage로 그래프·표 후보 선별
-- DePlot-inspired chart-to-table 변환으로 그래프 수치 보완
-- 1차 결과의 빈칸을 탐지해 관련 원문만 재조회하는 Gap-Fill 보완
-- 부문명 정규화, 중복 제거, 단위 스케일 보정, 이상치 처리
-- 7개 시트 Excel 자동 생성
+- `carbon_guideline.md` 기반 16개 표준 시트 자동 추출
+- 문서 구조 라우팅으로 시트별 관련 페이지 선별 (16개 카테고리)
+- Gemini API / Codex CLI / Claude Code CLI 선택 가능
+- ChartQA-style 이미지 triage + DePlot-inspired chart-to-table 변환
+- 부문명 정규화, 중복 제거, 달성여부/사업유형 코드 정규화
+- 17개 시트 Excel 자동 생성
 
 ## 처리 흐름
 
 ```mermaid
 flowchart TD
     A["입력 문서<br/>PDF / HWP / HWPX"] --> B["문서 파싱<br/>PyMuPDF / kordoc"]
-    B --> C["가이드라인 로드<br/>내장 스키마 + HWP 보조 지침"]
-    C --> D["문서 구조 라우팅<br/>시트별 후보 페이지 선별"]
-    D --> E["텍스트·표 추출<br/>Gemini JSON"]
+    B --> C["가이드라인 로드<br/>carbon_guideline.md"]
+    C --> D["문서 구조 라우팅<br/>16개 시트별 후보 페이지 선별"]
+    D --> E["텍스트·표 추출<br/>LLM 기반 JSON 추출"]
     B --> F["이미지 후보 추출<br/>PDF 렌더링 이미지"]
     F --> G["ChartQA-style triage"]
     G --> H["DePlot-inspired<br/>chart-to-table 변환"]
     E --> I["정리·정제<br/>Python deterministic logic"]
     H --> I
-    I --> J["Excel 작성<br/>7개 시트"]
+    I --> J["Excel 작성<br/>17개 시트"]
     J --> K["품질 검수<br/>점수 계산 + LLM 리뷰"]
 ```
 
@@ -64,7 +58,7 @@ flowchart TD
 │  ├─ excel_agent.py          # Excel 작성 에이전트
 │  └─ supervisor.py           # 전체 파이프라인 조율
 └─ utils/
-   ├─ llm_client.py           # Gemini 호출, JSON 파싱, 재시도
+   ├─ llm_client.py           # Codex/Claude Code 호출, JSON 파싱, 재시도
    ├─ pdf_reader.py           # PDF 파싱
    ├─ hwp_reader.py           # HWP/HWPX 파싱(kordoc)
    └─ excel_writer.py         # openpyxl 기반 Excel 생성
@@ -103,44 +97,66 @@ npm install
 
 프로젝트는 가능한 경우 전역 `npx`보다 로컬 `node_modules/.bin/kordoc.cmd`를 우선 사용합니다.
 
-### 3. Gemini API 키
+### 3. LLM 백엔드 준비
 
-프로젝트 루트에 `.env` 파일을 만들고 API 키를 입력합니다.
+기본 실행은 **Gemini API**를 사용합니다. `.env` 파일 또는 환경변수에 API 키를 설정하세요.
 
 ```text
 GEMINI_API_KEY=AIzaSy...
 ```
 
-또는 실행 시 `--api-key` 옵션으로 넘길 수 있습니다.
+Gemini SDK가 필요합니다:
+```powershell
+py -m pip install google-genai
+```
+
+로컬 에이전트를 사용하려면 아래처럼 설정합니다:
+
+```text
+LLM_PROVIDER=codex    # Codex CLI 사용
+# 또는
+LLM_PROVIDER=claude   # Claude Code CLI 사용
+```
+
+로컬 에이전트는 각각 로그인 상태가 필요합니다:
+```powershell
+codex --version
+# 또는
+claude --version
+```
 
 ## 실행
 
-### 기본 실행
-
-```powershell
-py main.py "서울특별시_탄소중립계획.pdf"
-```
-
-### 출력 파일명 지정
+### 기본 실행 (Gemini API)
 
 ```powershell
 py main.py "서울특별시_탄소중립계획.pdf" -o "서울_결과.xlsx"
 ```
 
-### 환경부 가이드라인 HWP 반영
+### Codex CLI로 실행
 
 ```powershell
-py main.py "서울특별시_탄소중립계획.pdf" `
-  --guideline "가이드라인.hwp" `
-  -o "서울_결과.xlsx"
+py main.py "서울특별시_탄소중립계획.pdf" --agent codex -o "서울_결과.xlsx"
+```
+
+### Claude Code CLI로 실행
+
+```powershell
+py main.py "서울특별시_탄소중립계획.pdf" --agent claude -o "서울_결과.xlsx"
 ```
 
 ### 이미지 분석 제외
 
-이미지 Vision 호출이 느리거나 비용을 줄이고 싶을 때 사용합니다.
+이미지 Vision 호출이 느리거나 비용을 줄이고 싶을 때:
 
 ```powershell
-py main.py "서울특별시_탄소중립계획.pdf" --no-images
+py main.py "서울특별시_탄소중립계획.pdf" --no-images -o "서울_결과.xlsx"
+```
+
+### 전체 페이지 스캔 (라우팅 누락 방지)
+
+```powershell
+py main.py "서울특별시_탄소중립계획.pdf" --full-scan -o "서울_결과.xlsx"
 ```
 
 ### 주요 옵션
@@ -150,68 +166,66 @@ py main.py "서울특별시_탄소중립계획.pdf" --no-images
 | `input_path` | 입력 문서 경로. PDF, HWP, HWPX 지원 |
 | `-o`, `--output` | 출력 Excel 파일 경로 |
 | `-g`, `--guideline` | 환경부 가이드라인 HWP/HWPX 경로 |
-| `-k`, `--api-key` | Gemini API 키 |
+| `--agent` | LLM 백엔드: `codex`, `claude`, `auto`, `gemini` |
+| `--agent-model` | 로컬 에이전트/레거시 Gemini 모델명 |
+| `--agent-timeout` | 로컬 에이전트 1회 호출 제한 시간(초) |
+| `-k`, `--api-key` | 레거시 Gemini 백엔드용 API 키 |
 | `-r`, `--retries` | 품질 미달 시 파이프라인 재시도 횟수 |
 | `-v`, `--verbose` | 상세 로그 출력 |
 | `--no-images` | 이미지·그래프 분석 생략 |
 
 ## 출력 Excel
 
-생성 파일은 다음 7개 시트로 구성됩니다.
+생성 파일은 `carbon_guideline.md` §5.2절 기준 17개 시트로 구성됩니다.
 
 | 시트 | 내용 |
 |---|---|
-| `용도별 자동차(현황)` | 용도·차종별 차량 대수와 1일 평균 주행거리 |
-| `용도별 에너지(현황)` | 용도별 에너지원 소비량 |
-| `온실가스(현황전망목표)` | 배출유형, 종류, 부문별 연도별 온실가스 값 |
-| `감축전략(계획실적)` | 감축사업별 계획·실적·예산·감축량 |
-| `감축전략(정성사업)` | 연도별 수치가 없거나 정성사업으로 판단된 감축전략 |
-| `이미지·그래프 판독결과` | 막대·선 그래프 등 이미지 판독값, 신뢰도, 반영 여부 |
-| `지자체별 요약카드` | 배출유형, 감축목표, 핵심전략, 연결성 요약 |
+| `00_문서메타` | 계획명, 지자체, 계획기간, 기준연도, 목표연도 |
+| `01_계획개요` | 수립배경, 법적근거, 추진체계, 추진경과 |
+| `02_지역여건` | 자연/인문/경제/에너지 지표 (자동차, 에너지 포함) |
+| `03_배출현황_지역` | GIR 기준 직접·간접·흡수원 배출량 |
+| `04_배출현황_관리권한` | 지자체 관리권한 인벤토리 |
+| `05_배출전망` | BAU 및 시나리오별 전망값 |
+| `06_감축목표` | 총괄·부문별 감축목표, 감축률 |
+| `07_비전전략` | 비전문구, 추진전략, 세부전략 |
+| `08_감축사업목록` | 감축대책 세부사업, 관리번호, 성과지표 |
+| `09_연차별이행계획` | 사업별 연도별 목표물량 및 계획 |
+| `10_정량감축량` | 감축원단위 기반 정량 감축량 산정 |
+| `11_재정투자계획` | 부문별·재원별·연도별 예산 |
+| `12_대응기반강화` | 적응/공유재산/교육/녹색성장 등 8개 영역 |
+| `13_이행관리환류` | 점검체계, 담당조직, 절차, 기한 |
+| `14_점검실적` | 연도별 이행실적, 달성여부, 사업유형 |
+| `15_변경과제_조치` | 변경사업, 미달성 사유, 조치계획 |
+| `16_시각자료목록` | 이미지·그래프 판독 결과 추적 |
 
 ## 현재 주요 설정
 
 `config.py`에서 실행 시간과 정확도 균형을 조정할 수 있습니다.
 
 ```python
-MODEL = "gemini-2.5-flash-lite"
-MAX_TOKENS = 65536
+LLM_PROVIDER = "gemini"        # 기본 백엔드 (gemini/codex/claude/auto)
+LOCAL_AGENT_MODEL = ""
+LOCAL_AGENT_TIMEOUT = 900
+GEMINI_API_KEY = ""            # .env 또는 환경변수로 설정
 
-BATCH_SIZE = 15
+BATCH_SIZE = 15                # 배치당 페이지 수
 
 DOCUMENT_ROUTE_CONTEXT_PAGES = 1
 DOCUMENT_ROUTE_MIN_SCORE = 3
-DOCUMENT_ROUTE_MAX_PAGES = {
-    "vehicle": 80,
-    "energy": 120,
-    "ghg": 220,
-    "strategy": 240,
-    "summary": 60,
-}
 
-MAX_IMAGES = 50
+MAX_IMAGES = None              # 기본값: triage 통과 이미지 전수 분석
 IMAGE_TRIAGE_ENABLED = True
 IMAGE_TRIAGE_MIN_SCORE = 5
-IMAGE_TRIAGE_KEEP_RENDERED_CONTEXT = True
 IMAGE_CHART_TABLE_EXTRACTION = True
 IMAGE_CHART_MERGE_MIN_CONFIDENCE = "medium"
-
-GAP_FILL_ENABLED = True
-GAP_FILL_TARGET_BATCH_SIZE = 10
-
-FOCUSED_GAP_FILL_ENABLED = True
-FOCUSED_GAP_FILL_MAX_ANCHORS = {
-    "vehicle": 10,
-    "energy": 10,
-}
 ```
 
 권장값:
 
-- 테스트 중: `MAX_IMAGES = 30~50`
-- 최종 산출용: `MAX_IMAGES = 100~150`
+- 최종 산출용: 기본값 그대로 `MAX_IMAGES = None`으로 이미지 전수 분석
+- 빠른 테스트: `MAX_IMAGES = 30~50` 또는 `--no-images`
+- 라우팅 누락이 의심될 때: `--full-scan` 또는 `FULL_DOCUMENT_SCAN=1`
 - JSON 파싱 실패가 잦을 때: `BATCH_SIZE = 10~15`
-- API 호출 수를 줄이고 싶을 때: `BATCH_SIZE = 20~30`, 단 긴 JSON 실패 가능성 증가
 
 ## 동작 방식
 
@@ -225,7 +239,7 @@ PDF는 PyMuPDF로 텍스트, 표, 이미지 후보를 추출합니다. HWP/HWPX�
 
 ### 텍스트 추출
 
-전체 문서를 그대로 LLM에 넣지 않고, 시트별로 관련성이 높은 후보 페이지를 먼저 고릅니다. 이후 후보 페이지를 `BATCH_SIZE` 단위로 묶어 Gemini JSON 모드로 호출합니다.
+전체 문서를 그대로 LLM에 넣지 않고, 시트별로 관련성이 높은 후보 페이지를 먼저 고릅니다. 이후 후보 페이지를 `BATCH_SIZE` 단위로 묶어 선택된 로컬 에이전트에 JSON 전용 프롬프트로 전달합니다.
 
 라우팅 로그의 후보 페이지 수와 최종 추출 행 수는 다른 값입니다.
 
@@ -238,17 +252,20 @@ PDF는 PyMuPDF로 텍스트, 표, 이미지 후보를 추출합니다. HWP/HWPX�
 
 ### 이미지 분석
 
-이미지가 많은 PDF에서는 모든 이미지를 Vision API에 보내지 않습니다.
+이미지가 많은 PDF에서도 기본값은 `MAX_IMAGES=None`이므로 triage 통과 이미지를 전수 분석합니다.
+속도 때문에 일부만 확인해야 하는 경우에만 `--max-images N` 또는 `MAX_IMAGES=N`을 명시합니다.
 
 1. 로컬 triage로 차트·표 가능성이 높은 이미지 선별
-2. `우리나라 NDC`, `주요국`, `세계도시`, `COP`, `IPCC`, `동향`, `목차` 등 지자체 직접 데이터가 아닌 참고자료성 페이지 제외
-3. 남은 후보 중 상위 `MAX_IMAGES`개만 Gemini Vision 호출
-4. 그래프는 `chart_table` 형태로 변환
-5. 변환된 표를 `이미지·그래프 판독결과` 시트에 기록
-6. 중복 행을 제거하고 연도 범위, 참고자료 여부, 값 존재 여부를 재검증
-7. 연도와 값이 명확한 표 기반 고신뢰 행만 본 데이터에 병합하고, 막대·선 그래프 추정값은 검토 후보로 보관
+2. 같은 페이지의 embedded 이미지가 전체 페이지 렌더에 포함되면 페이지 렌더 1장으로 대표해 중복 Vision 호출을 줄임
+3. `우리나라 NDC`, `주요국`, `세계도시`, `COP`, `IPCC`, `동향`, `목차` 등 지자체 직접 데이터가 아닌 참고자료성 페이지 제외
+4. 남은 후보를 전수 분석하되, `MAX_IMAGES`가 명시된 경우에만 상위 N개로 제한
+5. 그래프는 `chart_table` 형태로 변환
+6. 변환된 표를 `이미지·그래프 판독결과` 시트에 기록
+7. 중복 행을 제거하고 연도 범위, 참고자료 여부, 값 존재 여부를 재검증
+8. 연도와 값이 명확한 표 기반 고신뢰 행만 본 데이터에 병합하고, 막대·선 그래프 추정값은 검토 후보로 보관
+9. Vision이 유효 차트로 판독하지 못한 페이지도 페이지 렌더/표 주변 텍스트에서 확인되는 수치는 검토 후보로 남김
 
-Gemini Vision에서 `503 UNAVAILABLE`이 발생하면 서버 수요 증가로 인한 일시 지연일 수 있으며, 자동 재시도합니다.
+로컬 에이전트 호출이 실패하거나 타임아웃되면 설정된 재시도 횟수만큼 다시 실행합니다.
 
 ### 정리·정제
 
@@ -265,11 +282,11 @@ Gemini Vision에서 `503 UNAVAILABLE`이 발생하면 서버 수요 증가로 �
 
 ### 빈칸 보완
 
-1차 정제 후 자동차 대수/주행거리, 에너지 소비량, GHG 연도값, 감축전략 연도값이 크게 비어 있는 행을 찾습니다. 보완 대상 행과 관련 원문 페이지만 다시 Gemini에 보내 후보 값을 추가한 뒤, Organizer를 한 번 더 통과시켜 기존 중복 병합 로직으로 합칩니다.
+1차 정제 후 자동차 대수/주행거리, 에너지 소비량, GHG 연도값, 감축전략 연도값이 크게 비어 있는 행을 찾습니다. 보완 대상 행과 관련 원문 페이지만 다시 로컬 에이전트에 보내 후보 값을 추가한 뒤, Organizer를 한 번 더 통과시켜 기존 중복 병합 로직으로 합칩니다.
 
 자동차와 에너지는 보고서마다 위치가 다르므로 특정 페이지 번호에 의존하지 않습니다. `자동차 등록대수`, `연료별 자동차`, `주행거리`, `최종에너지`, `에너지원별 소비량`, `부문별 최종에너지` 같은 키워드로 전체 문서를 다시 점수화하고, 점수가 높은 구간만 집중 재분석합니다. 원문이 용도별 교차표가 아니라 연료별 총량만 제공하면 `용도=전체`로 기록해 잘못된 용도에 억지 배정하지 않습니다.
 
-감축전략에서 연도값을 끝내 찾지 못한 행은 기존 `감축전략(계획실적)` 시트에서 제외하고 `감축전략(정성사업)` 시트로 분리합니다. 별도 상태 문구를 셀에 반복해서 적지 않고, 원문에서 확인된 성과지표만 유지합니다. 이 작업은 이미 추출된 행을 나누는 후처리이므로 API 호출 수에는 영향을 주지 않습니다.
+감축전략에서 연도값을 끝내 찾지 못한 행은 기존 `감축전략(계획실적)` 시트에서 제외하고 `감축전략(정성사업)` 시트로 분리합니다. 별도 상태 문구를 셀에 반복해서 적지 않고, 원문에서 확인된 성과지표만 유지합니다. 이 작업은 이미 추출된 행을 나누는 후처리이므로 에이전트 호출 수에는 영향을 주지 않습니다.
 
 ## 자주 발생하는 로그
 
@@ -279,11 +296,11 @@ Gemini Vision에서 `503 UNAVAILABLE`이 발생하면 서버 수요 증가로 �
 
 ### `JSON 파싱 실패`
 
-Gemini 응답이 길거나 중간에 잘려 JSON 구조가 깨진 경우입니다. `BATCH_SIZE`를 낮추면 완화됩니다.
+로컬 에이전트 응답이 길거나 JSON 외 설명이 섞여 구조가 깨진 경우입니다. `BATCH_SIZE`를 낮추면 완화됩니다.
 
-### `Vision 오류: 503 UNAVAILABLE`
+### `로컬 에이전트 실행 실패`
 
-Gemini Vision API 수요가 높아 일시적으로 재시도하는 상황입니다. 코드 오류라기보다 외부 API 혼잡에 가깝습니다.
+Codex/Claude Code CLI 설치, 로그인 상태, `LLM_PROVIDER`, `CODEX_COMMAND`, `CLAUDE_COMMAND` 값을 확인하세요. 호출이 너무 오래 걸리면 `LOCAL_AGENT_TIMEOUT` 또는 `--agent-timeout`을 늘릴 수 있습니다.
 
 ### `MuPDF error: syntax error`
 
@@ -295,14 +312,14 @@ Gemini Vision API 수요가 높아 일시적으로 재시도하는 상황입니�
 - 스캔본 PDF처럼 텍스트 레이어가 약한 문서는 정확도가 낮습니다.
 - HWP 입력은 현재 텍스트·표 중심이며 이미지 추출은 지원하지 않습니다.
 - 지도형 시각화는 일반 그래프보다 수치 추출 신뢰도가 낮습니다.
-- API 속도와 비용은 Gemini 서버 상태, 이미지 분석 개수, 배치 크기에 영향을 받습니다.
+- 로컬 에이전트 응답 속도는 선택한 CLI, 모델, 이미지 분석 개수, 배치 크기에 영향을 받습니다.
 
 ## 개발 환경
 
 | 항목 | 내용 |
 |---|---|
 | 언어 | Python 3.10+ |
-| LLM | Google Gemini API (`google-genai`) |
+| LLM | Codex CLI / Claude Code CLI 로컬 에이전트 |
 | PDF | PyMuPDF |
 | HWP/HWPX | kordoc(Node.js) |
 | Excel | openpyxl |

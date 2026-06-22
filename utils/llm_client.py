@@ -1,97 +1,395 @@
 """
-Gemini API 공통 래퍼 (google-genai SDK)
+LLM/로컬 에이전트 공통 래퍼.
 
-모든 에이전트가 이 모듈을 통해 Gemini를 호출합니다.
-- call_text()  : JSON 강제 출력 모드 (response_mime_type=application/json)
-- call_vision(): 이미지+텍스트, JSON 강제 출력
-- Rate limit / 503 자동 재시도 포함
+기본 실행 경로는 Gemini API가 아니라 로컬 에이전트 CLI입니다.
+- call_text()  : 텍스트 프롬프트를 Codex/Claude Code 같은 로컬 에이전트에 전달
+- call_vision(): 이미지 파일을 임시로 저장한 뒤 로컬 에이전트에 첨부/경로 전달
+- call_vision_batch(): 여러 이미지를 한 번에 첨부해 전수 분석 호출 수를 줄임
+- parse_json() : 에이전트 응답에서 JSON만 안전하게 파싱
+
+환경변수/CLI(main.py)로 선택 가능한 백엔드:
+- LLM_PROVIDER=codex  : `codex exec` 사용 (기본값)
+- LLM_PROVIDER=claude : `claude -p` 사용
+- LLM_PROVIDER=auto   : codex → claude → gemini 순으로 사용 가능한 백엔드 선택
+- LLM_PROVIDER=gemini : 기존 Gemini API 백엔드(명시 선택 시에만)
 """
+
+from __future__ import annotations
 
 import base64
 import json
 import logging
+import shlex
+import shutil
+import subprocess
+import tempfile
 import time
-from typing import Any
-
-from google import genai
-from google.genai import types
-from google.api_core import exceptions as google_exceptions
+from pathlib import Path
+from typing import Any, Sequence
 
 import config
 
 logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-_client = genai.Client(api_key=config.GEMINI_API_KEY)
-
-# 텍스트 전용: JSON 강제 출력 (잘린 JSON 방지)
-_TEXT_CONFIG = types.GenerateContentConfig(
-    max_output_tokens=config.MAX_TOKENS,
-    temperature=0.1,
-    response_mime_type="application/json",
-)
-
-# 비전용: JSON 강제 출력
-_VISION_CONFIG = types.GenerateContentConfig(
-    max_output_tokens=config.MAX_TOKENS,
-    temperature=0.1,
-    response_mime_type="application/json",
-)
+_JSON_ONLY_INSTRUCTION = """
+당신은 지자체 탄소중립 계획 문서에서 구조화 데이터를 추출하는 로컬 에이전트입니다.
+중요 규칙:
+1. 파일을 수정하지 마세요.
+2. 외부 API 호출이나 네트워크 검색을 하지 마세요.
+3. 주어진 프롬프트와 첨부 이미지/파일 경로만 근거로 판단하세요.
+4. 최종 응답은 반드시 유효한 JSON만 출력하세요. 마크다운 코드블록, 설명, 주석은 금지입니다.
+""".strip()
 
 
-def _handle_retry(e: Exception, attempt: int, max_retries: int, label: str) -> bool:
-    """재시도 여부 결정 및 대기. True 반환 시 계속 재시도."""
-    if attempt >= max_retries:
+def _split_command(command: str) -> list[str]:
+    """환경변수에 들어간 실행 명령을 안전하게 토큰화한다."""
+    tokens = shlex.split(command or "")
+    if not tokens:
+        raise RuntimeError("로컬 에이전트 실행 명령이 비어 있습니다.")
+    return tokens
+
+
+def _command_exists(command: str) -> bool:
+    try:
+        executable = _split_command(command)[0]
+    except RuntimeError:
         return False
-    if isinstance(e, google_exceptions.ResourceExhausted):
-        wait = 30 * attempt
-        logger.warning(f"{label} Rate limit. {wait}초 대기 ({attempt}/{max_retries})")
-        time.sleep(wait)
-    elif isinstance(e, google_exceptions.ServiceUnavailable):
-        wait = 15 * attempt
-        logger.warning(f"{label} 503 서버 과부하. {wait}초 대기 ({attempt}/{max_retries})")
-        time.sleep(wait)
-    else:
-        logger.warning(f"{label} 오류: {e}. 5초 후 재시도 ({attempt}/{max_retries})")
-        time.sleep(5)
-    return True
+    return shutil.which(executable) is not None
+
+
+def _resolve_provider() -> str:
+    provider = (getattr(config, "LLM_PROVIDER", "codex") or "codex").strip().lower()
+    aliases = {
+        "local": "codex",
+        "local-agent": "codex",
+        "claude-code": "claude",
+        "gemini-api": "gemini",
+    }
+    provider = aliases.get(provider, provider)
+
+    if provider == "auto":
+        if _command_exists(getattr(config, "CODEX_COMMAND", "codex")):
+            return "codex"
+        if _command_exists(getattr(config, "CLAUDE_COMMAND", "claude")):
+            return "claude"
+        if getattr(config, "GEMINI_API_KEY", ""):
+            return "gemini"
+        raise RuntimeError(
+            "사용 가능한 로컬 에이전트를 찾지 못했습니다. "
+            "Codex CLI 또는 Claude Code를 설치하거나 LLM_PROVIDER를 명시하세요."
+        )
+
+    if provider == "codex" and not _command_exists(getattr(config, "CODEX_COMMAND", "codex")):
+        raise RuntimeError("Codex CLI를 찾을 수 없습니다. CODEX_COMMAND 또는 --agent claude를 설정하세요.")
+    if provider == "claude" and not _command_exists(getattr(config, "CLAUDE_COMMAND", "claude")):
+        raise RuntimeError("Claude Code CLI를 찾을 수 없습니다. CLAUDE_COMMAND 또는 --agent codex를 설정하세요.")
+    if provider == "gemini" and not getattr(config, "GEMINI_API_KEY", ""):
+        raise RuntimeError("Gemini 백엔드를 사용하려면 GEMINI_API_KEY가 필요합니다.")
+    if provider not in {"codex", "claude", "gemini"}:
+        raise RuntimeError(f"지원하지 않는 LLM_PROVIDER 값입니다: {provider}")
+    return provider
+
+
+def _agent_prompt(
+    prompt: str,
+    system: str = "",
+    image_path: Path | None = None,
+    image_paths: Sequence[Path] | None = None,
+) -> str:
+    parts = [_JSON_ONLY_INSTRUCTION]
+    if system:
+        parts.append(f"[시스템 지침]\n{system.strip()}")
+    paths = list(image_paths or ([] if image_path is None else [image_path]))
+    if paths:
+        path_lines = "\n".join(f"- 이미지 {idx}: {path}" for idx, path in enumerate(paths, start=1))
+        parts.append(
+            "[이미지 입력]\n"
+            f"{path_lines}\n"
+            "첨부 이미지를 순서대로 판독해 아래 요청의 JSON 스키마에 맞춰 답하세요."
+        )
+    parts.append(f"[요청]\n{prompt.strip()}")
+    return "\n\n".join(parts)
+
+
+def _tail(text: str, limit: int = 1200) -> str:
+    text = text or ""
+    return text[-limit:]
+
+
+def _run_command(command: Sequence[str], prompt: str, *, cwd: Path, timeout: int) -> str:
+    """로컬 CLI를 실행하고 stdout을 반환한다."""
+    logger.debug("로컬 에이전트 실행: %s", " ".join(shlex.quote(part) for part in command))
+    completed = subprocess.run(
+        list(command),
+        input=prompt,
+        text=True,
+        capture_output=True,
+        cwd=str(cwd),
+        timeout=timeout,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "로컬 에이전트 실행 실패 "
+            f"(exit={completed.returncode})\n"
+            f"STDERR:\n{_tail(completed.stderr)}\n"
+            f"STDOUT:\n{_tail(completed.stdout)}"
+        )
+    return completed.stdout.strip()
+
+
+def _run_codex(
+    prompt: str,
+    *,
+    image_path: Path | None = None,
+    image_paths: Sequence[Path] | None = None,
+) -> str:
+    timeout = int(getattr(config, "LOCAL_AGENT_TIMEOUT", 900))
+    command = _split_command(getattr(config, "CODEX_COMMAND", "codex"))
+
+    with tempfile.TemporaryDirectory(prefix="carbon-codex-") as tmpdir:
+        output_path = Path(tmpdir) / "last_message.txt"
+        command += [
+            "exec",
+            "--sandbox",
+            "read-only",
+            "--cd",
+            str(PROJECT_ROOT),
+            "--ephemeral",
+            "--color",
+            "never",
+            "--output-last-message",
+            str(output_path),
+        ]
+        model = getattr(config, "LOCAL_AGENT_MODEL", "")
+        if model:
+            command += ["--model", model]
+        paths = list(image_paths or ([] if image_path is None else [image_path]))
+        for path in paths:
+            command += ["--image", str(path)]
+        command.append("-")
+
+        stdout = _run_command(command, prompt, cwd=PROJECT_ROOT, timeout=timeout)
+        if output_path.exists():
+            message = output_path.read_text(encoding="utf-8").strip()
+            if message:
+                return message
+        return stdout
+
+
+def _run_claude(
+    prompt: str,
+    *,
+    image_path: Path | None = None,
+    image_paths: Sequence[Path] | None = None,
+) -> str:
+    # Claude Code는 버전별 CLI 옵션 차이가 있어 가장 보편적인 print 모드를 사용한다.
+    # 이미지가 있으면 prompt에 임시 파일 경로가 포함되어 Claude가 로컬 파일로 읽을 수 있다.
+    timeout = int(getattr(config, "LOCAL_AGENT_TIMEOUT", 900))
+    base_command = _split_command(getattr(config, "CLAUDE_COMMAND", "claude"))
+    command = [*base_command, "-p", "--output-format", "text"]
+    model = getattr(config, "LOCAL_AGENT_MODEL", "")
+    if model:
+        command += ["--model", model]
+    try:
+        return _run_command(command, prompt, cwd=PROJECT_ROOT, timeout=timeout)
+    except RuntimeError:
+        # 일부 Claude Code 버전은 print 모드에서 stdin 대신 prompt positional arg를 기대한다.
+        # 긴 문서 프롬프트는 argv 한도를 넘을 수 있으므로 짧은 경우에만 호환 폴백을 시도한다.
+        if len(prompt) > 100_000:
+            raise
+        fallback = [*command, prompt]
+        logger.debug("Claude stdin 실행 실패, positional prompt 폴백 시도")
+        return _run_command(fallback, "", cwd=PROJECT_ROOT, timeout=timeout)
+
+
+def _call_local_agent(
+    prompt: str,
+    system: str,
+    *,
+    image_b64: str | None = None,
+    images_b64: Sequence[str] | None = None,
+    provider: str | None = None,
+) -> str:
+    provider = provider or _resolve_provider()
+    image_path: Path | None = None
+    image_paths: list[Path] = []
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        images = list(images_b64 or ([] if image_b64 is None else [image_b64]))
+        if images:
+            temp_dir = tempfile.TemporaryDirectory(prefix="carbon-agent-image-")
+            for idx, image in enumerate(images, start=1):
+                path = Path(temp_dir.name) / f"input_{idx:03d}.png"
+                path.write_bytes(base64.b64decode(image))
+                image_paths.append(path)
+            image_path = image_paths[0] if len(image_paths) == 1 else None
+
+        prepared = _agent_prompt(prompt, system, image_path=image_path, image_paths=image_paths)
+        if provider == "codex":
+            return _run_codex(prepared, image_path=image_path, image_paths=image_paths)
+        if provider == "claude":
+            return _run_claude(prepared, image_path=image_path, image_paths=image_paths)
+        raise RuntimeError(f"지원하지 않는 로컬 에이전트입니다: {provider}")
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
+
+
+def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
+    for attempt in range(1, max_retries + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - CLI 오류는 다양한 예외로 들어온다.
+            if attempt >= max_retries:
+                logger.error("%s 최대 재시도 초과: %s", label, exc)
+                return "{}"
+            wait = min(5 * attempt, 30)
+            logger.warning("%s 오류: %s. %s초 후 재시도 (%s/%s)", label, exc, wait, attempt, max_retries)
+            time.sleep(wait)
+    return "{}"
 
 
 def call_text(prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> str:
     """
-    텍스트 프롬프트로 Gemini 호출 (JSON 강제 출력 모드).
+    텍스트 프롬프트를 선택된 백엔드에 전달한다.
 
-    Returns:
-        JSON 문자열 (파싱 실패 시 "{}")
+    기본값은 Gemini API가 아니라 로컬 Codex CLI이며, 응답은 JSON 문자열이어야 한다.
+    실패 시 기존 파이프라인 호환을 위해 "{}"를 반환한다.
     """
+    provider = _resolve_provider()
+    if provider == "gemini":
+        return _call_gemini_text(prompt, system, max_retries=max_retries)
+
+    return _retry_local_call(
+        lambda: _call_local_agent(prompt, system, provider=provider),
+        max_retries=max_retries,
+        label=provider,
+    )
+
+
+def call_vision(image_b64: str, prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> str:
+    """
+    이미지 + 텍스트 프롬프트를 선택된 백엔드에 전달한다.
+
+    Codex는 `--image` 첨부를 사용하고, Claude Code는 임시 이미지 파일 경로를 프롬프트에
+    포함한다. 실패 시 기존 파이프라인 호환을 위해 "{}"를 반환한다.
+    """
+    provider = _resolve_provider()
+    if provider == "gemini":
+        return _call_gemini_vision(image_b64, prompt, system, max_retries=max_retries)
+
+    return _retry_local_call(
+        lambda: _call_local_agent(prompt, system, image_b64=image_b64, provider=provider),
+        max_retries=max_retries,
+        label=f"{provider} vision",
+    )
+
+
+def call_vision_batch(
+    images_b64: Sequence[str],
+    prompt: str,
+    system: str = "",
+    max_retries: int = config.MAX_RETRIES,
+) -> str:
+    """
+    여러 이미지 + 텍스트 프롬프트를 선택된 백엔드에 한 번에 전달한다.
+
+    Codex CLI의 반복 `--image` 첨부를 사용해 전수 이미지 분석 시 호출 수를 줄인다.
+    """
+    if not images_b64:
+        return "{}"
+    if len(images_b64) == 1:
+        return call_vision(images_b64[0], prompt, system=system, max_retries=max_retries)
+
+    provider = _resolve_provider()
+    if provider == "gemini":
+        # Gemini 레거시 경로는 단일 이미지 호출만 유지한다.
+        return "{}"
+
+    return _retry_local_call(
+        lambda: _call_local_agent(prompt, system, images_b64=images_b64, provider=provider),
+        max_retries=max_retries,
+        label=f"{provider} vision batch",
+    )
+
+
+def _get_gemini_modules():
+    """Gemini 백엔드는 명시적으로 선택된 경우에만 SDK를 지연 import한다."""
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+        from google.api_core import exceptions as google_exceptions  # type: ignore
+    except ImportError as exc:  # pragma: no cover - 선택 백엔드 미설치 환경용
+        raise RuntimeError(
+            "Gemini 백엔드를 사용하려면 google-genai 패키지를 별도로 설치하세요."
+        ) from exc
+    return genai, types, google_exceptions
+
+
+def _gemini_client():
+    genai, _, _ = _get_gemini_modules()
+    return genai.Client(api_key=config.GEMINI_API_KEY)
+
+
+def _handle_gemini_retry(e: Exception, attempt: int, max_retries: int, label: str) -> bool:
+    """Gemini API 재시도 여부 결정 및 대기. True 반환 시 계속 재시도."""
+    _, _, google_exceptions = _get_gemini_modules()
+    if attempt >= max_retries:
+        return False
+    if isinstance(e, google_exceptions.ResourceExhausted):
+        wait = 30 * attempt
+        logger.warning("%s Rate limit. %s초 대기 (%s/%s)", label, wait, attempt, max_retries)
+        time.sleep(wait)
+    elif isinstance(e, google_exceptions.ServiceUnavailable):
+        wait = 15 * attempt
+        logger.warning("%s 503 서버 과부하. %s초 대기 (%s/%s)", label, wait, attempt, max_retries)
+        time.sleep(wait)
+    else:
+        logger.warning("%s 오류: %s. 5초 후 재시도 (%s/%s)", label, e, attempt, max_retries)
+        time.sleep(5)
+    return True
+
+
+def _call_gemini_text(prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> str:
+    """레거시 Gemini API 텍스트 호출."""
+    _, types, _ = _get_gemini_modules()
     full_text = f"[지침]\n{system}\n\n[요청]\n{prompt}" if system else prompt
     contents = [types.Content(role="user", parts=[types.Part(text=full_text)])]
+    api_config = types.GenerateContentConfig(
+        max_output_tokens=config.MAX_TOKENS,
+        temperature=0.1,
+        response_mime_type="application/json",
+    )
+    client = _gemini_client()
 
     for attempt in range(1, max_retries + 1):
         try:
-            response = _client.models.generate_content(
+            response = client.models.generate_content(
                 model=config.MODEL,
                 contents=contents,
-                config=_TEXT_CONFIG,
+                config=api_config,
             )
             return response.text
-        except Exception as e:
-            if not _handle_retry(e, attempt, max_retries, "Gemini"):
+        except Exception as e:  # noqa: BLE001 - SDK 예외 범위가 넓다.
+            if not _handle_gemini_retry(e, attempt, max_retries, "Gemini"):
                 break
 
     logger.error("Gemini 최대 재시도 초과.")
     return "{}"
 
 
-def call_vision(image_b64: str, prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> str:
-    """
-    이미지 + 텍스트로 Gemini Vision 호출 (JSON 강제 출력 모드).
-
-    Returns:
-        JSON 문자열 (파싱 실패 시 "{}")
-    """
+def _call_gemini_vision(
+    image_b64: str,
+    prompt: str,
+    system: str = "",
+    max_retries: int = config.MAX_RETRIES,
+) -> str:
+    """레거시 Gemini API Vision 호출."""
+    _, types, _ = _get_gemini_modules()
     image_bytes = base64.b64decode(image_b64)
     full_prompt = f"[지침]\n{system}\n\n[요청]\n{prompt}" if system else prompt
-
     contents = [
         types.Content(
             role="user",
@@ -101,17 +399,23 @@ def call_vision(image_b64: str, prompt: str, system: str = "", max_retries: int 
             ],
         )
     ]
+    api_config = types.GenerateContentConfig(
+        max_output_tokens=config.MAX_TOKENS,
+        temperature=0.1,
+        response_mime_type="application/json",
+    )
+    client = _gemini_client()
 
     for attempt in range(1, max_retries + 1):
         try:
-            response = _client.models.generate_content(
+            response = client.models.generate_content(
                 model=config.MODEL,
                 contents=contents,
-                config=_VISION_CONFIG,
+                config=api_config,
             )
             return response.text
-        except Exception as e:
-            if not _handle_retry(e, attempt, max_retries, "Vision"):
+        except Exception as e:  # noqa: BLE001 - SDK 예외 범위가 넓다.
+            if not _handle_gemini_retry(e, attempt, max_retries, "Vision"):
                 break
 
     logger.error("Vision 최대 재시도 초과.")
@@ -120,9 +424,11 @@ def call_vision(image_b64: str, prompt: str, system: str = "", max_retries: int 
 
 def _find_json_end(text: str, start: int) -> int:
     """
-    start 위치의 '{' 에서 시작하는 JSON 객체의 닫는 '}' 위치를 반환.
-    괄호 깊이를 추적하므로 }}]} 같은 후행 쓰레기에 영향받지 않음.
+    start 위치의 JSON 객체/배열 시작 문자에서 닫는 위치를 반환한다.
+    괄호 깊이를 추적하므로 후행 쓰레기에 영향받지 않는다.
     """
+    opener = text[start]
+    closer = "}" if opener == "{" else "]"
     depth = 0
     in_str = False
     escape = False
@@ -136,51 +442,56 @@ def _find_json_end(text: str, start: int) -> int:
         if ch == '"':
             in_str = not in_str
         elif not in_str:
-            if ch == "{":
+            if ch == opener:
                 depth += 1
-            elif ch == "}":
+            elif ch == closer:
                 depth -= 1
                 if depth == 0:
                     return i
     return -1
 
 
+def _strip_code_block(text: str) -> str:
+    text = text.strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.split("\n")
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
 def parse_json(text: str) -> Any:
     """
-    Gemini JSON 모드 응답 파싱.
-    JSON 모드 사용 시 이미 순수 JSON이 오지만, 안전을 위해 코드블록 제거도 처리.
-    }}]} 같은 후행 쓰레기는 괄호 깊이 추적으로 무시.
+    로컬 에이전트/LLM 응답 파싱.
+
+    JSON만 출력하도록 요청하지만, 안전을 위해 코드블록 제거와 앞뒤 설명 제거를 처리한다.
+    객체뿐 아니라 배열 최상위 JSON도 허용한다.
     """
     if not text or text.strip() in ("{}", ""):
         return {}
 
-    text = text.strip()
-
-    # 마크다운 코드블록 제거 (혹시 모를 경우 대비)
-    if text.startswith("```"):
-        lines = text.split("\n")
-        end = -1 if lines[-1].strip() == "```" else len(lines)
-        text = "\n".join(lines[1:end]).strip()
+    text = _strip_code_block(text)
 
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # 잘린 JSON 복구 시도: 괄호 깊이 추적으로 정확한 끝 위치 계산
-        start = text.find("{")
-        if start >= 0:
+        starts = [idx for idx, ch in enumerate(text) if ch in "{["]
+        for start in starts:
             end = _find_json_end(text, start)
             if end >= 0:
                 try:
                     return json.loads(text[start:end + 1])
                 except json.JSONDecodeError:
-                    pass
-            # 마지막 수단: rfind (end 찾기 실패 시)
-            end_fallback = text.rfind("}") + 1
+                    continue
+            end_fallback = max(text.rfind("}"), text.rfind("]")) + 1
             if end_fallback > start:
                 try:
                     return json.loads(text[start:end_fallback])
                 except json.JSONDecodeError:
-                    pass
+                    continue
 
-    logger.warning(f"JSON 파싱 실패 (응답 앞 200자): {text[:200]}")
+    logger.warning("JSON 파싱 실패 (응답 앞 200자): %s", text[:200])
     return {}

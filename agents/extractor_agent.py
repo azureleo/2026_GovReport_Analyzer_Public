@@ -1,11 +1,8 @@
 """
 에이전트 2: 텍스트·표 추출 에이전트
 
-변경 사항:
-- 5개 시트를 한 번에 추출 → 시트 유형별 개별 호출로 분리
-  (출력 토큰 한도 초과로 JSON 잘림 방지)
-- 키워드 프리필터: 관련 키워드가 없는 배치는 해당 유형 호출 건너뜀
-  (불필요한 API 호출 절감)
+carbon_guideline.md 기반 16개 시트 구조에 맞춰 문서를 추출합니다.
+시트별로 관련 페이지를 라우팅하고, 배치 단위로 LLM에 전달합니다.
 """
 
 import logging
@@ -24,135 +21,305 @@ EXTRACTION_SYSTEM = """당신은 한국 지자체 탄소중립 녹색성장 기�
 규칙:
 1. 숫자는 반드시 숫자형(int/float)으로 반환하세요. 단위(tCO2eq, 대 등)는 제외.
 2. 값이 없거나 확인 불가인 경우 null로 처리하세요.
-3. 연도별 데이터는 {"2018": 값, ...} 형식으로 작성하세요.
-4. 모든 텍스트 필드는 한국어로 작성하세요.
-5. 반드시 유효한 JSON만 반환하세요.
-6. 표 제목, 표 캡션, 그림 제목, 절 제목 등 레이블·헤더 텍스트는 절대 데이터 값으로 사용하지 마세요.
-7. 데이터 맥락이 명확하지 않은 숫자(출처 불명, 단위 불일치)는 null로 처리하세요."""
+3. 모든 텍스트 필드는 한국어로 작성하세요.
+4. 반드시 유효한 JSON만 반환하세요.
+5. 표 제목, 표 캡션, 그림 제목, 절 제목 등 레이블·헤더 텍스트는 절대 데이터 값으로 사용하지 마세요.
+6. 데이터 맥락이 명확하지 않은 숫자(출처 불명, 단위 불일치)는 null로 처리하세요."""
 
 
-# 시트별 설정: 키워드(프리필터), 프롬프트, JSON 스키마
+# ──────────────────────────────────────────────────────────────────────
+# 16개 시트별 추출 설정
+# ──────────────────────────────────────────────────────────────────────
+
 _SHEET_CONFIGS = {
-    "vehicle": {
-        "keywords": ["자동차", "차량", "승용", "화물", "버스", "이륜", "등록대수", "주행거리"],
-        "prompt": """이 배치에서 '용도별 자동차 현황' 데이터를 추출하세요.
-
-주의사항:
-- 용도명은 반드시 다음 중 하나로 통일하세요: 승용, 화물, 버스, 이륜, 특수, 승합
-  (승용차→승용, 화물차→화물, 이륜차→이륜 으로 표준화)
-- 원문이 용도별이 아니라 연료별 전체 자동차 등록대수만 제시하면 용도는 "전체"로 기록하세요.
-- 동일한 용도+차종 조합은 한 번만 기록하세요 (중복 제외).
-- 대수와 주행거리는 각각의 단위(대, km)를 제거하고 숫자만 기록하세요.
-- 전기차 성장률, 보급 목표, 추진계획, 투자계획, 감축효과 표의 숫자는 자동차 현황 대수로 사용하지 마세요.
-
-JSON 형식: {"vehicle": [{"지자체명": "...", "용도": "전체|승용|화물|버스|이륜|특수|승합", "차종": "경유|휘발유|LPG|전기|수소|하이브리드|내연기관", "대수": 숫자or null, "주행거리": 숫자or null}]}
-데이터가 없으면: {"vehicle": []}""",
-    },
-    "energy": {
-        "keywords": ["에너지", "소비량", "석유", "도시가스", "전력", "신재생", "열에너지", "LNG", "TJ", "toe"],
-        "prompt": """이 배치에서 '용도별 에너지 소비 현황' 데이터를 추출하세요.
-
-주의사항:
-- 용도명은 최소 단위(가정, 상업, 공공, 산업, 수송 등)로 분리하여 기록하세요.
-- '가정·상업', '가정/상업' 같은 합산 용도와 '가정', '상업' 개별 용도가 모두 존재하면 개별 세분값만 기록하세요 (합산값 제외).
-- '도로수송', '비도로수송'은 '수송'으로 통일하세요.
-- 에너지량 단위(TJ, toe, GWh 등)는 제거하고 숫자만 기록하세요.
-- 에너지원별 총량 표는 용도를 "전체"로 기록하세요. 총량을 가정/상업/공공 등 특정 용도에 임의 배정하지 마세요.
-- 변화율, 비율, 전망, 투자계획, 감축효과 표의 숫자는 에너지 현황 소비량으로 사용하지 마세요.
-
-JSON 형식: {"energy": [{"지자체명": "...", "용도": "가정|상업|공공|산업|수송 등", "석유_에너지유": 숫자or null, "석유_LPG": 숫자or null, "석유_비에너지유": 숫자or null, "가스": 숫자or null, "전력": 숫자or null, "열": 숫자or null, "신재생": 숫자or null}]}
-데이터가 없으면: {"energy": []}""",
-    },
-    "ghg": {
-        "keywords": ["온실가스", "배출량", "tCO2", "CO2eq", "탄소", "직접배출", "간접배출", "흡수원", "NDC", "BAU", "감축목표"],
-        "prompt": """이 배치에서 '온실가스 배출량(현황·전망·목표)' 데이터를 추출하세요.
-
-주의사항:
-- 부문명은 반드시 다음 목록 중 하나만 사용하세요: 건물, 수송, 농축산, 폐기물, 흡수원, 전환, 산업, 수소, 합계, 기타
-  표 제목, 캡션, IPCC 코드(예: 1A 연료연소, 4A 폐기물매립) 등 목록 외 값은 절대 부문명으로 사용하지 마세요.
-- 연도별 값은 반드시 온실가스 배출량(tCO2eq 단위) 수치만 기록하세요.
-  예산(원, 백만원), 면적(m², ha), 개수, 비율(%) 등 다른 단위의 숫자는 절대 포함하지 마세요.
-- 같은 표에서 합계 행과 부문별 행이 모두 있을 때는 부문별 행을 우선하고 합계 행도 함께 포함하세요.
-- IPCC 분류코드 기반 표는 건너뛰어도 됩니다.
-
-JSON 형식: {"ghg": [{"지자체명": "...", "배출유형": "직접배출|간접배출|흡수원", "종류": "현황|전망|목표", "부문": "건물|수송|농축산|폐기물|흡수원|전환|산업|수소|합계|기타", "연도별": {"2023": 숫자, "2030": 숫자}}]}
-※ 연도별에는 실제 숫자값이 있는 연도만 포함하세요. null인 연도는 키 자체를 생략하세요.
-데이터가 없으면: {"ghg": []}""",
-    },
-    "strategy": {
-        "keywords": ["감축", "사업", "이행", "계획", "실적", "지표", "예산", "공통", "특화", "ZEB", "전기차", "태양광"],
-        "prompt": """이 배치에서 '부문별 감축 사업 계획·실적' 데이터를 추출하세요.
-
-주의사항:
-- 감축사업명은 반드시 한글 사업 명칭을 사용하세요.
-  영문 코드(B1, M1, E2 등)로만 표기된 경우, 해당 코드의 한글 사업명을 찾아 함께 기록하세요 (예: "B1 기존 건물 ZEB 전환").
-  코드 단독('B1')과 코드+한글명('B1 기존 건물 ZEB 전환')이 같은 사업이면 한글명이 포함된 것만 기록하세요.
-- 표 제목이나 절 제목은 감축사업명으로 사용하지 마세요.
-- 연도별 값의 단위를 종류에 맞게 일관되게 기록하세요:
-  계획(감축량): tCO2eq, 계획(예산): 백만원, 계획(지표)/실적(지표): 해당 지표 단위 숫자.
-- 연도는 실제로 값이 있는 연도만 포함하세요 (빈 연도는 생략).
-
-JSON 형식: {"strategy": [{"지자체명": "...", "배출유형": "직접배출|간접배출", "감축전략_부문": "전환|산업|건물|수송|농축산|폐기물|흡수원|수소", "감축사업명": "...", "감축사업명_세부": "...", "구분": "공통|특화", "성과지표": "...", "종류": "계획(지표)|계획(감축량)|계획(예산)|실적(지표)|실적(감축량)|실적(예산)", "연도별": {"2023": 값, "2024": 값, "2025": 값, "2030": 값}}]}
-※ 연도별에는 실제 숫자가 있는 연도만 포함. null인 연도는 키 자체를 생략.
-데이터가 없으면: {"strategy": []}""",
-    },
-    "summary": {
-        "keywords": ["목표", "전략", "핵심", "비전", "방향", "개요", "현황", "배출유형", "탄소중립"],
-        "prompt": """이 배치에서 지자체 탄소중립 계획의 핵심 요약 정보를 추출하세요.
-
-추출 대상 항목은 아래 5개뿐입니다. 반드시 항목명을 정확히 사용하세요:
-  1. "배출유형" - 직접배출/간접배출/흡수원 등 배출 분류 체계 설명
-  2. "감축목표(2030)" - 2030년 온실가스 감축 목표 수치 및 기준연도
-  3. "감축목표(2035)" - 2035년 온실가스 감축 목표 수치 및 기준연도
-  4. "핵심전략" - 주요 감축 전략 방향 (부문별 전략 요약)
-  5. "배출유형-전략 간 연결성" - 배출 부문과 감축 전략의 연계 내용
-
-주의: 항목 필드에는 위 5개 중 하나의 정확한 이름만 넣으세요. 파이프(|)나 다른 내용을 항목 필드에 넣지 마세요.
-각 항목은 별도의 JSON 객체로 작성하세요.
+    "document_meta": {
+        "keywords": ["기본계획", "계획기간", "기준연도", "목표연도", "수립", "탄소중립", "녹색성장", "조례"],
+        "prompt": """이 배치에서 문서 메타정보를 추출하세요.
 
 JSON 형식:
-{"summary": [
-  {"지자체명": "서울특별시", "항목": "배출유형", "내용": "직접배출+간접배출로 구성...", "근거": "보고서 p.XX"},
-  {"지자체명": "서울특별시", "항목": "감축목표(2030)", "내용": "2018년 대비 40% 감축...", "근거": "보고서 p.XX"}
-]}
-데이터가 없으면: {"summary": []}""",
+{"document_meta": [{"지자체명": "...", "지자체유형": "광역|기초|기타", "계획명": "...", "발간일": "YYYY-MM-DD or null", "발간기관": "...", "계획시작연도": 숫자, "계획종료연도": 숫자, "기준연도": 숫자, "목표연도": "2030,2050 등 쉼표 구분", "법적근거": "...", "점검보고서여부": true/false}]}
+데이터가 없으면: {"document_meta": []}""",
+    },
+
+    "plan_overview": {
+        "keywords": ["목적", "필요성", "법적 근거", "추진체계", "추진절차", "경과", "공청회", "위원회", "자문"],
+        "prompt": """이 배치에서 계획 수립 개요(목적, 법적근거, 추진경과 등)를 추출하세요.
+
+JSON 형식:
+{"plan_overview": [{"지자체명": "...", "개요유형": "목적|법적근거|추진체계|추진경과|의견수렴", "항목명": "...", "항목값": "내용 텍스트", "일자": "YYYY-MM-DD or null", "이해관계자": "...", "관련법령_계획": "..."}]}
+데이터가 없으면: {"plan_overview": []}""",
+    },
+
+    "regional_conditions": {
+        "keywords": ["인구", "면적", "기온", "강수량", "GRDP", "차량등록", "에너지", "소비량", "전력",
+                     "도시가스", "가구수", "건축물", "토지이용", "사업체", "종사자"],
+        "prompt": """이 배치에서 지역 환경요인(자연, 인문·사회, 경제·산업, 에너지) 지표를 추출하세요.
+
+주의:
+- 지표범주는 자연환경/인문사회/경제산업/에너지 중 하나로 분류하세요.
+- 연도별 시계열 데이터는 연도마다 별도 행으로 기록하세요.
+- 단위는 원문 그대로 기록하세요(명, 대, km, TJ, TOE, GWh 등).
+
+JSON 형식:
+{"regional_conditions": [{"지자체명": "...", "지표범주": "자연환경|인문사회|경제산업|에너지", "지표세부범주": "...", "지표명": "...", "연도": 숫자, "값": 숫자or null, "단위": "...", "출처": "..."}]}
+데이터가 없으면: {"regional_conditions": []}""",
+    },
+
+    "emissions_regional": {
+        "keywords": ["온실가스", "배출량", "tCO2", "CO2eq", "직접배출", "간접배출", "흡수원",
+                     "인벤토리", "GIR", "LULUCF", "연료연소", "산업공정"],
+        "prompt": """이 배치에서 지역 전체 온실가스 배출·흡수 현황(GIR 통계 등)을 추출하세요.
+
+주의:
+- 배출범위: 직접배출/간접배출/흡수원 구분
+- 부문: 에너지, 산업공정, 농업, LULUCF, 폐기물 등 원문 표기
+- 연도별 데이터는 연도마다 별도 행으로 기록
+
+JSON 형식:
+{"emissions_regional": [{"지자체명": "...", "인벤토리출처": "GIR|자체산정|기타", "배출범위": "직접배출|간접배출|흡수원", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "연도": 숫자, "배출량": 숫자or null, "단위": "tCO2eq|천톤CO2eq|백만톤CO2eq", "흡수원여부": true/false}]}
+데이터가 없으면: {"emissions_regional": []}""",
+    },
+
+    "emissions_management": {
+        "keywords": ["관리권한", "관리 권한", "건물", "수송", "농축산", "폐기물", "흡수원",
+                     "가정", "상업", "공공", "도로수송"],
+        "prompt": """이 배치에서 지자체 관리권한 인벤토리(건물/수송/농축산/폐기물/흡수원) 데이터를 추출하세요.
+
+주의:
+- 관리부문은 건물/수송/농축산/폐기물/흡수원/전환/산업/수소/합계 중 하나
+- 직간접구분: direct/indirect/sink
+- 합계포함여부: 해당 행이 합계에 포함되는지 (흡수원은 보통 제외)
+
+JSON 형식:
+{"emissions_management": [{"지자체명": "...", "인벤토리출처": "GIR|자체산정", "관리부문": "건물|수송|농축산|폐기물|흡수원|전환|산업|수소|합계", "세부부문": "가정|상업/공공|도로수송|...", "직간접구분": "direct|indirect|sink", "연도": 숫자, "배출량": 숫자or null, "단위": "tCO2eq|천톤CO2eq", "합계포함여부": true/false}]}
+데이터가 없으면: {"emissions_management": []}""",
+    },
+
+    "emissions_forecast": {
+        "keywords": ["전망", "BAU", "배출전망", "증가율", "시계열", "LEAP", "추정", "예측"],
+        "prompt": """이 배치에서 온실가스 배출 전망(BAU 등) 데이터를 추출하세요.
+
+주의:
+- 시나리오: BAU/정책반영/추가조치 등
+- 전망방법원문: 보고서가 명시한 전망 방법론 텍스트
+- 연도별 데이터는 연도마다 별도 행
+
+JSON 형식:
+{"emissions_forecast": [{"지자체명": "...", "시나리오": "BAU|정책반영|추가조치", "전망방법코드": "stat_time_series|stat_regression|stat_growth_rate|bottom_up_accounting_LEAP|기타", "전망방법원문": "...", "부문": "...", "세부부문": "...", "연도": 숫자, "전망값": 숫자or null, "단위": "tCO2eq|천톤CO2eq", "주요가정": "..."}]}
+데이터가 없으면: {"emissions_forecast": []}""",
+    },
+
+    "reduction_targets": {
+        "keywords": ["감축목표", "감축률", "목표배출량", "목표감축량", "2030", "2050",
+                     "NDC", "기준연도 대비", "40%", "50%"],
+        "prompt": """이 배치에서 총괄·부문별 온실가스 감축목표를 추출하세요.
+
+주의:
+- 목표수준: 총괄/부문/세부부문
+- 목표범위: 관리권한/관리권한+추가감축/지역전체
+- 감축률(%) = (기준배출량 - 목표배출량) / 기준배출량 × 100
+
+JSON 형식:
+{"reduction_targets": [{"지자체명": "...", "목표수준": "총괄|부문|세부부문", "목표범위": "관리권한|관리권한+추가감축|지역전체", "부문": "건물|수송|농축산|폐기물|흡수원|전환|산업|수소|합계|null", "기준연도": 숫자, "기준배출량": 숫자or null, "목표연도": 숫자, "배출전망": 숫자or null, "목표감축량": 숫자or null, "목표배출량": 숫자or null, "감축률": 숫자or null}]}
+데이터가 없으면: {"reduction_targets": []}""",
+    },
+
+    "vision_strategy": {
+        "keywords": ["비전", "전략", "추진방향", "핵심과제", "슬로건", "탄소중립 도시"],
+        "prompt": """이 배치에서 비전·전략 정보를 추출하세요.
+
+JSON 형식:
+{"vision_strategy": [{"지자체명": "...", "비전문구": "2050 탄소중립 ... 등", "전략수준": "비전|추진전략|세부전략", "전략명": "...", "부문": "건물|수송|...|null", "설명": "...", "키워드": "..."}]}
+데이터가 없으면: {"vision_strategy": []}""",
+    },
+
+    "mitigation_projects": {
+        "keywords": ["감축사업", "세부사업", "핵심과제", "추진과제", "관리번호", "주관부서",
+                     "성과지표", "공통사업", "특화사업"],
+        "prompt": """이 배치에서 감축대책·세부사업 목록을 추출하세요.
+
+주의:
+- 사업유형: 정량/정성
+- 한 사업의 개요, 부서, 지표를 한 행에 정리
+- 관리번호가 없으면 null
+
+JSON 형식:
+{"mitigation_projects": [{"지자체명": "...", "관리번호": "...", "부문": "건물|수송|농축산|폐기물|흡수원|전환|산업|수소", "핵심과제": "...", "사업명": "...", "사업유형": "신규|계속|확대|변경|기타", "주관부서": "...", "협조부서": "...", "사업개요": "...", "성과지표명": "...", "성과지표단위": "...", "정량여부": true/false}]}
+데이터가 없으면: {"mitigation_projects": []}""",
+    },
+
+    "annual_implementation": {
+        "keywords": ["연차별", "이행계획", "이행목표", "연도별 목표", "물량", "2024", "2025",
+                     "2026", "2027", "2028", "2029", "2030"],
+        "prompt": """이 배치에서 연차별 이행계획(연도별 목표물량, 계획 텍스트)을 추출하세요.
+
+주의:
+- 초기 5년은 연 단위, 이후는 연 단위 또는 기간 단위
+- 기간 표기("2029~2030")는 기간시작/기간종료로 분리
+
+JSON 형식:
+{"annual_implementation": [{"지자체명": "...", "관리번호": "...", "사업명": "...", "기간시작": 숫자or null, "기간종료": 숫자or null, "연도": 숫자or null, "연간계획": "...", "목표물량": 숫자or null, "목표단위": "...", "규제혁신계획": "...", "입법계획": "..."}]}
+데이터가 없으면: {"annual_implementation": []}""",
+    },
+
+    "quantitative_reductions": {
+        "keywords": ["감축량", "감축원단위", "모니터링", "활동량", "배출계수", "tCO2eq",
+                     "원단위", "전기차", "태양광", "LED"],
+        "prompt": """이 배치에서 정량사업 감축량 산정 데이터를 추출하세요.
+
+주의:
+- 감축원단위: 활동 1단위당 감축되는 온실가스량
+- 예상감축량 = 활동량 × 감축원단위값
+- 모니터링인자: 사업량 측정에 사용되는 활동자료
+
+JSON 형식:
+{"quantitative_reductions": [{"지자체명": "...", "관리번호": "...", "사업명": "...", "연도": 숫자, "모니터링인자": "...", "활동량": 숫자or null, "활동단위": "...", "감축원단위ID": "...", "감축원단위값": 숫자or null, "예상감축량": 숫자or null, "단위": "tCO2eq"}]}
+데이터가 없으면: {"quantitative_reductions": []}""",
+    },
+
+    "financial_plan": {
+        "keywords": ["재정", "투자", "예산", "국비", "시비", "도비", "민간", "백만원", "억원"],
+        "prompt": """이 배치에서 재정투자 계획(부문별·재원별·연도별 예산)을 추출하세요.
+
+JSON 형식:
+{"financial_plan": [{"지자체명": "...", "계획구분": "총계|온실가스감축대책|대응기반강화|기타", "부문": "...", "사업명": "...", "재원구분": "합계|국비|도비|시비|민간", "연도": 숫자, "예산액": 숫자or null, "예산단위": "백만원|억원"}]}
+데이터가 없으면: {"financial_plan": []}""",
+    },
+
+    "foundation_measures": {
+        "keywords": ["적응", "공유재산", "국제협력", "교육", "홍보", "녹색성장", "청정에너지",
+                     "정의로운 전환", "인력양성", "대응기반"],
+        "prompt": """이 배치에서 기후위기 대응기반 강화대책을 추출하세요.
+
+주의:
+- 대응기반영역: 적응대책/공유재산/국제협력/교육소통/녹색성장/청정에너지/정의로운전환/인력양성
+
+JSON 형식:
+{"foundation_measures": [{"지자체명": "...", "대응기반영역": "적응대책|공유재산|국제협력|교육소통|녹색성장|청정에너지|정의로운전환|인력양성", "과제ID": "...", "과제명": "...", "정책방향": "...", "주요내용": "...", "대상": "...", "주관부서": "...", "기간": "..."}]}
+데이터가 없으면: {"foundation_measures": []}""",
+    },
+
+    "governance_feedback": {
+        "keywords": ["이행관리", "환류", "점검체계", "탄소중립이행책임관", "지방위원회",
+                     "지원센터", "점검", "보고"],
+        "prompt": """이 배치에서 이행관리·환류체계 정보를 추출하세요.
+
+JSON 형식:
+{"governance_feedback": [{"지자체명": "...", "거버넌스기구": "...", "역할": "...", "담당부서": "...", "절차단계": "...", "기한": "...", "산출물": "..."}]}
+데이터가 없으면: {"governance_feedback": []}""",
+    },
+
+    "monitoring_performance": {
+        "keywords": ["추진상황", "점검", "이행실적", "달성여부", "달성", "정상추진",
+                     "지연", "미달성", "소요예산"],
+        "prompt": """이 배치에서 추진상황 점검 실적 데이터를 추출하세요.
+
+주의:
+- 달성여부: 달성/정상추진/지연/미달성 중 하나
+- 사업유형: 기존/변경/신규 중 하나
+
+JSON 형식:
+{"monitoring_performance": [{"지자체명": "...", "점검연도": 숫자, "부문": "...", "관리번호": "...", "사업명": "...", "연간계획": "...", "이행실적": "...", "소요예산": "...", "달성여부": "달성|정상추진|지연|미달성", "사업유형": "기존|변경|신규"}]}
+데이터가 없으면: {"monitoring_performance": []}""",
+    },
+
+    "changes_actions": {
+        "keywords": ["변경", "신규사업", "미달성", "조치계획", "변경사유", "지연사유", "개선"],
+        "prompt": """이 배치에서 변경과제·미달성 조치 정보를 추출하세요.
+
+JSON 형식:
+{"changes_actions": [{"지자체명": "...", "점검연도": 숫자or null, "부문": "...", "관리번호": "...", "사업명": "...", "변경전": "...", "변경후": "...", "변경사유": "...", "지연미달성사유": "...", "조치계획": "..."}]}
+데이터가 없으면: {"changes_actions": []}""",
     },
 }
 
 
-# 문서 구조 라우팅용 가중 키워드.
-# Extractor 호출 전에 페이지 단위로 점수를 매겨 "정말 관련 있는 페이지"만 시트별 배치에 넣는다.
+# ──────────────────────────────────────────────────────────────────────
+# 문서 구조 라우팅용 가중 키워드
+# ──────────────────────────────────────────────────────────────────────
+
 _ROUTE_CONFIGS = {
-    "vehicle": {
-        "strong": ["자동차 등록", "차량 등록", "등록대수", "용도별 자동차", "차종별", "주행거리"],
-        "weak": _SHEET_CONFIGS["vehicle"]["keywords"],
-        "negative": ["설문", "자문회의", "해외", "IPCC"],
+    "document_meta": {
+        "strong": ["기본계획", "계획기간", "기준연도", "목표연도", "수립 및 추진"],
+        "weak": _SHEET_CONFIGS["document_meta"]["keywords"],
+        "negative": ["해외", "부록"],
     },
-    "energy": {
-        "strong": ["최종에너지", "에너지 소비", "에너지사용량", "에너지원별", "부문별 에너지", "TJ", "toe"],
-        "weak": _SHEET_CONFIGS["energy"]["keywords"],
-        "negative": ["예산", "재정투자", "설문"],
+    "plan_overview": {
+        "strong": ["수립 배경", "법적 근거", "추진체계", "추진절차", "경과", "공청회"],
+        "weak": _SHEET_CONFIGS["plan_overview"]["keywords"],
+        "negative": ["해외", "부록3", "부록4"],
     },
-    "ghg": {
-        "strong": [
-            "온실가스 배출량", "배출량 현황", "배출량 전망", "감축목표",
-            "BAU", "NDC", "인벤토리", "관리권한 배출량", "tCO2", "CO2eq",
-        ],
-        "weak": _SHEET_CONFIGS["ghg"]["keywords"],
-        "negative": ["재정투자", "예산", "설문", "교육 프로그램", "COP28"],
+    "regional_conditions": {
+        "strong": ["지역 현황", "지역현황", "지역 여건", "인구 현황", "에너지 현황",
+                   "자동차 등록", "경제 현황", "GRDP"],
+        "weak": _SHEET_CONFIGS["regional_conditions"]["keywords"],
+        "negative": ["감축사업", "이행계획", "해외"],
     },
-    "strategy": {
-        "strong": [
-            "부문별 감축", "감축사업", "이행계획", "세부사업", "감축량",
-            "연차별", "성과지표", "공통사업", "특화사업", "추진계획",
-        ],
-        "weak": _SHEET_CONFIGS["strategy"]["keywords"],
-        "negative": ["목차", "표 목차", "그림 목차", "설문"],
+    "emissions_regional": {
+        "strong": ["온실가스 배출량", "배출량 현황", "지역 온실가스", "GIR", "인벤토리",
+                   "직접배출량", "간접배출량", "LULUCF"],
+        "weak": _SHEET_CONFIGS["emissions_regional"]["keywords"],
+        "negative": ["재정투자", "예산", "설문", "해외"],
     },
-    "summary": {
-        "strong": ["비전", "추진전략", "기본방향", "감축목표", "핵심전략", "계획의 개요"],
-        "weak": _SHEET_CONFIGS["summary"]["keywords"],
-        "negative": ["표 목차", "그림 목차", "참고문헌", "부록"],
+    "emissions_management": {
+        "strong": ["관리권한", "관리 권한", "관리권한 배출량", "관리권한 인벤토리"],
+        "weak": _SHEET_CONFIGS["emissions_management"]["keywords"],
+        "negative": ["재정투자", "예산", "설문"],
+    },
+    "emissions_forecast": {
+        "strong": ["배출 전망", "배출전망", "BAU", "전망치", "전망방법"],
+        "weak": _SHEET_CONFIGS["emissions_forecast"]["keywords"],
+        "negative": ["재정투자", "예산"],
+    },
+    "reduction_targets": {
+        "strong": ["감축목표", "목표배출량", "감축률", "2018년 대비", "NDC"],
+        "weak": _SHEET_CONFIGS["reduction_targets"]["keywords"],
+        "negative": ["재정투자", "예산", "해외"],
+    },
+    "vision_strategy": {
+        "strong": ["비전", "추진전략", "기본방향", "핵심전략", "비전 체계"],
+        "weak": _SHEET_CONFIGS["vision_strategy"]["keywords"],
+        "negative": ["표 목차", "그림 목차", "부록"],
+    },
+    "mitigation_projects": {
+        "strong": ["감축사업", "세부사업", "추진과제", "핵심과제", "관리카드", "사업목록"],
+        "weak": _SHEET_CONFIGS["mitigation_projects"]["keywords"],
+        "negative": ["목차", "해외"],
+    },
+    "annual_implementation": {
+        "strong": ["연차별", "이행계획", "연도별 목표", "단계별 이행"],
+        "weak": _SHEET_CONFIGS["annual_implementation"]["keywords"],
+        "negative": ["목차", "해외"],
+    },
+    "quantitative_reductions": {
+        "strong": ["감축량", "감축원단위", "모니터링인자", "활동량", "배출계수"],
+        "weak": _SHEET_CONFIGS["quantitative_reductions"]["keywords"],
+        "negative": ["목차", "해외"],
+    },
+    "financial_plan": {
+        "strong": ["재정투자", "투자계획", "예산", "재원별", "국비", "시비"],
+        "weak": _SHEET_CONFIGS["financial_plan"]["keywords"],
+        "negative": ["목차", "해외"],
+    },
+    "foundation_measures": {
+        "strong": ["대응기반", "적응대책", "공유재산", "정의로운 전환", "녹색성장 촉진"],
+        "weak": _SHEET_CONFIGS["foundation_measures"]["keywords"],
+        "negative": ["목차"],
+    },
+    "governance_feedback": {
+        "strong": ["이행관리", "환류", "점검체계", "탄소중립이행책임관"],
+        "weak": _SHEET_CONFIGS["governance_feedback"]["keywords"],
+        "negative": ["목차", "해외"],
+    },
+    "monitoring_performance": {
+        "strong": ["추진상황 점검", "이행실적", "달성여부", "점검 결과"],
+        "weak": _SHEET_CONFIGS["monitoring_performance"]["keywords"],
+        "negative": ["목차", "해외"],
+    },
+    "changes_actions": {
+        "strong": ["변경과제", "변경추진사업", "미달성 사유", "조치계획", "개선"],
+        "weak": _SHEET_CONFIGS["changes_actions"]["keywords"],
+        "negative": ["목차", "해외"],
     },
 }
 
@@ -173,12 +340,10 @@ def _build_page_text(pages: list[PageContent]) -> str:
 
 
 def _has_keywords(text: str, keywords: list[str]) -> bool:
-    """배치 텍스트에 해당 유형의 키워드가 하나라도 있는지 확인"""
     return any(kw in text for kw in keywords)
 
 
 def _page_title_score(text: str, keywords: list[str]) -> int:
-    """페이지 앞부분/제목형 라인에 키워드가 있으면 가중치를 더 준다."""
     score = 0
     head = text[:1200]
     for line in head.splitlines()[:18]:
@@ -192,8 +357,9 @@ def _page_title_score(text: str, keywords: list[str]) -> int:
 
 
 def _score_page_for_sheet(page: PageContent, sheet_key: str) -> int:
-    """페이지가 특정 시트 추출에 얼마나 관련 있는지 결정론적으로 점수화."""
-    cfg = _ROUTE_CONFIGS[sheet_key]
+    cfg = _ROUTE_CONFIGS.get(sheet_key)
+    if not cfg:
+        return 0
     text = page.text or ""
     table_text = "\n".join(page.tables or [])
     combined = f"{text}\n{table_text}"
@@ -205,13 +371,6 @@ def _score_page_for_sheet(page: PageContent, sheet_key: str) -> int:
 
     if page.tables:
         score += 2
-    if sheet_key == "ghg" and re.search(r"\b20(1[8-9]|2[0-9]|3[0-4])\b", combined):
-        score += 1
-    if sheet_key == "strategy" and any(t in combined for t in ["계획(감축량)", "계획(예산)", "계획(지표)", "실적"]):
-        score += 2
-    if sheet_key == "summary" and page.page_number <= 40:
-        score += 1
-
     score -= sum(2 for kw in cfg["negative"] if kw in combined)
     return score
 
@@ -221,15 +380,8 @@ def _route_pages_by_sheet(
     context_pages: int = config.DOCUMENT_ROUTE_CONTEXT_PAGES,
     min_score: int = config.DOCUMENT_ROUTE_MIN_SCORE,
 ) -> dict[str, list[PageContent]]:
-    """
-    전체 문서를 시트별 후보 페이지로 라우팅.
-
-    점수가 높은 페이지와 그 앞뒤 일부 문맥 페이지만 LLM에 전달하여
-    토큰 낭비와 관련 없는 숫자 혼입을 줄인다.
-    """
     by_num = {p.page_number: p for p in pages}
     routed: dict[str, list[PageContent]] = {}
-
     max_pages_by_sheet = getattr(config, "DOCUMENT_ROUTE_MAX_PAGES", {})
 
     for sheet_key in _SHEET_CONFIGS:
@@ -239,8 +391,6 @@ def _route_pages_by_sheet(
             if score >= min_score:
                 scored_pages.append((score, page.page_number))
 
-        # 점수가 높은 핵심 페이지를 먼저 고르고, 이후 앞뒤 문맥 페이지를 붙인다.
-        # 단, summary처럼 광범위하게 매칭되는 시트는 상한을 두어 반복 호출을 막는다.
         scored_pages.sort(key=lambda item: (item[0], -item[1]), reverse=True)
         max_pages = max_pages_by_sheet.get(sheet_key)
         anchor_limit = max_pages if isinstance(max_pages, int) and max_pages > 0 else None
@@ -266,13 +416,11 @@ def _route_pages_by_sheet(
 
 
 class ExtractorAgent:
-    """에이전트 2: 텍스트·표 추출 에이전트 (시트별 분리 호출)"""
+    """에이전트 2: 텍스트·표 추출 에이전트 (가이드라인 기반 16개 시트)"""
 
     def __init__(self):
-        self._raw_results: dict = {
-            "vehicle": [], "energy": [], "ghg": [],
-            "strategy": [], "summary": [], "municipality_name": "",
-        }
+        self._raw_results: dict = {key: [] for key in _SHEET_CONFIGS}
+        self._raw_results["municipality_name"] = ""
 
     def _extract_municipality_name(self, full_text: str) -> str:
         prompt = (
@@ -291,17 +439,15 @@ class ExtractorAgent:
         municipality: str,
         guideline_prompt: str = "",
     ) -> list:
-        """단일 시트 유형 추출 (키워드 프리필터 포함)"""
         cfg = _SHEET_CONFIGS[sheet_key]
 
-        # 키워드 없으면 API 호출 건너뜀
-        if not _has_keywords(batch_text, cfg["keywords"]):
+        if not getattr(config, "FULL_DOCUMENT_SCAN", False) and not _has_keywords(batch_text, cfg["keywords"]):
             return []
 
         guideline_block = ""
         if guideline_prompt:
             guideline_block = (
-                "\n\n[환경부 HWP 가이드라인 기반 보조 지침]\n"
+                "\n\n[환경부 가이드라인 기반 보조 지침]\n"
                 f"{guideline_prompt}\n"
                 "위 지침과 배치 텍스트가 충돌할 경우, 배치 텍스트의 실제 수치와 단위를 우선하되 "
                 "필드 구성과 분류 체계는 가이드라인을 따르세요.\n"
@@ -326,15 +472,9 @@ class ExtractorAgent:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            # 지자체명 보정
             if not item.get("지자체명"):
                 item["지자체명"] = municipality
-            # null 연도 제거 (출력 토큰 절감 + 잘린 JSON 영향 최소화)
-            if "연도별" in item and isinstance(item["연도별"], dict):
-                item["연도별"] = {
-                    k: v for k, v in item["연도별"].items() if v is not None
-                }
-        return items
+        return [item for item in items if isinstance(item, dict)]
 
     def extract(
         self,
@@ -348,25 +488,33 @@ class ExtractorAgent:
         self._raw_results["municipality_name"] = municipality
         print(f"[에이전트2 텍스트추출] 지자체명: {municipality}")
 
+        if getattr(config, "FULL_DOCUMENT_SCAN", False):
+            print("[에이전트2 텍스트추출] 전체 문서 스캔 모드")
+            batches = [pages[i:i + batch_size] for i in range(0, len(pages), batch_size)]
+            for batch_num, batch in enumerate(batches, start=1):
+                batch_text = _build_page_text(batch)
+                page_nums = [p.page_number for p in batch]
+                page_range = f"p{page_nums[0]}~{page_nums[-1]}" if len(page_nums) > 1 else f"p{page_nums[0]}"
+                for sheet_key in _SHEET_CONFIGS:
+                    guideline_prompt = extraction_prompts.get(sheet_key, "")
+                    items = self._extract_sheet(sheet_key, batch_text, municipality, guideline_prompt)
+                    self._raw_results[sheet_key].extend(items)
+                print(f"  [full] 배치 {batch_num:>2}/{len(batches)} ({page_range}) 완료")
+
+            total = {k: len(v) for k, v in self._raw_results.items() if isinstance(v, list)}
+            print(f"[에이전트2 텍스트추출] 완료. 누적: {total}")
+            return self._raw_results
+
         routed_pages = _route_pages_by_sheet(pages)
-        route_summary = {k: len(v) for k, v in routed_pages.items()}
-        print(f"[에이전트2 텍스트추출] 문서 구조 라우팅 완료(시트별 후보 페이지 수): {route_summary}")
+        route_summary = {k: len(v) for k, v in routed_pages.items() if v}
+        print(f"[에이전트2 텍스트추출] 문서 구조 라우팅 완료: {route_summary}")
 
-        total_candidate_pages = sum(route_summary.values())
-        print(
-            f"[에이전트2 텍스트추출] 총 {len(pages)}페이지 → "
-            f"시트별 후보 페이지 합계 {total_candidate_pages}개(시트 간 중복 포함) / 시트별 분리 호출"
-        )
-
-        for sheet_key in ["vehicle", "energy", "ghg", "strategy", "summary"]:
+        for sheet_key in _SHEET_CONFIGS:
             sheet_pages = routed_pages.get(sheet_key, [])
             if not sheet_pages:
-                print(f"  [{sheet_key}] 후보 페이지 없음, 건너뜀")
                 continue
 
             batches = [sheet_pages[i:i + batch_size] for i in range(0, len(sheet_pages), batch_size)]
-            total_batches = len(batches)
-
             for batch_num, batch in enumerate(batches, start=1):
                 batch_text = _build_page_text(batch)
                 page_nums = [p.page_number for p in batch]
@@ -375,14 +523,14 @@ class ExtractorAgent:
                 items = self._extract_sheet(sheet_key, batch_text, municipality, guideline_prompt)
                 self._raw_results[sheet_key].extend(items)
                 status = f"{len(items)}건" if items else "추출 없음"
-                print(f"  [{sheet_key}] 배치 {batch_num:>2}/{total_batches} ({page_range}): {status}")
+                print(f"  [{sheet_key}] 배치 {batch_num:>2}/{len(batches)} ({page_range}): {status}")
 
-        total = {k: len(self._raw_results[k]) for k in ["vehicle", "energy", "ghg", "strategy", "summary"]}
+        total = {k: len(v) for k, v in self._raw_results.items() if isinstance(v, list) and v}
         print(f"[에이전트2 텍스트추출] 완료. 누적: {total}")
         return self._raw_results
 
     def report(self) -> str:
-        counts = {k: len(v) for k, v in self._raw_results.items() if isinstance(v, list)}
+        counts = {k: len(v) for k, v in self._raw_results.items() if isinstance(v, list) and v}
         return (
             f"[에이전트2 텍스트추출] 추출 완료\n"
             f"  - 지자체명: {self._raw_results.get('municipality_name', '미확인')}\n"

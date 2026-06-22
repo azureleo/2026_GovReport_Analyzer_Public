@@ -4,8 +4,9 @@
 환경부 「지자체 탄소중립 녹색성장 기본계획 수립 및 추진상황 점검 가이드라인」에 따라
 추출해야 할 정보의 스키마를 정의하고 반환합니다.
 
-기본 스키마는 코드 내에 내장되어 있으며, HWP 가이드라인 파일이 제공되면
-kordoc 기반 HWP 파서를 통해 문서 내용을 읽고 시트별 보조 지침으로 반영합니다.
+기본 스키마는 코드 내에 내장되어 있으며, 프로젝트 루트의 carbon_guideline.md가 존재하면
+이를 시트별 보조 지침으로 우선 활용합니다. carbon_guideline.md가 없고 HWP 파일이
+제공된 경우에만 kordoc 기반 HWP 파서를 fallback으로 사용합니다.
 """
 
 import json
@@ -16,6 +17,10 @@ from pathlib import Path
 
 import config
 from utils.hwp_reader import extract_hwp, is_hwp_file
+from utils import llm_client
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_MARKDOWN_GUIDELINE_PATH = _PROJECT_ROOT / "carbon_guideline.md"
 
 
 logger = logging.getLogger(__name__)
@@ -116,34 +121,64 @@ GUIDELINE_SCHEMA = {
         ],
     },
 
-    # ── 시트 5: 지자체별 요약카드 ────────────────────────────────────
+    # ── 시트 5: 비전·전략 ────────────────────────────────────
     "summary_card": {
-        "sheet_name": "지자체별 요약카드",
-        "description": "지자체 탄소중립 계획의 핵심 내용 요약",
+        "sheet_name": "비전·전략",
+        "description": "지자체 탄소중립 계획의 비전, 전략, 목표 핵심 요약",
         "fields": {
             "지자체명": "시·군·구 명칭",
-            "항목": " / ".join(config.SUMMARY_ITEMS),
-            "내용": "해당 항목의 핵심 내용 (2~5문장 이내로 간결하게)",
-            "근거": "보고서 내 근거 위치 (예: 보고서 p.45, 3장 온실가스 배출 현황)",
+            "비전문구": "2050 탄소중립 미래상 등 비전 원문",
+            "전략수준": "비전 / 추진전략 / 세부전략",
+            "전략명": "전략 명칭",
+            "부문": "관련 부문",
+            "설명": "전략 설명",
         },
-        "items": config.SUMMARY_ITEMS,
         "extraction_hints": [
-            "배출유형: 직접/간접/흡수원 배출 구성 및 주요 배출원 설명",
-            "감축목표(2030): 2030년 온실가스 감축 목표량 및 감축률",
-            "감축목표(2035): 2035년 목표 (있는 경우)",
-            "핵심전략: 지자체의 핵심 감축 전략 3~5가지",
-            "배출유형-전략 간 연결성: 주요 배출 부문과 대응 감축 전략의 연결 관계",
+            "비전: 2050 탄소중립 관련 미래상 및 슬로건",
+            "추진전략: 부문별 핵심 추진 전략",
+            "세부전략: 세부 실행 방안",
         ],
     },
 }
 
 
 _EXTRACTOR_KEY_MAP = {
-    "vehicle": "vehicle_by_use",
-    "energy": "energy_by_use",
-    "ghg": "greenhouse_gas",
-    "strategy": "reduction_strategy",
-    "summary": "summary_card",
+    "document_meta": "vehicle_by_use",
+    "plan_overview": "vehicle_by_use",
+    "regional_conditions": "energy_by_use",
+    "emissions_regional": "greenhouse_gas",
+    "emissions_management": "greenhouse_gas",
+    "emissions_forecast": "greenhouse_gas",
+    "reduction_targets": "greenhouse_gas",
+    "vision_strategy": "summary_card",
+    "mitigation_projects": "reduction_strategy",
+    "annual_implementation": "reduction_strategy",
+    "quantitative_reductions": "reduction_strategy",
+    "financial_plan": "reduction_strategy",
+    "foundation_measures": "summary_card",
+    "governance_feedback": "summary_card",
+    "monitoring_performance": "reduction_strategy",
+    "changes_actions": "reduction_strategy",
+}
+
+# 새 16개 시트에서 가이드라인 문맥 검색에 사용하는 키워드
+_GUIDELINE_CONTEXT_RULES_V2 = {
+    "document_meta": ["기본계획", "계획기간", "기준연도", "목표연도", "수립", "법적 근거"],
+    "plan_overview": ["추진체계", "추진절차", "경과", "공청회", "자문", "위원회"],
+    "regional_conditions": ["인구", "면적", "GRDP", "에너지", "차량", "전력", "건축물"],
+    "emissions_regional": ["온실가스", "배출량", "직접배출", "간접배출", "GIR", "인벤토리", "LULUCF"],
+    "emissions_management": ["관리권한", "건물", "수송", "농축산", "폐기물", "흡수원"],
+    "emissions_forecast": ["전망", "BAU", "시계열", "LEAP", "증가율"],
+    "reduction_targets": ["감축목표", "감축률", "목표배출량", "NDC", "2030", "2018년 대비"],
+    "vision_strategy": ["비전", "전략", "추진방향", "핵심", "슬로건"],
+    "mitigation_projects": ["감축사업", "세부사업", "핵심과제", "관리번호", "성과지표", "주관부서"],
+    "annual_implementation": ["연차별", "이행계획", "단계별", "목표물량"],
+    "quantitative_reductions": ["감축량", "감축원단위", "모니터링", "활동량", "배출계수"],
+    "financial_plan": ["재정", "투자", "예산", "국비", "시비", "도비"],
+    "foundation_measures": ["적응", "공유재산", "국제협력", "교육", "녹색성장", "정의로운 전환"],
+    "governance_feedback": ["이행관리", "환류", "점검체계", "탄소중립이행책임관"],
+    "monitoring_performance": ["추진상황", "점검", "달성여부", "이행실적"],
+    "changes_actions": ["변경과제", "미달성", "조치계획", "변경사유"],
 }
 
 
@@ -164,6 +199,10 @@ _GUIDELINE_CONTEXT_RULES = {
         "비전", "목표", "전략", "기본계획", "추진방향", "배출유형", "녹색성장",
     ],
 }
+
+
+_AGENT_SPEC_SYSTEM = """당신은 환경부 지자체 탄소중립 녹색성장 기본계획 가이드라인을
+엑셀 추출 요구사항으로 재구성하는 분석가입니다. 반드시 JSON만 반환하세요."""
 
 
 def _compact_text(text: str) -> str:
@@ -241,12 +280,53 @@ def _extract_guideline_context(full_text: str, max_chunks: int = 4) -> dict[str,
     return result
 
 
+def _format_context_for_agent(context: dict[str, list[str]]) -> str:
+    lines: list[str] = []
+    for schema_key, snippets in context.items():
+        lines.append(f"## {schema_key}")
+        for idx, snippet in enumerate(snippets, start=1):
+            lines.append(f"{idx}. {snippet}")
+    return "\n".join(lines)
+
+
+def _normalise_agent_spec(parsed: dict) -> dict[str, dict]:
+    """에이전트가 재구성한 가이드라인 스펙을 안전한 형태로 정리."""
+    if not isinstance(parsed, dict):
+        return {}
+    spec = parsed.get("sheets", parsed)
+    if not isinstance(spec, dict):
+        return {}
+
+    normalised: dict[str, dict] = {}
+    for schema_key in _EXTRACTOR_KEY_MAP.values():
+        raw = spec.get(schema_key)
+        if not isinstance(raw, dict):
+            continue
+        entry: dict[str, list[str]] = {}
+        for key in ["required_fields", "extraction_rules", "validation_rules", "source_keywords", "visual_rules"]:
+            values = raw.get(key, [])
+            if isinstance(values, str):
+                values = [values]
+            if isinstance(values, list):
+                entry[key] = [
+                    _compact_text(str(value))[:500]
+                    for value in values
+                    if _compact_text(str(value))
+                ][:8]
+        if any(entry.values()):
+            normalised[schema_key] = entry
+    return normalised
+
+
 class GuidelineAgent:
     """
     에이전트 1: 가이드라인 분석 에이전트
 
     추출 스키마를 반환하고, 각 시트의 추출 지침을 제공합니다.
-    HWP 파일이 제공된 경우 추가 컨텍스트를 읽어 보완합니다.
+
+    가이드라인 로드 우선순위:
+    1. 프로젝트 루트의 carbon_guideline.md (사전 구조화된 마크다운)
+    2. --guideline 옵션으로 전달된 HWP/HWPX 파일 (fallback)
     """
 
     def __init__(self, hwp_path: str | None = None):
@@ -254,14 +334,36 @@ class GuidelineAgent:
         self.schema = deepcopy(GUIDELINE_SCHEMA)
         self.guideline_text = ""
         self.guideline_context: dict[str, list[str]] = {}
+        self.agent_spec: dict[str, dict] = {}
         self.guideline_loaded = False
         self.guideline_error = ""
+        self.guideline_source = ""
 
-        if hwp_path:
+        # 우선순위 1: carbon_guideline.md
+        if _MARKDOWN_GUIDELINE_PATH.exists():
+            self._load_markdown_guideline()
+        elif hwp_path:
+            # 우선순위 2: HWP fallback
             self._load_hwp_guideline(hwp_path)
 
+    def _load_markdown_guideline(self):
+        """사전 구조화된 carbon_guideline.md에서 시트별 보조 지침을 로드."""
+        try:
+            text = _MARKDOWN_GUIDELINE_PATH.read_text(encoding="utf-8")
+            self.guideline_text = text
+            self.guideline_context = _extract_guideline_context(text)
+            self.guideline_loaded = bool(text.strip())
+            self.guideline_source = str(_MARKDOWN_GUIDELINE_PATH.name)
+
+            for schema_key, snippets in self.guideline_context.items():
+                if schema_key in self.schema and isinstance(self.schema[schema_key], dict):
+                    self.schema[schema_key]["guideline_context"] = snippets
+        except Exception as exc:
+            self.guideline_error = f"carbon_guideline.md 로드 실패: {exc}"
+            logger.warning(self.guideline_error)
+
     def _load_hwp_guideline(self, hwp_path: str):
-        """HWP/HWPX 가이드라인을 실제로 파싱해 시트별 보조 지침으로 저장."""
+        """HWP/HWPX 가이드라인을 실제로 파싱해 시트별 보조 지침으로 저장. (fallback)"""
         path = Path(hwp_path)
         if not path.exists():
             self.guideline_error = f"파일 없음: {path}"
@@ -277,13 +379,57 @@ class GuidelineAgent:
             self.guideline_text = content.full_text
             self.guideline_context = _extract_guideline_context(content.full_text)
             self.guideline_loaded = bool(self.guideline_text.strip())
+            self.guideline_source = str(path.name)
+            if self.guideline_loaded and config.GUIDELINE_AGENT_SPEC_ENABLED:
+                self.agent_spec = self._build_agent_spec()
 
             for schema_key, snippets in self.guideline_context.items():
                 if schema_key in self.schema and isinstance(self.schema[schema_key], dict):
                     self.schema[schema_key]["guideline_context"] = snippets
+            for schema_key, spec in self.agent_spec.items():
+                if schema_key in self.schema and isinstance(self.schema[schema_key], dict):
+                    self.schema[schema_key]["agent_guideline_spec"] = spec
         except Exception as exc:
             self.guideline_error = str(exc)
             logger.warning(f"가이드라인 HWP 파싱 실패: {exc}")
+
+    def _build_agent_spec(self) -> dict[str, dict]:
+        """
+        HWP에서 선별한 관련 문맥을 다시 로컬 에이전트에 맡겨 시트별 요구사항으로 재구성.
+
+        코드에 내장된 기본 스키마는 엑셀 컬럼 안정성을 위한 fallback이고, 실제 추출 지침은
+        매 실행 시 HWP 내용에서 재구성한 agent_guideline_spec을 프롬프트에 추가한다.
+        """
+        context_text = _format_context_for_agent(self.guideline_context)
+        if not context_text.strip():
+            return {}
+
+        prompt = f"""아래는 환경부 HWP 가이드라인에서 시트별로 선별한 원문 조각입니다.
+이 조각만 근거로 각 시트에서 반드시 추출해야 하는 필드, 추출 규칙, 검증 규칙,
+그래프/표/이미지에서 확인해야 할 비정형 데이터 규칙을 재구성하세요.
+
+반환 JSON 형식:
+{{
+  "sheets": {{
+    "vehicle_by_use": {{
+      "required_fields": ["..."],
+      "source_keywords": ["..."],
+      "extraction_rules": ["..."],
+      "visual_rules": ["..."],
+      "validation_rules": ["..."]
+    }},
+    "energy_by_use": {{}},
+    "greenhouse_gas": {{}},
+    "reduction_strategy": {{}},
+    "summary_card": {{}}
+  }}
+}}
+
+[HWP 가이드라인 관련 문맥]
+{context_text[:12000]}
+"""
+        response = llm_client.call_text(prompt, system=_AGENT_SPEC_SYSTEM, max_retries=1)
+        return _normalise_agent_spec(llm_client.parse_json(response))
 
     def get_schema(self) -> dict:
         """추출 스키마 반환"""
@@ -309,14 +455,61 @@ class GuidelineAgent:
             lines.append("\n## HWP 가이드라인에서 추출한 관련 지침")
             for idx, snippet in enumerate(guideline_context, start=1):
                 lines.append(f"{idx}. {snippet}")
+        agent_spec = info.get("agent_guideline_spec", {})
+        if agent_spec:
+            lines.append("\n## 로컬 에이전트가 HWP에서 재구성한 실행 규칙")
+            section_names = {
+                "required_fields": "필수 필드",
+                "source_keywords": "원문 탐색 키워드",
+                "extraction_rules": "추출 규칙",
+                "visual_rules": "표·그래프·이미지 판독 규칙",
+                "validation_rules": "검증 규칙",
+            }
+            for key, title in section_names.items():
+                values = agent_spec.get(key, [])
+                if values:
+                    lines.append(f"\n### {title}")
+                    for value in values:
+                        lines.append(f"- {value}")
         return "\n".join(lines)
 
     def get_all_prompts(self) -> dict[str, str]:
-        """모든 시트의 추출 프롬프트를 extractor 키 기준으로 반환"""
-        return {
-            extractor_key: self.get_extraction_prompt(schema_key)
-            for extractor_key, schema_key in _EXTRACTOR_KEY_MAP.items()
-        }
+        """모든 16개 시트의 추출 보조 프롬프트를 시트키 기준으로 반환"""
+        prompts: dict[str, str] = {}
+        for sheet_key, keywords in _GUIDELINE_CONTEXT_RULES_V2.items():
+            snippets = self._get_relevant_snippets(keywords)
+            if snippets:
+                lines = [f"[가이드라인 보조 지침: {sheet_key}]"]
+                for idx, snippet in enumerate(snippets, start=1):
+                    lines.append(f"{idx}. {snippet}")
+                prompts[sheet_key] = "\n".join(lines)
+            else:
+                prompts[sheet_key] = ""
+        return prompts
+
+    def _get_relevant_snippets(self, keywords: list[str], max_chunks: int = 3) -> list[str]:
+        """가이드라인 텍스트에서 키워드 관련 조각을 반환"""
+        if not self.guideline_text:
+            return []
+        chunks = _split_guideline_sentences(self.guideline_text)
+        ranked = sorted(
+            ((_score_guideline_chunk(chunk, keywords), chunk) for chunk in chunks),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        selected = []
+        seen = set()
+        for score, chunk in ranked:
+            if score <= 0:
+                break
+            compact = _compact_text(chunk)
+            if not compact or compact in seen:
+                continue
+            seen.add(compact)
+            selected.append(compact[:500])
+            if len(selected) >= max_chunks:
+                break
+        return selected
 
     def report(self) -> str:
         """에이전트 상태 보고"""
@@ -325,13 +518,15 @@ class GuidelineAgent:
             f"[에이전트1 가이드라인] 로드 완료\n"
             f"  - 추출 대상 시트: {len(sheets)}개\n"
             f"  - 시트 목록: {', '.join(sheets)}\n"
-            f"  - HWP 가이드라인 파일: {self._guideline_status()}"
+            f"  - 가이드라인 출처: {self._guideline_status()}"
         )
 
     def _guideline_status(self) -> str:
-        if not self.hwp_path:
-            return "없음 (내장 스키마 사용)"
         if self.guideline_loaded:
             total_snippets = sum(len(v) for v in self.guideline_context.values())
-            return f"파싱 완료 ({self.hwp_path}, 관련 지침 {total_snippets}개 반영)"
-        return f"파싱 실패/미반영 ({self.hwp_path}; {self.guideline_error or '원인 미상'})"
+            spec_count = len(self.agent_spec)
+            spec_text = f", 에이전트 재구성 {spec_count}개 시트" if spec_count else ""
+            return f"로드 완료 ({self.guideline_source}, 관련 지침 {total_snippets}개 반영{spec_text})"
+        if self.guideline_error:
+            return f"로드 실패 ({self.guideline_error})"
+        return "없음 (내장 스키마 사용)"

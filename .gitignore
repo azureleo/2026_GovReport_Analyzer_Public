@@ -8,6 +8,9 @@ node_modules/
 npm-debug.log*
 
 .claude/
+.omc/
+.omx/
+.DS_Store
 
 *.xlsx
 *_결과*.xlsx
@@ -15,3 +18,8 @@ npm-debug.log*
 
 *.tmp
 *.log
+
+# 내부 작업 문서
+16guide.md
+excel_source_verification*.json
+*.hwp
