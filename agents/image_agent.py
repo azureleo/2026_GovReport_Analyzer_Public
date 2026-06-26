@@ -93,7 +93,7 @@ def _coverage_reduce_images(raw_images: list[tuple[PageContent, dict]]) -> list[
 
 
 _CHART_CONTEXT_KEYWORDS = [
-    "그림", "그래프", "차트", "도표", "표", "추이", "전망", "현황", "목표",
+    "그림", "그래프", "차트", "도표", "추이", "전망", "현황",
     "배출량", "온실가스", "감축", "BAU", "NDC", "tCO2", "CO2eq", "비율", "%",
 ]
 
@@ -105,6 +105,8 @@ _LOCAL_DIRECT_DATA_KEYWORDS = [
     "배출량", "배출 현황", "배출 전망", "감축목표", "감축사업", "추진계획",
     "최종에너지", "에너지 소비", "자동차 등록", "주행거리",
 ]
+
+_TABLE_MARKER_PATTERN = re.compile(r"(?m)(?:^\s*\[?\s*표\s*\d|[\[\(]\s*표\s*\d)")
 
 
 def _visual_title_from_text(text: str) -> str:
@@ -288,6 +290,8 @@ def _context_score(page: PageContent) -> tuple[int, list[str]]:
     score = 0
     reasons: list[str] = []
     hits = [kw for kw in _CHART_CONTEXT_KEYWORDS if kw in text]
+    if _TABLE_MARKER_PATTERN.search(text):
+        hits.append("표")
     if hits:
         score += min(len(hits), 5)
         reasons.append("context:" + ",".join(hits[:4]))
@@ -297,9 +301,6 @@ def _context_score(page: PageContent) -> tuple[int, list[str]]:
         score -= min(len(negatives) * 2, 6)
         reasons.append("negative_context:" + ",".join(negatives[:3]))
 
-    if page.tables:
-        score += 2
-        reasons.append("page_has_tables")
     return score, reasons
 
 
@@ -335,12 +336,16 @@ def _triage_image(page: PageContent, image: dict) -> dict:
     score = image_score + context_score
 
     caption = image.get("caption", "")
+    is_full_render = "full render" in caption.lower()
     keep_rendered = (
         config.IMAGE_TRIAGE_KEEP_RENDERED_CONTEXT
-        and "full render" in caption.lower()
+        and is_full_render
         and context_score >= 3
     )
     passed = score >= config.IMAGE_TRIAGE_MIN_SCORE or keep_rendered
+    if is_full_render and context_score < 2 and score < config.IMAGE_TRIAGE_MIN_SCORE + 3:
+        passed = False
+        context_reasons.append("weak_render_context")
 
     return {
         "page": page,

@@ -28,9 +28,33 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import config
+from utils.llm_cache import LLMCacheRequest, cached_response
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class LLMCallError(RuntimeError):
+    """LLM/로컬 에이전트 호출 실패."""
+
+
+class LLMQuotaExceededError(LLMCallError):
+    """계정 quota, 세션 한도, rate limit처럼 즉시 회복되지 않는 실패."""
+
+
+_QUOTA_ERROR_MARKERS = (
+    "session limit",
+    "you've hit your session limit",
+    "quota",
+    "resource_exhausted",
+    "resource exhausted",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "429",
+    "한도",
+    "할당량",
+)
 
 _JSON_ONLY_INSTRUCTION = """
 당신은 지자체 탄소중립 계획 문서에서 구조화 데이터를 추출하는 로컬 에이전트입니다.
@@ -117,6 +141,27 @@ def _tail(text: str, limit: int = 1200) -> str:
     return text[-limit:]
 
 
+def _is_quota_error_message(message: str) -> bool:
+    normalized = message.casefold()
+    return any(marker in normalized for marker in _QUOTA_ERROR_MARKERS)
+
+
+def _model_identity(provider: str) -> str:
+    if provider == "gemini":
+        return str(getattr(config, "MODEL", ""))
+    if provider == "codex":
+        return ":".join([
+            str(getattr(config, "CODEX_COMMAND", "codex")),
+            str(getattr(config, "LOCAL_AGENT_MODEL", "")),
+        ])
+    if provider == "claude":
+        return ":".join([
+            str(getattr(config, "CLAUDE_COMMAND", "claude")),
+            str(getattr(config, "LOCAL_AGENT_MODEL", "")),
+        ])
+    return str(getattr(config, "LOCAL_AGENT_MODEL", ""))
+
+
 def _run_command(command: Sequence[str], prompt: str, *, cwd: Path, timeout: int) -> str:
     """로컬 CLI를 실행하고 stdout을 반환한다."""
     logger.debug("로컬 에이전트 실행: %s", " ".join(shlex.quote(part) for part in command))
@@ -130,20 +175,23 @@ def _run_command(command: Sequence[str], prompt: str, *, cwd: Path, timeout: int
         check=False,
     )
     if completed.returncode != 0:
-        raise RuntimeError(
+        message = (
             "로컬 에이전트 실행 실패 "
             f"(exit={completed.returncode})\n"
             f"STDERR:\n{_tail(completed.stderr)}\n"
             f"STDOUT:\n{_tail(completed.stdout)}"
         )
+        if _is_quota_error_message(message):
+            raise LLMQuotaExceededError(message)
+        raise LLMCallError(message)
     return completed.stdout.strip()
 
 
 def _run_codex(
     prompt: str,
     *,
-    image_path: Path | None = None,
     image_paths: Sequence[Path] | None = None,
+    cwd: Path,
 ) -> str:
     timeout = int(getattr(config, "LOCAL_AGENT_TIMEOUT", 900))
     command = _split_command(getattr(config, "CODEX_COMMAND", "codex"))
@@ -154,8 +202,10 @@ def _run_codex(
             "exec",
             "--sandbox",
             "read-only",
+            # 추출은 레포 파일 접근이 불필요하다. AGENTS.md 자동 로드를 피하려고
+            # 프로젝트 루트가 아닌 중립 작업 디렉터리에서 실행한다.
             "--cd",
-            str(PROJECT_ROOT),
+            str(cwd),
             "--ephemeral",
             "--color",
             "never",
@@ -165,12 +215,11 @@ def _run_codex(
         model = getattr(config, "LOCAL_AGENT_MODEL", "")
         if model:
             command += ["--model", model]
-        paths = list(image_paths or ([] if image_path is None else [image_path]))
-        for path in paths:
+        for path in list(image_paths or []):
             command += ["--image", str(path)]
         command.append("-")
 
-        stdout = _run_command(command, prompt, cwd=PROJECT_ROOT, timeout=timeout)
+        stdout = _run_command(command, prompt, cwd=cwd, timeout=timeout)
         if output_path.exists():
             message = output_path.read_text(encoding="utf-8").strip()
             if message:
@@ -178,30 +227,59 @@ def _run_codex(
         return stdout
 
 
+def _claude_minimal_flags(image_paths: Sequence[Path]) -> list[str]:
+    """
+    추출은 단발 JSON 작업이라 레포/ MCP/스킬/프로젝트 메모리가 불필요하다.
+    호출당 세션 오버헤드(프로젝트 CLAUDE.md, MCP 서버 스키마, 스킬, 설정/훅,
+    동적 시스템 프롬프트 섹션)를 끈다. 추출 출력에는 영향이 없다.
+
+    텍스트 호출은 도구 자체를 비활성화하고, 이미지 호출은 로컬 이미지 판독에
+    필요한 Read만 허용한다.
+    """
+    if not getattr(config, "CLAUDE_MINIMAL_SESSION", True):
+        return []
+    tools = "Read" if image_paths else ""
+    return [
+        "--tools",
+        tools,
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--disable-slash-commands",
+        "--setting-sources",
+        "",
+        "--exclude-dynamic-system-prompt-sections",
+    ]
+
+
 def _run_claude(
     prompt: str,
     *,
-    image_path: Path | None = None,
     image_paths: Sequence[Path] | None = None,
+    cwd: Path,
 ) -> str:
     # Claude Code는 버전별 CLI 옵션 차이가 있어 가장 보편적인 print 모드를 사용한다.
-    # 이미지가 있으면 prompt에 임시 파일 경로가 포함되어 Claude가 로컬 파일로 읽을 수 있다.
+    # 이미지가 있으면 prompt에 cwd 내부 임시 파일 경로가 포함되어 Claude가 읽을 수 있다.
     timeout = int(getattr(config, "LOCAL_AGENT_TIMEOUT", 900))
     base_command = _split_command(getattr(config, "CLAUDE_COMMAND", "claude"))
+    paths = list(image_paths or [])
     command = [*base_command, "-p", "--output-format", "text"]
     model = getattr(config, "LOCAL_AGENT_MODEL", "")
     if model:
         command += ["--model", model]
+    command += _claude_minimal_flags(paths)
     try:
-        return _run_command(command, prompt, cwd=PROJECT_ROOT, timeout=timeout)
-    except RuntimeError:
+        return _run_command(command, prompt, cwd=cwd, timeout=timeout)
+    except LLMQuotaExceededError:
+        raise
+    except LLMCallError:
         # 일부 Claude Code 버전은 print 모드에서 stdin 대신 prompt positional arg를 기대한다.
         # 긴 문서 프롬프트는 argv 한도를 넘을 수 있으므로 짧은 경우에만 호환 폴백을 시도한다.
         if len(prompt) > 100_000:
             raise
         fallback = [*command, prompt]
         logger.debug("Claude stdin 실행 실패, positional prompt 폴백 시도")
-        return _run_command(fallback, "", cwd=PROJECT_ROOT, timeout=timeout)
+        return _run_command(fallback, "", cwd=cwd, timeout=timeout)
 
 
 def _call_local_agent(
@@ -213,42 +291,41 @@ def _call_local_agent(
     provider: str | None = None,
 ) -> str:
     provider = provider or _resolve_provider()
-    image_path: Path | None = None
-    image_paths: list[Path] = []
-    temp_dir: tempfile.TemporaryDirectory[str] | None = None
-    try:
-        images = list(images_b64 or ([] if image_b64 is None else [image_b64]))
-        if images:
-            temp_dir = tempfile.TemporaryDirectory(prefix="carbon-agent-image-")
-            for idx, image in enumerate(images, start=1):
-                path = Path(temp_dir.name) / f"input_{idx:03d}.png"
-                path.write_bytes(base64.b64decode(image))
-                image_paths.append(path)
-            image_path = image_paths[0] if len(image_paths) == 1 else None
+    images = list(images_b64 or ([] if image_b64 is None else [image_b64]))
+    # 호출마다 깨끗한 작업 디렉터리를 쓴다. 프로젝트 CLAUDE.md/AGENTS.md 자동 로드를
+    # 막고, 이미지는 이 디렉터리 안에 기록해 에이전트가 cwd 내부에서 읽게 한다.
+    with tempfile.TemporaryDirectory(prefix="carbon-agent-") as workdir_name:
+        workdir = Path(workdir_name)
+        image_paths: list[Path] = []
+        for idx, image in enumerate(images, start=1):
+            path = workdir / f"input_{idx:03d}.png"
+            path.write_bytes(base64.b64decode(image))
+            image_paths.append(path)
+        image_path = image_paths[0] if len(image_paths) == 1 else None
 
         prepared = _agent_prompt(prompt, system, image_path=image_path, image_paths=image_paths)
         if provider == "codex":
-            return _run_codex(prepared, image_path=image_path, image_paths=image_paths)
+            return _run_codex(prepared, image_paths=image_paths, cwd=workdir)
         if provider == "claude":
-            return _run_claude(prepared, image_path=image_path, image_paths=image_paths)
+            return _run_claude(prepared, image_paths=image_paths, cwd=workdir)
         raise RuntimeError(f"지원하지 않는 로컬 에이전트입니다: {provider}")
-    finally:
-        if temp_dir is not None:
-            temp_dir.cleanup()
 
 
 def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
     for attempt in range(1, max_retries + 1):
         try:
             return fn()
-        except Exception as exc:  # noqa: BLE001 - CLI 오류는 다양한 예외로 들어온다.
+        except LLMQuotaExceededError:
+            logger.error("%s quota/세션 한도 초과. 현재 결과로 진행하지 않고 중단합니다.", label)
+            raise
+        except (LLMCallError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
             if attempt >= max_retries:
                 logger.error("%s 최대 재시도 초과: %s", label, exc)
-                return "{}"
+                raise LLMCallError(f"{label} 최대 재시도 초과") from exc
             wait = min(5 * attempt, 30)
             logger.warning("%s 오류: %s. %s초 후 재시도 (%s/%s)", label, exc, wait, attempt, max_retries)
             time.sleep(wait)
-    return "{}"
+    raise LLMCallError(f"{label} 호출 실패")
 
 
 def call_text(prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> str:
@@ -256,16 +333,29 @@ def call_text(prompt: str, system: str = "", max_retries: int = config.MAX_RETRI
     텍스트 프롬프트를 선택된 백엔드에 전달한다.
 
     기본값은 Gemini API가 아니라 로컬 Codex CLI이며, 응답은 JSON 문자열이어야 한다.
-    실패 시 기존 파이프라인 호환을 위해 "{}"를 반환한다.
+    실패 시 빈 JSON으로 품질 저하를 숨기지 않고 예외를 발생시킨다.
     """
     provider = _resolve_provider()
+    request = LLMCacheRequest(
+        call_kind="text",
+        provider=provider,
+        model=_model_identity(provider),
+        system=system,
+        prompt=prompt,
+    )
     if provider == "gemini":
-        return _call_gemini_text(prompt, system, max_retries=max_retries)
+        return cached_response(
+            request,
+            lambda: _call_gemini_text(prompt, system, max_retries=max_retries),
+        )
 
-    return _retry_local_call(
-        lambda: _call_local_agent(prompt, system, provider=provider),
-        max_retries=max_retries,
-        label=provider,
+    return cached_response(
+        request,
+        lambda: _retry_local_call(
+            lambda: _call_local_agent(prompt, system, provider=provider),
+            max_retries=max_retries,
+            label=provider,
+        ),
     )
 
 
@@ -274,16 +364,30 @@ def call_vision(image_b64: str, prompt: str, system: str = "", max_retries: int 
     이미지 + 텍스트 프롬프트를 선택된 백엔드에 전달한다.
 
     Codex는 `--image` 첨부를 사용하고, Claude Code는 임시 이미지 파일 경로를 프롬프트에
-    포함한다. 실패 시 기존 파이프라인 호환을 위해 "{}"를 반환한다.
+    포함한다. 실패 시 빈 JSON으로 품질 저하를 숨기지 않고 예외를 발생시킨다.
     """
     provider = _resolve_provider()
+    request = LLMCacheRequest(
+        call_kind="vision",
+        provider=provider,
+        model=_model_identity(provider),
+        system=system,
+        prompt=prompt,
+        images_b64=(image_b64,),
+    )
     if provider == "gemini":
-        return _call_gemini_vision(image_b64, prompt, system, max_retries=max_retries)
+        return cached_response(
+            request,
+            lambda: _call_gemini_vision(image_b64, prompt, system, max_retries=max_retries),
+        )
 
-    return _retry_local_call(
-        lambda: _call_local_agent(prompt, system, image_b64=image_b64, provider=provider),
-        max_retries=max_retries,
-        label=f"{provider} vision",
+    return cached_response(
+        request,
+        lambda: _retry_local_call(
+            lambda: _call_local_agent(prompt, system, image_b64=image_b64, provider=provider),
+            max_retries=max_retries,
+            label=f"{provider} vision",
+        ),
     )
 
 
@@ -304,14 +408,27 @@ def call_vision_batch(
         return call_vision(images_b64[0], prompt, system=system, max_retries=max_retries)
 
     provider = _resolve_provider()
+    request = LLMCacheRequest(
+        call_kind="vision_batch",
+        provider=provider,
+        model=_model_identity(provider),
+        system=system,
+        prompt=prompt,
+        images_b64=tuple(images_b64),
+    )
     if provider == "gemini":
-        # Gemini 레거시 경로는 단일 이미지 호출만 유지한다.
-        return "{}"
+        return cached_response(
+            request,
+            lambda: _call_gemini_vision_batch(images_b64, prompt, system, max_retries=max_retries),
+        )
 
-    return _retry_local_call(
-        lambda: _call_local_agent(prompt, system, images_b64=images_b64, provider=provider),
-        max_retries=max_retries,
-        label=f"{provider} vision batch",
+    return cached_response(
+        request,
+        lambda: _retry_local_call(
+            lambda: _call_local_agent(prompt, system, images_b64=images_b64, provider=provider),
+            max_retries=max_retries,
+            label=f"{provider} vision batch",
+        ),
     )
 
 
@@ -354,7 +471,7 @@ def _handle_gemini_retry(e: Exception, attempt: int, max_retries: int, label: st
 
 def _call_gemini_text(prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> str:
     """레거시 Gemini API 텍스트 호출."""
-    _, types, _ = _get_gemini_modules()
+    _, types, google_exceptions = _get_gemini_modules()
     full_text = f"[지침]\n{system}\n\n[요청]\n{prompt}" if system else prompt
     contents = [types.Content(role="user", parts=[types.Part(text=full_text)])]
     api_config = types.GenerateContentConfig(
@@ -364,6 +481,7 @@ def _call_gemini_text(prompt: str, system: str = "", max_retries: int = config.M
     )
     client = _gemini_client()
 
+    last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
             response = client.models.generate_content(
@@ -373,11 +491,16 @@ def _call_gemini_text(prompt: str, system: str = "", max_retries: int = config.M
             )
             return response.text
         except Exception as e:  # noqa: BLE001 - SDK 예외 범위가 넓다.
+            last_error = e
             if not _handle_gemini_retry(e, attempt, max_retries, "Gemini"):
                 break
 
     logger.error("Gemini 최대 재시도 초과.")
-    return "{}"
+    if last_error is not None and isinstance(last_error, google_exceptions.ResourceExhausted):
+        raise LLMQuotaExceededError("Gemini quota/rate limit 초과") from last_error
+    if last_error is not None:
+        raise LLMCallError("Gemini 최대 재시도 초과") from last_error
+    raise LLMCallError("Gemini 호출 실패")
 
 
 def _call_gemini_vision(
@@ -387,7 +510,7 @@ def _call_gemini_vision(
     max_retries: int = config.MAX_RETRIES,
 ) -> str:
     """레거시 Gemini API Vision 호출."""
-    _, types, _ = _get_gemini_modules()
+    _, types, google_exceptions = _get_gemini_modules()
     image_bytes = base64.b64decode(image_b64)
     full_prompt = f"[지침]\n{system}\n\n[요청]\n{prompt}" if system else prompt
     contents = [
@@ -406,6 +529,7 @@ def _call_gemini_vision(
     )
     client = _gemini_client()
 
+    last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
             response = client.models.generate_content(
@@ -415,11 +539,64 @@ def _call_gemini_vision(
             )
             return response.text
         except Exception as e:  # noqa: BLE001 - SDK 예외 범위가 넓다.
+            last_error = e
             if not _handle_gemini_retry(e, attempt, max_retries, "Vision"):
                 break
 
     logger.error("Vision 최대 재시도 초과.")
-    return "{}"
+    if last_error is not None and isinstance(last_error, google_exceptions.ResourceExhausted):
+        raise LLMQuotaExceededError("Gemini Vision quota/rate limit 초과") from last_error
+    if last_error is not None:
+        raise LLMCallError("Gemini Vision 최대 재시도 초과") from last_error
+    raise LLMCallError("Gemini Vision 호출 실패")
+
+
+def _call_gemini_vision_batch(
+    images_b64: Sequence[str],
+    prompt: str,
+    system: str = "",
+    max_retries: int = config.MAX_RETRIES,
+) -> str:
+    """Gemini API에 여러 이미지를 한 요청의 inline image parts로 전달한다."""
+    _, types, google_exceptions = _get_gemini_modules()
+    image_parts = [
+        types.Part.from_bytes(data=base64.b64decode(image), mime_type="image/png")
+        for image in images_b64
+    ]
+    full_prompt = f"[지침]\n{system}\n\n[요청]\n{prompt}" if system else prompt
+    contents = [
+        types.Content(
+            role="user",
+            parts=[*image_parts, types.Part.from_text(text=full_prompt)],
+        )
+    ]
+    api_config = types.GenerateContentConfig(
+        max_output_tokens=config.MAX_TOKENS,
+        temperature=0.1,
+        response_mime_type="application/json",
+    )
+    client = _gemini_client()
+
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=config.MODEL,
+                contents=contents,
+                config=api_config,
+            )
+            return response.text
+        except Exception as e:  # noqa: BLE001 - SDK 예외 범위가 넓다.
+            last_error = e
+            if not _handle_gemini_retry(e, attempt, max_retries, "Vision batch"):
+                break
+
+    logger.error("Vision batch 최대 재시도 초과.")
+    if last_error is not None and isinstance(last_error, google_exceptions.ResourceExhausted):
+        raise LLMQuotaExceededError("Gemini Vision batch quota/rate limit 초과") from last_error
+    if last_error is not None:
+        raise LLMCallError("Gemini Vision batch 최대 재시도 초과") from last_error
+    raise LLMCallError("Gemini Vision batch 호출 실패")
 
 
 def _find_json_end(text: str, start: int) -> int:

@@ -32,6 +32,16 @@ def _env_optional_int(name: str, default: int | None = None) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None or value == "":
@@ -49,6 +59,11 @@ LOCAL_AGENT_TIMEOUT = _env_int("LOCAL_AGENT_TIMEOUT", 900)
 CODEX_COMMAND = os.environ.get("CODEX_COMMAND", "codex").strip()
 CLAUDE_COMMAND = os.environ.get("CLAUDE_COMMAND", "claude").strip()
 GUIDELINE_AGENT_SPEC_ENABLED = _env_bool("GUIDELINE_AGENT_SPEC_ENABLED", True)
+
+# 추출은 단발 JSON 작업이라 레포 파일·MCP 서버·스킬·프로젝트 메모리(CLAUDE.md)가 불필요하다.
+# True이면 claude/codex를 중립 임시 디렉터리에서 실행하고, claude는 MCP/스킬/설정/동적
+# 시스템 프롬프트 섹션을 끈 채 호출해 호출당 세션 오버헤드를 제거한다. 추출 출력에는 영향 없음.
+CLAUDE_MINIMAL_SESSION = _env_bool("CLAUDE_MINIMAL_SESSION", True)
 
 # Gemini는 명시적으로 LLM_PROVIDER=gemini를 선택한 경우에만 쓰는 레거시 백엔드입니다.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -205,13 +220,56 @@ FULL_DOCUMENT_SCAN = _env_bool("FULL_DOCUMENT_SCAN", False)
 DOCUMENT_ROUTE_MIN_SCORE = _env_int("DOCUMENT_ROUTE_MIN_SCORE", -9999 if FULL_DOCUMENT_SCAN else 3)
 # 시트별 라우팅 후보 페이지 상한. 기본값은 없음.
 # 필요한 경우에만 DOCUMENT_ROUTE_MAX_PAGES_* 환경변수로 명시적으로 샘플링한다.
-DOCUMENT_ROUTE_MAX_PAGES = {
-    "vehicle": _env_optional_int("DOCUMENT_ROUTE_MAX_PAGES_VEHICLE", None),
-    "energy": _env_optional_int("DOCUMENT_ROUTE_MAX_PAGES_ENERGY", None),
-    "ghg": _env_optional_int("DOCUMENT_ROUTE_MAX_PAGES_GHG", None),
-    "strategy": _env_optional_int("DOCUMENT_ROUTE_MAX_PAGES_STRATEGY", None),
-    "summary": _env_optional_int("DOCUMENT_ROUTE_MAX_PAGES_SUMMARY", None),
+_DOCUMENT_ROUTE_LEGACY_ALIASES = {
+    "regional_conditions": ("DOCUMENT_ROUTE_MAX_PAGES_VEHICLE", "DOCUMENT_ROUTE_MAX_PAGES_ENERGY"),
+    "emissions_regional": ("DOCUMENT_ROUTE_MAX_PAGES_GHG",),
+    "emissions_management": ("DOCUMENT_ROUTE_MAX_PAGES_GHG",),
+    "mitigation_projects": ("DOCUMENT_ROUTE_MAX_PAGES_STRATEGY",),
+    "annual_implementation": ("DOCUMENT_ROUTE_MAX_PAGES_STRATEGY",),
+    "quantitative_reductions": ("DOCUMENT_ROUTE_MAX_PAGES_STRATEGY",),
+    "vision_strategy": ("DOCUMENT_ROUTE_MAX_PAGES_SUMMARY",),
 }
+
+
+def _env_optional_int_first(names: tuple[str, ...], default: int | None = None) -> int | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None and value != "":
+            return _env_optional_int(name, default)
+    return default
+
+
+def _route_max_page_env_names(sheet_key: str) -> tuple[str, ...]:
+    current = f"DOCUMENT_ROUTE_MAX_PAGES_{sheet_key.upper()}"
+    return (current, *_DOCUMENT_ROUTE_LEGACY_ALIASES.get(sheet_key, ()))
+
+
+DOCUMENT_ROUTE_MAX_PAGES = {
+    sheet_key: _env_optional_int_first(_route_max_page_env_names(sheet_key), None)
+    for sheet_key in EXTRACTION_SHEETS
+}
+
+# (실험적, 기본 비활성) 구조적으로 문서 앞/뒤에만 존재하는 시트를 전면부 N + 후면부 M
+# 페이지로 제한하는 메커니즘. 시트키→(front_n, back_n).
+#
+# 주의: document_meta에 (20,5)를 적용했더니 scripts/verify_routing_coverage.py가
+# 안전하지 않음을 잡아냈다 — 서울 보고서는 앞쪽 목차가 길어 법적근거/계획기간/기준연도
+# (2018, p.161) 등 메타 필드가 20p 밖에 있었다. 그래서 기본은 비활성({}).
+# 적용하려면 반드시 검증기로 시트별 커버리지가 베이스라인 이상인지 먼저 증명할 것.
+DOCUMENT_ROUTE_FRONT_BACK_PAGES: dict[str, tuple[int, int]] = {}
+
+# 라우팅 샤프닝: 문서 전반(ROUTE_UBIQUITY_RATIO 비율 이상 페이지)에 편재해 변별력이
+# 없는 weak 키워드의 점수 가산을 제외한다. strong 신호는 보존하므로 실제 데이터 페이지는
+# 그대로 선택되고, 머리말/공통어로 전 문서가 모든 시트에 배정되던 중복만 줄인다.
+# scripts/verify_routing_coverage.py로 시트별 커버리지가 베이스라인 이상인지 증명됨.
+# ratio=0.5가 검증기에서 무회귀 최대치(서울 기준 ~8% 페이지 축소). 더 낮추면(0.4)
+# regional_conditions의 '에너지/전력' 같은 실신호 weak를 떨궈 리콜이 회귀한다.
+ROUTE_DROP_UBIQUITOUS_WEAK = _env_bool("ROUTE_DROP_UBIQUITOUS_WEAK", True)
+ROUTE_UBIQUITY_RATIO = _env_float("ROUTE_UBIQUITY_RATIO", 0.5)
+
+LLM_CACHE_ENABLED = _env_bool("LLM_CACHE_ENABLED", True)
+LLM_CACHE_DIR = os.environ.get("LLM_CACHE_DIR", ".cache/llm_responses").strip()
+LLM_CACHE_VERSION = os.environ.get("LLM_CACHE_VERSION", "carbon-report-llm-cache-v1").strip()
 
 # 이미지 분석 최대 개수. 기본값은 없음(=triage 통과 후보 전부 분석).
 # 테스트/디버그 때만 MAX_IMAGES=30처럼 명시적으로 제한한다.

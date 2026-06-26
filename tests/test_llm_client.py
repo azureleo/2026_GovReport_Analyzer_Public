@@ -21,10 +21,24 @@ class LLMClientTests(unittest.TestCase):
                 "GEMINI_API_KEY",
             )
         }
+        self._saved_optional = {
+            name: getattr(llm_client.config, name, None)
+            for name in (
+                "LLM_CACHE_ENABLED",
+                "LLM_CACHE_DIR",
+                "LLM_CACHE_VERSION",
+            )
+        }
+        llm_client.config.LLM_CACHE_ENABLED = False
 
     def tearDown(self):
         for name, value in self._saved.items():
             setattr(llm_client.config, name, value)
+        for name, value in self._saved_optional.items():
+            if value is None and hasattr(llm_client.config, name):
+                delattr(llm_client.config, name)
+            elif value is not None:
+                setattr(llm_client.config, name, value)
 
     def _fake_codex_command(self, tmpdir: Path) -> str:
         fake = tmpdir / "fake_codex.py"
@@ -48,6 +62,46 @@ class LLMClientTests(unittest.TestCase):
                 with open(output_path, 'w', encoding='utf-8') as f:
                     json.dump(payload, f, ensure_ascii=False)
                 print('ignored stdout')
+                """
+            ),
+            encoding="utf-8",
+        )
+        return f"{sys.executable} {fake}"
+
+
+    def _fake_counting_codex_command(self, tmpdir: Path) -> str:
+        fake = tmpdir / "fake_counting_codex.py"
+        count_path = tmpdir / "call_count.txt"
+        fake.write_text(
+            textwrap.dedent(
+                f"""
+                import json
+                import sys
+                from pathlib import Path
+
+                args = sys.argv[1:]
+                sys.stdin.read()
+                output_path = args[args.index('--output-last-message') + 1]
+                count_path = Path({str(count_path)!r})
+                current = int(count_path.read_text(encoding='utf-8')) if count_path.exists() else 0
+                count_path.write_text(str(current + 1), encoding='utf-8')
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    json.dump({{'call_index': current + 1}}, f)
+                """
+            ),
+            encoding="utf-8",
+        )
+        return f"{sys.executable} {fake}"
+
+    def _fake_quota_command(self, tmpdir: Path) -> str:
+        fake = tmpdir / "fake_quota.py"
+        fake.write_text(
+            textwrap.dedent(
+                """
+                import sys
+
+                print("You've hit your session limit · resets 7:50pm (Asia/Seoul)")
+                sys.exit(1)
                 """
             ),
             encoding="utf-8",
@@ -96,6 +150,75 @@ class LLMClientTests(unittest.TestCase):
 
         self.assertTrue(parsed["has_image"])
         self.assertEqual(parsed["image_count"], 2)
+
+
+    def test_call_text_reuses_identical_successful_response_from_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            llm_client.config.LLM_PROVIDER = "codex"
+            llm_client.config.CODEX_COMMAND = self._fake_counting_codex_command(tmpdir)
+            llm_client.config.LOCAL_AGENT_TIMEOUT = 5
+            llm_client.config.LOCAL_AGENT_MODEL = ""
+            llm_client.config.LLM_CACHE_ENABLED = True
+            llm_client.config.LLM_CACHE_DIR = str(tmpdir / "cache")
+            llm_client.config.LLM_CACHE_VERSION = "test-v1"
+
+            first = llm_client.parse_json(llm_client.call_text('{"answer": true}', system="system", max_retries=1))
+            second = llm_client.parse_json(llm_client.call_text('{"answer": true}', system="system", max_retries=1))
+            call_count = (tmpdir / "call_count.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(first, {"call_index": 1})
+        self.assertEqual(second, {"call_index": 1})
+        self.assertEqual(call_count, "1")
+
+    def test_call_text_cache_key_includes_prompt_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            llm_client.config.LLM_PROVIDER = "codex"
+            llm_client.config.CODEX_COMMAND = self._fake_counting_codex_command(tmpdir)
+            llm_client.config.LOCAL_AGENT_TIMEOUT = 5
+            llm_client.config.LOCAL_AGENT_MODEL = ""
+            llm_client.config.LLM_CACHE_ENABLED = True
+            llm_client.config.LLM_CACHE_DIR = str(tmpdir / "cache")
+            llm_client.config.LLM_CACHE_VERSION = "test-v1"
+
+            llm_client.call_text('{"answer": true}', system="system", max_retries=1)
+            llm_client.call_text('{"answer": false}', system="system", max_retries=1)
+            call_count = (tmpdir / "call_count.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(call_count, "2")
+
+    def test_quota_errors_raise_instead_of_returning_empty_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            llm_client.config.LLM_PROVIDER = "codex"
+            llm_client.config.CODEX_COMMAND = self._fake_quota_command(Path(tmp))
+            llm_client.config.LOCAL_AGENT_TIMEOUT = 5
+            llm_client.config.LOCAL_AGENT_MODEL = ""
+
+            with self.assertRaises(llm_client.LLMQuotaExceededError):
+                llm_client.call_text('{"answer": true}', system="system", max_retries=3)
+
+    def test_gemini_vision_batch_uses_batch_call(self):
+        calls = []
+        original = llm_client._call_gemini_vision_batch
+
+        def fake_batch(images_b64, prompt, system="", max_retries=1):
+            calls.append((images_b64, prompt, system, max_retries))
+            return '{"ok": true}'
+
+        try:
+            llm_client.config.LLM_PROVIDER = "gemini"
+            llm_client.config.GEMINI_API_KEY = "test-key"
+            llm_client._call_gemini_vision_batch = fake_batch
+
+            raw = llm_client.call_vision_batch(["a", "b"], "prompt", system="system", max_retries=1)
+            parsed = llm_client.parse_json(raw)
+        finally:
+            llm_client._call_gemini_vision_batch = original
+
+        self.assertEqual(parsed, {"ok": True})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], ["a", "b"])
 
     def test_parse_json_recovers_wrapped_object_and_arrays(self):
         self.assertEqual(llm_client.parse_json('```json\n{"ok": true}\n```'), {"ok": True})

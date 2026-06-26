@@ -128,17 +128,21 @@ def _render_page_as_image(page: fitz.Page) -> dict:
     }
 
 
+_VISUAL_RENDER_PHRASES = [
+    "그래프", "차트", "도표", "배출량 추이", "온실가스 배출",
+    "감축 목표", "배출 현황", "에너지 소비",
+]
+_VISUAL_RENDER_PATTERNS = [
+    re.compile(r"(?m)^\s*\[?\s*그림\s*\d"),
+    re.compile(r"\b(?:Figure|Fig\.|Chart)\b", re.I),
+]
+
+
 def _has_graph_keywords(text: str) -> bool:
-    """그래프/차트가 있을 가능성이 높은 페이지인지 키워드로 판별"""
-    keywords = [
-        "그림", "그래프", "차트", "Figure", "Fig.", "Chart",
-        "배출량 추이", "온실가스 배출", "감축 목표", "배출 현황",
-        "에너지 소비", "탄소중립", "NDC",
-    ]
-    for kw in keywords:
-        if kw in text:
-            return True
-    return False
+    """그래프/차트/도표가 있을 가능성이 높은 페이지인지 판별."""
+    if any(phrase in text for phrase in _VISUAL_RENDER_PHRASES):
+        return True
+    return any(pattern.search(text) for pattern in _VISUAL_RENDER_PATTERNS)
 
 
 def extract_pdf(

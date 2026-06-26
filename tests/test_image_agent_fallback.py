@@ -1,7 +1,7 @@
 import unittest
 
 import config
-from agents.image_agent import ImageAgent, _coverage_reduce_images
+from agents.image_agent import ImageAgent, _context_score, _coverage_reduce_images, _triage_image
 from agents.image_agent import _fallback_visual_observations
 from utils.pdf_reader import PageContent
 
@@ -25,7 +25,7 @@ class ImageFallbackTests(unittest.TestCase):
         rows = _fallback_visual_observations(page, "서울특별시")
 
         self.assertEqual(len(rows), 6)
-        self.assertEqual(rows[0]["대상시트"], "energy")
+        self.assertEqual(rows[0]["대상시트"], "regional_conditions")
         self.assertEqual(rows[2]["연도"], 2030)
         self.assertEqual(rows[2]["값"], -0.55)
         self.assertEqual(rows[2]["반영여부"], "검토")
@@ -81,6 +81,42 @@ class ImageFallbackTests(unittest.TestCase):
 
         self.assertEqual(len(reduced), 1)
         self.assertEqual(reduced[0][1]["caption"], "Page 10 full render")
+
+    def test_goal_text_does_not_count_as_table_context(self):
+        page = PageContent(
+            page_number=25,
+            text="2030 탄소중립 목표와 추진 방향을 설명한다.",
+            tables=[],
+            images=[],
+        )
+
+        score, reasons = _context_score(page)
+
+        self.assertEqual(score, 0)
+        self.assertEqual(reasons, [])
+
+    def test_full_render_without_visual_context_is_not_sent_to_vision(self):
+        saved = {
+            "IMAGE_TRIAGE_MIN_SCORE": config.IMAGE_TRIAGE_MIN_SCORE,
+            "IMAGE_TRIAGE_KEEP_RENDERED_CONTEXT": config.IMAGE_TRIAGE_KEEP_RENDERED_CONTEXT,
+        }
+        config.IMAGE_TRIAGE_MIN_SCORE = 5
+        config.IMAGE_TRIAGE_KEEP_RENDERED_CONTEXT = True
+        page = PageContent(
+            page_number=25,
+            text="2030 탄소중립 목표와 추진 방향을 설명한다.",
+            tables=[],
+            images=[],
+        )
+        image = {"base64": "", "width": 1200, "height": 1600, "caption": "Page 25 full render"}
+
+        try:
+            triaged = _triage_image(page, image)
+        finally:
+            config.IMAGE_TRIAGE_MIN_SCORE = saved["IMAGE_TRIAGE_MIN_SCORE"]
+            config.IMAGE_TRIAGE_KEEP_RENDERED_CONTEXT = saved["IMAGE_TRIAGE_KEEP_RENDERED_CONTEXT"]
+
+        self.assertFalse(triaged["passed"])
 
 
 if __name__ == "__main__":
