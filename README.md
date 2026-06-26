@@ -4,6 +4,21 @@
 
 PDF를 주 입력으로 지원하며, HWP/HWPX 문서는 `kordoc`를 통해 텍스트와 표를 읽어 파이프라인에 연결합니다.
 
+## 2026년 6월 업데이트: Claude Code 모드 토큰 최적화
+
+`--agent claude` 실행 시 세션/사용량 한도 초과를 완화하기 위해, **추출 품질은 그대로 유지**하면서 호출당 오버헤드와 라우팅 중복만 줄였습니다. 모든 변경은 LLM 토큰을 쓰지 않는 검증기로 품질 비회귀를 증명했습니다.
+
+- **세션 오버헤드 제거** (`utils/llm_client.py`): 로컬 에이전트를 중립 임시 디렉터리에서 실행해 프로젝트 `CLAUDE.md`/`AGENTS.md` 자동 로드를 막고, Claude Code 호출 시 MCP 서버·스킬·설정/훅·동적 시스템 프롬프트 섹션을 비활성화합니다(텍스트 호출은 도구 없음, 이미지 호출은 Read만 허용). 추출 입력·출력은 동일하며 `CLAUDE_MINIMAL_SESSION=0`으로 끌 수 있습니다.
+- **라우팅 샤프닝** (`agents/extractor_agent.py`): 문서 전반에 편재해 변별력이 없는 weak 키워드(예: 머리말의 `탄소중립`·`녹색성장`)의 점수 가산을 제외해, 거의 전 문서가 모든 시트에 배정되던 중복을 줄입니다. strong 신호는 보존하므로 실제 데이터 페이지는 그대로 선택됩니다(서울 기준 텍스트 호출 297→273). `ROUTE_UBIQUITY_RATIO=0.5`가 무회귀 최대치입니다.
+- **라우팅 커버리지 검증기** (`scripts/verify_routing_coverage.py`): 정답지 값을 원문 페이지에 매핑해 시트별 리콜이 베이스라인 이상인지 LLM 없이 증명합니다. 라우팅을 더 공격적으로 조이기 전에는 반드시 이 게이트를 통과해야 합니다.
+
+```powershell
+# 라우팅 변경이 정답 리콜을 떨어뜨리지 않는지 토큰 0으로 검증
+py scripts/verify_routing_coverage.py "서울특별시_탄소중립계획_정리.xlsx" "서울특별시_탄소중립계획.pdf"
+```
+
+> 참고: 페이지가 여러 시트의 정당한 strong 신호에 걸리는 **구조적 중복**은 라우팅만으로 품질 무손실로 제거하기 어렵습니다. 한도 초과의 실질적 해결은 위 세션 오버헤드 제거이며, 더 큰 절감이 필요하면 배치당 다중 시트 통합 추출을 검증기로 보증하며 도입할 수 있습니다.
+
 ## 2026년 6월 업데이트: 가이드라인 기반 16시트 구조 전환
 
 전체 파이프라인을 `carbon_guideline.md` 기반으로 재설계했습니다.
@@ -57,11 +72,14 @@ flowchart TD
 │  ├─ organizer_agent.py      # 정제·정규화·이상치 처리
 │  ├─ excel_agent.py          # Excel 작성 에이전트
 │  └─ supervisor.py           # 전체 파이프라인 조율
-└─ utils/
-   ├─ llm_client.py           # Codex/Claude Code 호출, JSON 파싱, 재시도
-   ├─ pdf_reader.py           # PDF 파싱
-   ├─ hwp_reader.py           # HWP/HWPX 파싱(kordoc)
-   └─ excel_writer.py         # openpyxl 기반 Excel 생성
+├─ utils/
+│  ├─ llm_client.py           # Codex/Claude Code 호출, 세션 오버헤드 제거, JSON 파싱, 재시도
+│  ├─ llm_cache.py            # 프롬프트 해시 기반 LLM 응답 캐시(중단 시 재실행 이어받기)
+│  ├─ pdf_reader.py           # PDF 파싱
+│  ├─ hwp_reader.py           # HWP/HWPX 파싱(kordoc)
+│  └─ excel_writer.py         # openpyxl 기반 Excel 생성
+└─ scripts/
+   └─ verify_routing_coverage.py  # 라우팅 커버리지 검증기(LLM 토큰 0)
 ```
 
 ## 설치
@@ -212,6 +230,11 @@ BATCH_SIZE = 15                # 배치당 페이지 수
 
 DOCUMENT_ROUTE_CONTEXT_PAGES = 1
 DOCUMENT_ROUTE_MIN_SCORE = 3
+
+# 토큰 최적화 (품질 무손실)
+CLAUDE_MINIMAL_SESSION = True  # claude 호출 시 MCP/스킬/설정/CLAUDE.md 등 오버헤드 차단
+ROUTE_DROP_UBIQUITOUS_WEAK = True  # 편재하는 변별력 없는 weak 키워드 점수 제외
+ROUTE_UBIQUITY_RATIO = 0.5     # 이 비율 이상 페이지에 나오는 weak 키워드는 무시(무회귀 최대치)
 
 MAX_IMAGES = None              # 기본값: triage 통과 이미지 전수 분석
 IMAGE_TRIAGE_ENABLED = True
