@@ -49,10 +49,17 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_list(name: str, default: list[str]) -> list[str]:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return list(default)
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 # LLM/로컬 에이전트 실행 설정
 #
-# 기본값은 Gemini API가 아니라 로컬 Codex CLI입니다. 필요하면 환경변수 또는
-# main.py --agent 옵션으로 codex / claude / auto / gemini 중 선택합니다.
+# 기본값은 Gemini API입니다. 필요하면 환경변수 또는 main.py --agent 옵션으로
+# gemini / openai / codex / claude / auto 중 선택합니다.
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
 LOCAL_AGENT_MODEL = os.environ.get("LOCAL_AGENT_MODEL", "").strip()
 LOCAL_AGENT_TIMEOUT = _env_int("LOCAL_AGENT_TIMEOUT", 900)
@@ -65,10 +72,57 @@ GUIDELINE_AGENT_SPEC_ENABLED = _env_bool("GUIDELINE_AGENT_SPEC_ENABLED", True)
 # 시스템 프롬프트 섹션을 끈 채 호출해 호출당 세션 오버헤드를 제거한다. 추출 출력에는 영향 없음.
 CLAUDE_MINIMAL_SESSION = _env_bool("CLAUDE_MINIMAL_SESSION", True)
 
-# Gemini는 명시적으로 LLM_PROVIDER=gemini를 선택한 경우에만 쓰는 레거시 백엔드입니다.
+# Gemini API 설정
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
-MAX_TOKENS = 65536  # 레거시 Gemini 백엔드 사용 시 최대 출력 토큰
+MAX_TOKENS = 65536  # Gemini 백엔드 사용 시 최대 출력 토큰
+
+# Gemini 503/일시 과부하 대응 설정.
+# 429/ResourceExhausted는 계정·quota 문제로 보고 중단하지만, 503은 해당 호출만
+# 빈 JSON으로 처리해 전체 파이프라인이 중간에 죽지 않도록 한다.
+GEMINI_MAX_RETRIES = _env_int("GEMINI_MAX_RETRIES", 4)
+GEMINI_RETRY_BASE_SECONDS = _env_int("GEMINI_RETRY_BASE_SECONDS", 20)
+GEMINI_RETRY_MAX_SECONDS = _env_int("GEMINI_RETRY_MAX_SECONDS", 90)
+GEMINI_FAIL_SOFT_ON_TRANSIENT = _env_bool("GEMINI_FAIL_SOFT_ON_TRANSIENT", True)
+
+# OpenAI API 설정.
+# Gemini Flash 계열과 비교 테스트하기 위한 기본 모델은 사용자가 지정한 gpt-5.4-mini로 둔다.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
+OPENAI_MAX_OUTPUT_TOKENS = _env_int("OPENAI_MAX_OUTPUT_TOKENS", 32768)
+OPENAI_MAX_RETRIES = _env_int("OPENAI_MAX_RETRIES", 4)
+OPENAI_RETRY_BASE_SECONDS = _env_int("OPENAI_RETRY_BASE_SECONDS", 10)
+OPENAI_RETRY_MAX_SECONDS = _env_int("OPENAI_RETRY_MAX_SECONDS", 60)
+OPENAI_FAIL_SOFT_ON_TRANSIENT = _env_bool("OPENAI_FAIL_SOFT_ON_TRANSIENT", True)
+
+# GPT-Mini/OpenAI 기본본 + Gemini 타깃 검수 구조.
+# 기본값은 비용/시간 보호를 위해 비활성이고, 테스트 시 --hybrid-review 또는
+# HYBRID_REVIEW_ENABLED=1로 켠다. 검수 결과는 자동 병합하지 않고 별도 후보 시트에 남긴다.
+HYBRID_REVIEW_ENABLED = _env_bool("HYBRID_REVIEW_ENABLED", False)
+HYBRID_REVIEW_PROVIDER = os.environ.get("HYBRID_REVIEW_PROVIDER", "gemini").strip().lower()
+HYBRID_REVIEW_MODEL = os.environ.get("HYBRID_REVIEW_MODEL", MODEL).strip()
+HYBRID_REVIEW_SHEETS = _env_list(
+    "HYBRID_REVIEW_SHEETS",
+    [
+        "emissions_management",
+        "reduction_targets",
+        "mitigation_projects",
+        "quantitative_reductions",
+        "financial_plan",
+    ],
+)
+HYBRID_REVIEW_BATCH_SIZE = _env_int("HYBRID_REVIEW_BATCH_SIZE", 8)
+HYBRID_REVIEW_MAX_BATCHES_PER_SHEET = _env_int("HYBRID_REVIEW_MAX_BATCHES_PER_SHEET", 2)
+HYBRID_REVIEW_BASE_ROWS_PER_SHEET = _env_int("HYBRID_REVIEW_BASE_ROWS_PER_SHEET", 80)
+
+# Gemini Flash가 찾은 후보를 더 강한 모델(Gemini Pro 등)이 원문 근거 기준으로
+# 재판정한다. 기본값은 판정 로그만 남기고 자동 병합은 하지 않는다.
+HYBRID_ADJUDICATION_ENABLED = _env_bool("HYBRID_ADJUDICATION_ENABLED", True)
+HYBRID_ADJUDICATION_PROVIDER = os.environ.get("HYBRID_ADJUDICATION_PROVIDER", "gemini").strip().lower()
+HYBRID_ADJUDICATION_MODEL = os.environ.get("HYBRID_ADJUDICATION_MODEL", "gemini-2.5-pro").strip()
+HYBRID_ADJUDICATION_MAX_CANDIDATES = _env_int("HYBRID_ADJUDICATION_MAX_CANDIDATES", 0)
+HYBRID_AUTO_MERGE_ENABLED = _env_bool("HYBRID_AUTO_MERGE_ENABLED", False)
+HYBRID_AUTO_MERGE_MIN_CONFIDENCE = os.environ.get("HYBRID_AUTO_MERGE_MIN_CONFIDENCE", "high").strip().lower()
 
 # 연도 범위 (탄소중립 기본계획 기준)
 YEARS = list(range(2018, 2051))
@@ -172,6 +226,15 @@ EXCEL_HEADERS = {
         "지자체명", "시각자료ID", "캡션", "유형",
         "데이터포함여부", "추출값요약", "디지타이징필요", "관련시트",
     ],
+    "17_보조검수후보": [
+        "지자체명", "대상시트", "후보유형", "신뢰도", "근거페이지",
+        "후보행JSON", "기본본유사행JSON", "검수사유", "병합권장", "검수상태",
+    ],
+    "18_보조병합로그": [
+        "지자체명", "대상시트", "판정", "신뢰도", "최종반영여부", "근거페이지",
+        "근거문구", "위험플래그", "후보행JSON", "정규화행JSON",
+        "판정사유", "병합차단사유",
+    ],
 }
 
 # 추출 대상 시트 키 목록 (파이프라인에서 LLM으로 추출하는 시트)
@@ -205,7 +268,12 @@ SHEET_KEY_TO_NAME = {
     "monitoring_performance": "14_점검실적",
     "changes_actions": "15_변경과제_조치",
     "visual_inventory": "16_시각자료목록",
+    "hybrid_review_candidates": "17_보조검수후보",
+    "hybrid_merge_log": "18_보조병합로그",
 }
+
+# 데이터가 있을 때만 생성하는 선택 시트
+OPTIONAL_EXCEL_SHEETS = {"17_보조검수후보", "18_보조병합로그"}
 
 # PDF 페이지 배치 처리 크기.
 # 너무 크면 출력 JSON이 길어져 파싱 실패가 늘 수 있어 안정성 위주로 둔다.
@@ -219,7 +287,9 @@ DOCUMENT_ROUTE_CONTEXT_PAGES = 1
 FULL_DOCUMENT_SCAN = _env_bool("FULL_DOCUMENT_SCAN", False)
 DOCUMENT_ROUTE_MIN_SCORE = _env_int("DOCUMENT_ROUTE_MIN_SCORE", -9999 if FULL_DOCUMENT_SCAN else 3)
 # 시트별 라우팅 후보 페이지 상한. 기본값은 없음.
-# 필요한 경우에만 DOCUMENT_ROUTE_MAX_PAGES_* 환경변수로 명시적으로 샘플링한다.
+# 테스트/최적화가 필요할 때만 DOCUMENT_ROUTE_MAX_PAGES_* 환경변수로 명시적으로 샘플링한다.
+_DOCUMENT_ROUTE_DEFAULT_MAX_PAGES: dict[str, int | None] = {}
+
 _DOCUMENT_ROUTE_LEGACY_ALIASES = {
     "regional_conditions": ("DOCUMENT_ROUTE_MAX_PAGES_VEHICLE", "DOCUMENT_ROUTE_MAX_PAGES_ENERGY"),
     "emissions_regional": ("DOCUMENT_ROUTE_MAX_PAGES_GHG",),
@@ -245,7 +315,10 @@ def _route_max_page_env_names(sheet_key: str) -> tuple[str, ...]:
 
 
 DOCUMENT_ROUTE_MAX_PAGES = {
-    sheet_key: _env_optional_int_first(_route_max_page_env_names(sheet_key), None)
+    sheet_key: _env_optional_int_first(
+        _route_max_page_env_names(sheet_key),
+        _DOCUMENT_ROUTE_DEFAULT_MAX_PAGES.get(sheet_key),
+    )
     for sheet_key in EXTRACTION_SHEETS
 }
 
