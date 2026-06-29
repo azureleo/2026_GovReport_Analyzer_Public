@@ -163,9 +163,9 @@ npm install
 GEMINI_API_KEY=
 ```
 
-Gemini SDK가 필요합니다:
+Gemini SDK(`google-genai`)는 `requirements.txt`에 포함되어 있습니다. 설치가 안 되어 있으면 아래로 설치하세요:
 ```powershell
-py -m pip install google-genai
+py -m pip install -r requirements.txt
 ```
 
 OpenAI API를 테스트하려면 `.env` 파일 또는 환경변수에 아래 값을 설정합니다:
