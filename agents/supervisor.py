@@ -18,6 +18,7 @@ from agents.guideline_agent import GuidelineAgent
 from agents.extractor_agent import ExtractorAgent
 from agents.image_agent import ImageAgent
 from agents.organizer_agent import OrganizerAgent
+from agents.gap_fill_agent import GapFillAgent
 from agents.hybrid_review_agent import HybridReviewAgent
 from agents.excel_agent import ExcelAgent
 
@@ -33,6 +34,7 @@ _TIMING_ORDER = [
     "텍스트 추출",
     "이미지 분석",
     "정리·정제",
+    "빈칸 보완",
     "보조 모델 검수",
     "보조 후보 판정·병합",
     "엑셀 작성",
@@ -255,6 +257,34 @@ class Supervisor:
             self._add_timing("정리·정제", elapsed)
             self._log(organizer.report())
             self._log(f"[감독관] 정리·정제 완료: {elapsed:.1f}초")
+
+            # STEP 3b: 빈칸 보완 (비어 있거나 채움률 낮은 시트만 재추출)
+            if getattr(config, "GAP_FILL_ENABLED", True):
+                self._log("\n[감독관] STEP 3b: 빈칸 보완 에이전트 실행...")
+                gap_agent = GapFillAgent()
+                t0 = time.time()
+                try:
+                    enhanced_raw = gap_agent.enhance(
+                        raw_data=raw_data,
+                        cleaned=final_data,
+                        pages=pdf_content.pages,
+                    )
+                except llm_client.LLMQuotaExceededError as exc:
+                    enhanced_raw = raw_data
+                    logger.warning("빈칸 보완 quota/한도 문제로 건너뜀: %s", exc)
+                elapsed = time.time() - t0
+                self._add_timing("빈칸 보완", elapsed)
+                self._log(gap_agent.report())
+                self._log(f"[감독관] 빈칸 보완 완료: {elapsed:.1f}초")
+
+                # 보완 후보가 추가된 경우에만 같은 organizer로 재정제(_final_data 갱신).
+                if enhanced_raw is not raw_data:
+                    raw_data = enhanced_raw
+                    t0 = time.time()
+                    final_data = organizer.organize(raw_data)
+                    elapsed = time.time() - t0
+                    self._add_timing("정리·정제", elapsed)
+                    self._log(f"[감독관] 빈칸 보완 후 재정제 완료: {elapsed:.1f}초")
 
             if getattr(config, "HYBRID_REVIEW_ENABLED", False):
                 self._log("\n[감독관] STEP 3c: 보조 모델 타깃 검수 실행...")

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A Python CLI tool that extracts structured data (GHG emissions, energy use, vehicle stats, reduction strategies) from Korean municipal carbon-neutrality plan documents (PDF/HWP/HWPX) and outputs a 7-sheet Excel file. It uses local LLM agent CLIs (Codex or Claude Code) as the extraction backend, not cloud APIs by default.
+A Python CLI tool that extracts structured data (GHG emissions, energy use, vehicle stats, reduction strategies) from Korean municipal carbon-neutrality plan documents (PDF/HWP/HWPX) and outputs a guideline-based Excel file (17 always-present sheets — 16 data + 1 visual inventory — plus optional audit sheets). The default backend is the Gemini API (`GEMINI_API_KEY` required); local LLM agent CLIs (Codex or Claude Code) are used only when selected via `--agent`.
 
 ## Commands
 
@@ -44,8 +44,10 @@ main.py (CLI + env setup)
     → STEP 1: GuidelineAgent (loads carbon_guideline.md; HWP fallback)
     → STEP 2: ExtractorAgent (16-sheet extraction with per-sheet routing)
     → STEP 2b: ImageAgent (ChartQA-style triage → DePlot-style chart-to-table)
-    → STEP 3: OrganizerAgent (deterministic Python normalization/dedup per sheet)
-    → STEP 4: ExcelAgent (openpyxl output, 17 sheets)
+    → STEP 3: OrganizerAgent (deterministic Python normalization/dedup + validation pass)
+    → STEP 3b: GapFillAgent (re-extract empty/sparse sheets; GAP_FILL_ENABLED)
+    → STEP 3c/3d: HybridReviewAgent (optional; HYBRID_REVIEW_ENABLED)
+    → STEP 4: ExcelAgent (openpyxl output; optional 17/18/19 sheets only when populated)
     → Quality scoring + LLM review
 ```
 
@@ -57,17 +59,18 @@ main.py (CLI + env setup)
 
 - **Guideline-driven**: The extraction schema, sheet structure, and field definitions all derive from `carbon_guideline.md` (pre-structured from the MoE HWP guideline). No HWP parsing needed at runtime.
 - **Document routing**: Before extraction, pages are scored per-sheet (16 categories) with weighted keywords (`_ROUTE_CONFIGS` in `extractor_agent.py`). `FULL_DOCUMENT_SCAN=1` disables this.
-- **LLM calls are subprocess-based**: `utils/llm_client.py` shells out to `codex exec` or `claude -p` (not SDK calls). JSON-only output is enforced via system prompt.
-- **Organizer is deterministic**: All normalization, dedup, type coercion in `organizer_agent.py` is pure Python—no LLM calls.
+- **Backend dispatch in `utils/llm_client.py`**: the Gemini (default) and OpenAI backends call cloud SDKs; the `codex`/`claude` backends shell out to `codex exec` / `claude -p` (subprocess, not SDK). JSON-only output is enforced via system prompt. Local-agent calls add quota/timeout resilience: on quota limits or repeated codex timeouts (treated as throttling), the call waits for reset and resumes instead of aborting (`LLM_QUOTA_WAIT_*`, `LLM_TIMEOUT_AS_QUOTA_THRESHOLD`).
+- **Organizer is deterministic**: All normalization, dedup, type coercion, unit canonicalization, and the validation pass (reduction-rate recompute, sector/target-year coverage, unit-scale and financial-sum cross-checks → `19_검증리포트`) in `organizer_agent.py` are pure Python—no LLM calls. (GapFillAgent, a separate step, does make LLM calls.)
 - **Image pipeline is conservative**: Only table-type charts with high confidence auto-merge; graph-estimated values stay in `16_시각자료목록`.
 
 ### LLM backend selection
 
 Set via `LLM_PROVIDER` env var or `--agent` CLI flag:
-- `codex` (default): `codex exec --sandbox read-only`
+- `gemini` (default): Gemini API, requires `GEMINI_API_KEY`
+- `codex`: `codex exec --sandbox read-only`
 - `claude`: `claude -p --output-format text`
+- `openai`: OpenAI API, requires `OPENAI_API_KEY`
 - `auto`: tries codex → claude → gemini
-- `gemini`: legacy, requires `GEMINI_API_KEY`
 
 ## Configuration
 

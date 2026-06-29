@@ -24,6 +24,20 @@ class LLMCacheRequest:
     images_b64: tuple[str, ...] = ()
 
 
+# 실행 단위 캐시 통계. Supervisor가 시작 시 reset_cache_stats()로 초기화하고
+# 종료 시 get_cache_stats()로 hit/miss/write/disabled 요약을 출력한다.
+_CACHE_STATS: dict[str, int] = {"hit": 0, "miss": 0, "write": 0, "disabled": 0}
+
+
+def reset_cache_stats() -> None:
+    for key in _CACHE_STATS:
+        _CACHE_STATS[key] = 0
+
+
+def get_cache_stats() -> dict[str, int]:
+    return dict(_CACHE_STATS)
+
+
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -94,15 +108,19 @@ def _write_response(request: LLMCacheRequest, response: str) -> None:
 
 def cached_response(request: LLMCacheRequest, producer: Callable[[], str]) -> str:
     if not _is_enabled():
+        _CACHE_STATS["disabled"] += 1
         return producer()
 
     cached = _read_response(request)
     if cached is not None:
+        _CACHE_STATS["hit"] += 1
         return cached
 
+    _CACHE_STATS["miss"] += 1
     response = producer()
     try:
         _write_response(request, response)
+        _CACHE_STATS["write"] += 1
     except OSError:
         return response
     return response

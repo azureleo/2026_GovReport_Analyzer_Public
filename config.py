@@ -235,6 +235,9 @@ EXCEL_HEADERS = {
         "근거문구", "위험플래그", "후보행JSON", "정규화행JSON",
         "판정사유", "병합차단사유",
     ],
+    "19_검증리포트": [
+        "지자체명", "심각도", "영역", "항목", "문제내용", "권장조치",
+    ],
 }
 
 # 추출 대상 시트 키 목록 (파이프라인에서 LLM으로 추출하는 시트)
@@ -270,10 +273,11 @@ SHEET_KEY_TO_NAME = {
     "visual_inventory": "16_시각자료목록",
     "hybrid_review_candidates": "17_보조검수후보",
     "hybrid_merge_log": "18_보조병합로그",
+    "validation_report": "19_검증리포트",
 }
 
 # 데이터가 있을 때만 생성하는 선택 시트
-OPTIONAL_EXCEL_SHEETS = {"17_보조검수후보", "18_보조병합로그"}
+OPTIONAL_EXCEL_SHEETS = {"17_보조검수후보", "18_보조병합로그", "19_검증리포트"}
 
 # PDF 페이지 배치 처리 크기.
 # 너무 크면 출력 JSON이 길어져 파싱 실패가 늘 수 있어 안정성 위주로 둔다.
@@ -375,6 +379,13 @@ IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT = True
 
 # 1차 추출 후 빈칸이 큰 행만 좁은 문맥으로 다시 보완
 GAP_FILL_ENABLED = _env_bool("GAP_FILL_ENABLED", True)
+# 시트별 채움률이 이 값 미만이면 보완 재추출 대상으로 본다.
+GAP_FILL_MIN_FILL_RATIO = _env_float("GAP_FILL_MIN_FILL_RATIO", 0.6)
+# 보완 재추출 시 페이지 라우팅 점수 임계값. 1차(DOCUMENT_ROUTE_MIN_SCORE=3)보다 낮춰
+# 1차 패스가 놓친 페이지를 다시 잡는다(recall 우선).
+GAP_FILL_REEXTRACT_MIN_SCORE = _env_int("GAP_FILL_REEXTRACT_MIN_SCORE", 2)
+# 시트당 보완 재추출에 사용할 최대 후보 페이지 수(비용 가드).
+GAP_FILL_REEXTRACT_MAX_PAGES = _env_int("GAP_FILL_REEXTRACT_MAX_PAGES", 24)
 GAP_FILL_MAX_TARGETS = {
     "vehicle": _env_optional_int("GAP_FILL_MAX_TARGETS_VEHICLE", None),
     "energy": _env_optional_int("GAP_FILL_MAX_TARGETS_ENERGY", None),
@@ -401,8 +412,34 @@ FOCUSED_GAP_FILL_BATCH_PAGES = 6
 # 이미지 DPI (PDF → 이미지 변환 시)
 IMAGE_DPI = 150
 
+# 벡터로 그려진 차트(축·막대·격자가 벡터 path) 누락 방지.
+# 이런 차트는 page.get_images()에 안 잡혀 통째로 누락된다. 표·임베드이미지가 없는데
+# 벡터 path가 충분히 많은 페이지는 벡터 차트로 보고 전체 렌더링한다.
+# (정밀도는 이후 이미지 triage가 담당하므로 과렌더링은 허용된다.)
+VECTOR_RENDER_ENABLED = _env_bool("VECTOR_RENDER_ENABLED", True)
+VECTOR_RENDER_MIN_DRAWINGS = _env_int("VECTOR_RENDER_MIN_DRAWINGS", 60)
+
 # 최대 재시도 횟수
 MAX_RETRIES = 3
+
+# ──────────────────────────────────────────────────────────────────────
+# 할당량(quota/세션 한도) 회복 대기-재개 설정
+# ──────────────────────────────────────────────────────────────────────
+# True이면 codex/claude 로컬 에이전트가 한도 초과로 막혔을 때 즉시 죽지 않고,
+# 에러 메시지에 적힌 회복 시각(없으면 폴링 간격)만큼 대기했다가 같은 호출을
+# 그 자리에서 자동 재개한다. 파이프라인이 메모리에 그대로 묶여 이어진다.
+LLM_QUOTA_WAIT_ENABLED = _env_bool("LLM_QUOTA_WAIT_ENABLED", True)
+# 회복 시각을 메시지에서 파싱하지 못한 경우의 재시도 폴링 간격(초). 기본 10분.
+# quota로 막힌 호출은 즉시 실패로 돌아오므로 폴링 비용은 거의 없다.
+LLM_QUOTA_WAIT_POLL_SECONDS = _env_int("LLM_QUOTA_WAIT_POLL_SECONDS", 600)
+# 누적 대기 상한(초). 이 시간을 넘기면 포기하고 중단한다. 기본 6시간(리셋 ~5h 대비 여유).
+LLM_QUOTA_WAIT_MAX_SECONDS = _env_int("LLM_QUOTA_WAIT_MAX_SECONDS", 21600)
+# 대기 중 "아직 살아 있음"을 알리는 하트비트 로그 간격(초). 기본 5분.
+LLM_QUOTA_WAIT_HEARTBEAT_SECONDS = _env_int("LLM_QUOTA_WAIT_HEARTBEAT_SECONDS", 300)
+# codex/claude는 한도 근처에서 깨끗한 quota 메시지 대신 그냥 hang(타임아웃)으로 나타나기도 한다.
+# 한 호출에서 연속 N회 타임아웃이면 throttling으로 간주해, 일반 재시도(3회) 대신
+# 위 quota 대기-재개 로직으로 전환한다(LLM_QUOTA_WAIT_ENABLED=True일 때).
+LLM_TIMEOUT_AS_QUOTA_THRESHOLD = _env_int("LLM_TIMEOUT_AS_QUOTA_THRESHOLD", 2)
 
 # 이미지 최대 크기 (픽셀, 긴 변 기준)
 MAX_IMAGE_SIZE = 1568

@@ -343,6 +343,116 @@ def _has_keywords(text: str, keywords: list[str]) -> bool:
     return any(kw in text for kw in keywords)
 
 
+# 광역 지자체(특별시/광역시/특별자치시/도/특별자치도)는 형태가 명확해 오탐이 적다.
+# 기초 지자체(시/군/구)는 일반어와 충돌이 잦아 광역명 뒤에서만 보조로 본다.
+_WIDE_ADMIN_PATTERN = re.compile(
+    r"[가-힣]{2,4}(?:특별자치도|특별자치시|특별시|광역시|도)\b"
+)
+_BASIC_ADMIN_PATTERN = re.compile(r"[가-힣]{2,5}(?:시|군|구)\b")
+# '관리시', '도시', '제도' 등 행정구역이 아닌 흔한 오탐 접미 차단용.
+_ADMIN_FALSE_POSITIVES = {"관리시", "도시", "제도", "정도", "현도", "보도", "고도", "용도", "강도", "온도", "속도", "각도", "태도", "법도"}
+
+
+def _municipality_from_text(full_text: str) -> str:
+    """
+    LLM이 지자체명을 못 잡았을 때의 결정론적 fallback.
+
+    문서 전반에서 가장 자주 등장하는 광역 행정구역명을 채택한다(보고서 본인
+    지자체명이 압도적으로 많이 반복된다는 점을 이용). 광역명을 찾으면 바로 인접한
+    기초 지자체명(시/군/구)이 함께 자주 나오면 '경기도 수원시' 형태로 결합한다.
+    """
+    text = full_text or ""
+    wide_counts: dict[str, int] = {}
+    for match in _WIDE_ADMIN_PATTERN.findall(text):
+        if match in _ADMIN_FALSE_POSITIVES:
+            continue
+        wide_counts[match] = wide_counts.get(match, 0) + 1
+    if not wide_counts:
+        return ""
+    wide = max(wide_counts, key=wide_counts.get)
+
+    # '도'로 끝나는 광역이면 기초 지자체명을 보조로 결합 시도.
+    if wide.endswith("도"):
+        basic_counts: dict[str, int] = {}
+        for match in _BASIC_ADMIN_PATTERN.findall(text):
+            if match in _ADMIN_FALSE_POSITIVES or len(match) < 3:
+                continue
+            basic_counts[match] = basic_counts.get(match, 0) + 1
+        if basic_counts:
+            basic = max(basic_counts, key=basic_counts.get)
+            # 충분히 반복되는 경우에만 결합(우발적 단일 등장 배제).
+            if basic_counts[basic] >= 3:
+                return f"{wide} {basic}"
+    return wide
+
+
+def _group_contiguous(pages: list[PageContent]) -> list[list[PageContent]]:
+    """페이지번호가 연속인 페이지끼리 묶는다(입력은 페이지번호 오름차순 가정)."""
+    runs: list[list[PageContent]] = []
+    current: list[PageContent] = []
+    for page in pages:
+        if current and page.page_number == current[-1].page_number + 1:
+            current.append(page)
+        else:
+            if current:
+                runs.append(current)
+            current = [page]
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _chunk_run(run: list[PageContent], batch_size: int) -> list[list[PageContent]]:
+    """
+    하나의 연속 구간을 batch_size 이하로 자른다.
+    단, 표가 페이지를 넘어가는 경우(연속 두 페이지가 모두 표를 가짐)에는 그 사이에서
+    자르지 않도록 절단 지점을 한 칸 앞으로 당겨 표가 쪼개지는 것을 막는다.
+    """
+    chunks: list[list[PageContent]] = []
+    i, n = 0, len(run)
+    while i < n:
+        end = min(i + batch_size, n)
+        if end < n and run[end - 1].tables and run[end].tables and (end - 1) > i:
+            end -= 1
+        chunks.append(run[i:end])
+        i = end
+    return chunks
+
+
+def _build_semantic_batches(
+    pages: list[PageContent],
+    batch_size: int,
+) -> list[list[PageContent]]:
+    """
+    페이지를 의미 단위에 가깝게 배치로 묶는다.
+
+    - 연속 구간(run)은 가능하면 통째로 한 배치에 유지(비연속 페이지가 한 배치에
+      뒤섞여 LLM 맥락을 흐리는 것을 방지).
+    - 작은 구간들은 batch_size 한도 내에서 함께 채운다.
+    - batch_size를 넘는 긴 구간은 표 경계를 보호하며 잘게 나눈다.
+    """
+    if batch_size < 1:
+        batch_size = 1
+    batches: list[list[PageContent]] = []
+    current: list[PageContent] = []
+    for run in _group_contiguous(pages):
+        if len(run) > batch_size:
+            if current:
+                batches.append(current)
+                current = []
+            batches.extend(_chunk_run(run, batch_size))
+            continue
+        if len(current) + len(run) > batch_size:
+            if current:
+                batches.append(current)
+            current = list(run)
+        else:
+            current.extend(run)
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _page_title_score(text: str, keywords: list[str]) -> int:
     score = 0
     head = text[:1200]
@@ -485,8 +595,22 @@ class ExtractorAgent:
             "JSON 형식으로만 반환: {\"municipality_name\": \"지자체명\"}\n\n"
             f"텍스트(앞 3000자):\n{full_text[:3000]}"
         )
-        resp = llm_client.call_text(prompt, system="당신은 한국 행정구역 명칭 전문가입니다.")
-        return llm_client.parse_json(resp).get("municipality_name", "알 수 없음")
+        name = ""
+        try:
+            resp = llm_client.call_text(prompt, system="당신은 한국 행정구역 명칭 전문가입니다.")
+            name = (llm_client.parse_json(resp).get("municipality_name") or "").strip()
+        except llm_client.LLMQuotaExceededError:
+            raise
+        except llm_client.LLMCallError as exc:
+            logger.warning("지자체명 LLM 추출 실패, 정규식 fallback 사용: %s", exc)
+
+        if not name or name in {"알 수 없음", "미확인", "null", "None"}:
+            fallback = _municipality_from_text(full_text)
+            if fallback:
+                logger.info("지자체명 정규식 fallback 적용: %s", fallback)
+                return fallback
+            return "알 수 없음"
+        return name
 
     def _extract_sheet(
         self,
@@ -497,7 +621,11 @@ class ExtractorAgent:
     ) -> list:
         cfg = _SHEET_CONFIGS[sheet_key]
 
-        if not getattr(config, "FULL_DOCUMENT_SCAN", False) and not _has_keywords(batch_text, cfg["keywords"]):
+        # full-scan 모드에서는 모든 배치에서 모든 시트를 추출하므로, 관련 없는
+        # (시트,배치) 조합을 거르기 위해 키워드 게이트를 적용한다.
+        # 라우팅 모드에서는 이미 이 시트용으로 선별된 페이지만 들어오므로 게이트를
+        # 적용하지 않는다(표만 있고 본문 키워드가 약한 페이지가 탈락하던 이중 필터 제거).
+        if getattr(config, "FULL_DOCUMENT_SCAN", False) and not _has_keywords(batch_text, cfg["keywords"]):
             return []
 
         guideline_block = ""
@@ -546,7 +674,7 @@ class ExtractorAgent:
 
         if getattr(config, "FULL_DOCUMENT_SCAN", False):
             print("[에이전트2 텍스트추출] 전체 문서 스캔 모드")
-            batches = [pages[i:i + batch_size] for i in range(0, len(pages), batch_size)]
+            batches = _build_semantic_batches(pages, batch_size)
             for batch_num, batch in enumerate(batches, start=1):
                 batch_text = _build_page_text(batch)
                 page_nums = [p.page_number for p in batch]
@@ -570,7 +698,7 @@ class ExtractorAgent:
             if not sheet_pages:
                 continue
 
-            batches = [sheet_pages[i:i + batch_size] for i in range(0, len(sheet_pages), batch_size)]
+            batches = _build_semantic_batches(sheet_pages, batch_size)
             for batch_num, batch in enumerate(batches, start=1):
                 batch_text = _build_page_text(batch)
                 page_nums = [p.page_number for p in batch]

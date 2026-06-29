@@ -19,6 +19,13 @@ COLOR_HEADER_BG = "2E75B6"
 COLOR_HEADER_FONT = "FFFFFF"
 COLOR_ALT_ROW = "F2F2F2"
 
+# 엑셀 헤더 라벨과 데이터 dict 키가 다른 경우의 별칭 매핑.
+# 예: 헤더는 "감축률(%)"로 표기하지만 추출·정제 단계의 dict 키는 "감축률"이다.
+# 별칭이 없으면 header == key 로 간주한다.
+HEADER_KEY_ALIASES = {
+    "감축률(%)": "감축률",
+}
+
 
 def _thin_border() -> Border:
     side = Side(style="thin", color="AAAAAA")
@@ -63,6 +70,8 @@ def _write_generic_sheet(ws, headers: list[str], data: list[dict]):
     for row_idx, row_data in enumerate(data, start=2):
         for col_idx, header in enumerate(headers, start=1):
             val = row_data.get(header, None)
+            if val is None and header in HEADER_KEY_ALIASES:
+                val = row_data.get(HEADER_KEY_ALIASES[header], None)
             if isinstance(val, bool):
                 val = "Y" if val else "N"
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
@@ -96,9 +105,9 @@ def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
     wb = openpyxl.Workbook()
     del wb[wb.sheetnames[0]]
 
-    for sheet_name, headers in config.EXCEL_HEADERS.items():
-        ws = wb.create_sheet(sheet_name)
+    optional_sheets = getattr(config, "OPTIONAL_EXCEL_SHEETS", set())
 
+    for sheet_name, headers in config.EXCEL_HEADERS.items():
         # config.SHEET_KEY_TO_NAME 역매핑으로 데이터 키 찾기
         data_key = None
         for key, name in config.SHEET_KEY_TO_NAME.items():
@@ -110,6 +119,12 @@ def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
         if not isinstance(data, list):
             data = []
 
+        # 선택 시트(보조검수후보·병합로그 등)는 데이터가 있을 때만 생성한다.
+        # 하이브리드 검수를 끄면 항상 비므로 빈 헤더 시트를 만들지 않는다.
+        if sheet_name in optional_sheets and not data:
+            continue
+
+        ws = wb.create_sheet(sheet_name)
         _write_generic_sheet(ws, headers, data)
 
     wb.save(str(output_path))

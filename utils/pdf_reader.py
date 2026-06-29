@@ -7,6 +7,7 @@ PyMuPDF(fitz) 기반으로 구현되었으며,
 
 import base64
 import io
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,10 @@ fitz.TOOLS.mupdf_display_errors(False)   # MuPDF C라이브러리 노이즈 억�
 from PIL import Image
 
 import config
+
+logger = logging.getLogger(__name__)
+
+_TABLE_MARKER_RE = re.compile(r"(?m)(?:^|\[|\()\s*표\s*\d")
 
 
 @dataclass
@@ -52,21 +57,52 @@ def _image_to_base64(pil_img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def _tables_with_strategy(page: fitz.Page, strategy: str) -> tuple[list[str], int]:
+    """주어진 전략으로 표를 찾아 (HTML 리스트, 총 셀 수)를 반환."""
+    htmls: list[str] = []
+    cells = 0
+    try:
+        tab_finder = page.find_tables(strategy=strategy)
+    except Exception:
+        return [], 0
+    for tab in tab_finder.tables:
+        try:
+            df = tab.to_pandas()
+        except Exception:
+            continue
+        if df.size == 0:
+            continue
+        cells += int(df.shape[0]) * int(df.shape[1])
+        htmls.append(df.to_html(index=False, border=1, na_rep=""))
+    return htmls, cells
+
+
 def _extract_tables_from_page(page: fitz.Page) -> list[str]:
     """
-    PyMuPDF의 find_tables()를 사용해 페이지 내 표를 HTML 문자열 리스트로 반환.
-    표가 없으면 빈 리스트 반환.
+    페이지 내 표를 HTML 문자열 리스트로 반환.
+
+    한국 정부 보고서는 괘선 일부 생략·셀 병합이 많아 기본 전략만으로는 표를 놓치거나
+    깨뜨린다. 괘선 기반(lines_strict→lines)을 먼저 시도하고, 둘 다 못 찾으면 텍스트
+    정렬 기반(text)으로 폴백한다. (text를 max-cells로 경쟁시키면 무괘선 표를 과분할해
+    오히려 이기는 경우가 있어, 괘선 우선·텍스트 폴백 순서를 쓴다.)
+
+    '표 N' 마커가 있는데 표를 0개 찾으면 조용한 유실 대신 경고를 남긴다.
     """
-    tables = []
+    for strategy in ("lines_strict", "lines"):
+        htmls, _ = _tables_with_strategy(page, strategy)
+        if htmls:
+            return htmls
+
+    htmls, _ = _tables_with_strategy(page, "text")
+    if htmls:
+        return htmls
+
     try:
-        tab_finder = page.find_tables()
-        for tab in tab_finder.tables:
-            df = tab.to_pandas()
-            html = df.to_html(index=False, border=1, na_rep="")
-            tables.append(html)
+        if _TABLE_MARKER_RE.search(page.get_text("text")):
+            logger.warning("페이지 %s: '표 N' 마커는 있으나 표 파싱 결과 0개", page.number + 1)
     except Exception:
         pass
-    return tables
+    return []
 
 
 def _extract_images_from_page(
@@ -145,6 +181,32 @@ def _has_graph_keywords(text: str) -> bool:
     return any(pattern.search(text) for pattern in _VISUAL_RENDER_PATTERNS)
 
 
+def _is_vector_chart_page(
+    page: fitz.Page,
+    tables: list[str],
+    images: list[dict],
+) -> bool:
+    """
+    벡터로 그려진 차트가 있을 법한 페이지인지 판별(전체 렌더링 대상 승격용).
+
+    벡터 차트는 get_images()에 안 잡혀 누락된다. 다만 한국 정부 보고서의 차트 페이지는
+    텍스트가 많아 '텍스트가 적다'는 신호는 쓸 수 없다. 대신 다음을 본다:
+    - 파싱된 표가 없음(있으면 데이터는 표로 이미 확보)
+    - 임베드 이미지가 없음(있으면 이미지로 이미 확보)
+    - 벡터 path가 충분히 많음(축·격자·막대 등 차트 구성요소)
+    이 조건은 보수적이라 표/이미지로 데이터가 잡힌 페이지는 과렌더링하지 않는다.
+    """
+    if not getattr(config, "VECTOR_RENDER_ENABLED", True):
+        return False
+    if tables or images:
+        return False
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return False
+    return len(drawings) >= int(getattr(config, "VECTOR_RENDER_MIN_DRAWINGS", 60))
+
+
 def extract_pdf(
     pdf_path: str | Path,
     render_graph_pages: bool = True,
@@ -175,8 +237,12 @@ def extract_pdf(
         # 이미지 추출 (embedded images)
         images = _extract_images_from_page(page, doc)
 
-        # 그래프가 있을 법한 페이지는 전체 렌더링 추가
-        if render_graph_pages and _has_graph_keywords(text):
+        # 그래프가 있을 법한 페이지는 전체 렌더링 추가.
+        # (1) 텍스트에 그래프/차트 키워드가 있거나, (2) 표·임베드이미지가 없는데 벡터 path가
+        # 많아 벡터 차트로 추정되는 페이지(키워드가 없어 누락되던 케이스)를 잡는다.
+        if render_graph_pages and (
+            _has_graph_keywords(text) or _is_vector_chart_page(page, tables, images)
+        ):
             rendered = _render_page_as_image(page)
             # 이미 embedded image가 없거나, rendered 페이지가 더 풍부한 경우 추가
             images.append(rendered)

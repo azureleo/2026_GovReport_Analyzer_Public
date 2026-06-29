@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import shlex
 import shutil
 import subprocess
@@ -204,6 +205,9 @@ def _run_codex(
             "read-only",
             # 추출은 레포 파일 접근이 불필요하다. AGENTS.md 자동 로드를 피하려고
             # 프로젝트 루트가 아닌 중립 작업 디렉터리에서 실행한다.
+            # 그 임시 디렉터리는 git repo/신뢰 디렉터리가 아니므로, codex가
+            # "Not inside a trusted directory" 로 거부하지 않도록 git 체크를 건너뛴다.
+            "--skip-git-repo-check",
             "--cd",
             str(cwd),
             "--ephemeral",
@@ -311,21 +315,137 @@ def _call_local_agent(
         raise RuntimeError(f"지원하지 않는 로컬 에이전트입니다: {provider}")
 
 
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds}초"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}분 {sec}초"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}시간 {minutes}분"
+
+
+def _parse_quota_reset_seconds(message: str) -> int | None:
+    """
+    한도 초과 메시지에서 회복까지 남은 시간(초)을 best-effort로 파싱한다.
+
+    지원 형태:
+    - "retry after 1234" / "retry-after: 1234"            → 초
+    - "try again in 3h 20m", "in 45 minutes", "in 30s"    → 시/분/초 합산
+    - "resets in 2 hours 5 minutes"                        → 동일
+    파싱 실패 시 None.
+    """
+    text = (message or "").lower()
+
+    m = re.search(r"retry[\s\-]?after[:\s]+(\d+)", text)
+    if m:
+        return int(m.group(1))
+
+    m = re.search(r"(?:again|retry|reset[s]?|available)\s+in\s+(.+?)(?:[.\n,;]|$)", text)
+    segment = m.group(1) if m else ""
+    if segment:
+        total = 0
+        found = False
+        for value, unit in re.findall(
+            r"(\d+)\s*(h|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)",
+            segment,
+        ):
+            found = True
+            v = int(value)
+            if unit.startswith("h"):
+                total += v * 3600
+            elif unit.startswith("m"):
+                total += v * 60
+            else:
+                total += v
+        if found:
+            return total
+    return None
+
+
+def _sleep_with_heartbeat(total_seconds: float, label: str) -> None:
+    """대기 중 주기적으로 '아직 살아 있음'을 로깅하며 sleep."""
+    heartbeat = max(30, int(getattr(config, "LLM_QUOTA_WAIT_HEARTBEAT_SECONDS", 300)))
+    remaining = int(total_seconds)
+    while remaining > 0:
+        chunk = min(heartbeat, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+        if remaining > 0:
+            logger.warning("%s 할당량 회복 대기 중... 약 %s 남음", label, _fmt_duration(remaining))
+
+
 def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
-    for attempt in range(1, max_retries + 1):
+    attempt = 0
+    quota_waited = 0.0
+    consecutive_timeouts = 0
+    timeout_threshold = int(getattr(config, "LLM_TIMEOUT_AS_QUOTA_THRESHOLD", 2))
+    while True:
+        attempt += 1
         try:
-            return fn()
-        except LLMQuotaExceededError:
-            logger.error("%s quota/세션 한도 초과. 현재 결과로 진행하지 않고 중단합니다.", label)
-            raise
+            result = fn()
+            consecutive_timeouts = 0
+            return result
+        except subprocess.TimeoutExpired as exc:
+            consecutive_timeouts += 1
+            wait_enabled = getattr(config, "LLM_QUOTA_WAIT_ENABLED", True)
+            # 연속 타임아웃이 임계값 이상이면 throttling으로 보고 quota처럼 대기-재개한다.
+            if wait_enabled and consecutive_timeouts >= timeout_threshold:
+                poll = int(getattr(config, "LLM_QUOTA_WAIT_POLL_SECONDS", 600))
+                cap = int(getattr(config, "LLM_QUOTA_WAIT_MAX_SECONDS", 21600))
+                if quota_waited + poll > cap:
+                    logger.error(
+                        "%s 반복 타임아웃 대기 누적 %s 가 상한 %s 초과. 중단합니다.",
+                        label, _fmt_duration(quota_waited), _fmt_duration(cap),
+                    )
+                    raise LLMCallError(f"{label} 반복 타임아웃(throttling 추정) 상한 초과") from exc
+                quota_waited += poll
+                attempt -= 1  # throttling 대기는 일반 재시도 예산을 소모하지 않는다.
+                logger.warning(
+                    "%s 연속 %s회 타임아웃 → throttling 추정. %s 후 자동 재개(누적 대기 %s).",
+                    label, consecutive_timeouts, _fmt_duration(poll), _fmt_duration(quota_waited),
+                )
+                _sleep_with_heartbeat(poll, label)
+            elif attempt >= max_retries:
+                logger.error("%s 타임아웃 최대 재시도 초과: %s", label, exc)
+                raise LLMCallError(f"{label} 타임아웃 최대 재시도 초과") from exc
+            else:
+                wait = min(5 * attempt, 30)
+                logger.warning("%s 타임아웃. %s초 후 재시도 (%s/%s)", label, wait, attempt, max_retries)
+                time.sleep(wait)
+        except LLMQuotaExceededError as exc:
+            consecutive_timeouts = 0
+            if not getattr(config, "LLM_QUOTA_WAIT_ENABLED", True):
+                logger.error("%s quota/세션 한도 초과. 현재 결과로 진행하지 않고 중단합니다.", label)
+                raise
+            # 회복 시각을 메시지에서 파싱(없으면 폴링 간격). 리셋 직후 여유로 +30초.
+            parsed = _parse_quota_reset_seconds(str(exc))
+            poll = int(getattr(config, "LLM_QUOTA_WAIT_POLL_SECONDS", 600))
+            wait = (parsed + 30) if parsed is not None else poll
+            cap = int(getattr(config, "LLM_QUOTA_WAIT_MAX_SECONDS", 21600))
+            if quota_waited + wait > cap:
+                logger.error(
+                    "%s 할당량 회복 대기 누적 %s + 다음 대기 %s 가 상한 %s 초과. 중단합니다.",
+                    label, _fmt_duration(quota_waited), _fmt_duration(wait), _fmt_duration(cap),
+                )
+                raise
+            quota_waited += wait
+            attempt -= 1  # 할당량 대기는 일반 재시도 예산을 소모하지 않는다.
+            source = "메시지 기준" if parsed is not None else "폴링 간격"
+            logger.warning(
+                "%s 할당량 한도 도달. %s 후 자동 재개 (%s, 누적 대기 %s). 프로세스는 대기 상태로 유지됩니다.",
+                label, _fmt_duration(wait), source, _fmt_duration(quota_waited),
+            )
+            _sleep_with_heartbeat(wait, label)
         except (LLMCallError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            consecutive_timeouts = 0  # 비-타임아웃 오류는 연속 타임아웃 카운트를 끊는다.
             if attempt >= max_retries:
                 logger.error("%s 최대 재시도 초과: %s", label, exc)
                 raise LLMCallError(f"{label} 최대 재시도 초과") from exc
             wait = min(5 * attempt, 30)
             logger.warning("%s 오류: %s. %s초 후 재시도 (%s/%s)", label, exc, wait, attempt, max_retries)
             time.sleep(wait)
-    raise LLMCallError(f"{label} 호출 실패")
 
 
 def call_text(prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> str:

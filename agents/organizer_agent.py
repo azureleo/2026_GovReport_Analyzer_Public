@@ -98,6 +98,35 @@ def _normalize(val: str, mapping: dict) -> str:
     return mapping.get(val.strip(), val.strip())
 
 
+def _normalize_co2_unit(unit: Any) -> str:
+    """
+    온실가스 단위 표기를 표준형으로 정규화한다.
+
+    같은 단위가 '천톤CO2eq', '천 톤CO2eq.', '천톤CO₂eq'처럼 여러 표기로 갈려
+    집계·비교가 불가능해지던 문제를 해결한다. CO2 단위가 아니면(명·대·TJ·원 등)
+    원문을 그대로 둔다(스케일 환산은 하지 않음 — 표기만 통일).
+    """
+    if not isinstance(unit, str):
+        return unit if unit is None else str(unit)
+    raw = unit.strip()
+    if not raw:
+        return raw
+    key = (
+        raw.replace(" ", "")
+        .replace(".", "")
+        .replace("₂", "2")
+        .replace("CO₂", "CO2")
+        .lower()
+    )
+    if key in {"백만톤co2eq", "백만톤co2", "백만톤co2e", "백만톤이산화탄소"}:
+        return "백만톤CO2eq"
+    if key in {"천톤co2eq", "천톤co2", "천톤co2e", "천toco2eq", "천톤이산화탄소"}:
+        return "천톤CO2eq"
+    if key in {"tco2eq", "톤co2eq", "tco2e", "톤co2", "tco2", "톤co2e"}:
+        return "tCO2eq"
+    return raw
+
+
 def _normalize_sector(val: str) -> str:
     if not isinstance(val, str):
         return ""
@@ -157,6 +186,7 @@ def _clean_regional_conditions(rows: list[dict], municipality: str) -> list[dict
         row["지자체명"] = row.get("지자체명") or municipality
         row["연도"] = _to_int(row.get("연도"))
         row["값"] = _to_float(row.get("값"))
+        row["단위"] = _normalize_co2_unit(row.get("단위", ""))
     rows = _filter_empty_rows(rows, ["값", "지표명"])
     return _deduplicate_rows(rows, ["지자체명", "지표범주", "지표명", "연도"])
 
@@ -167,6 +197,7 @@ def _clean_emissions_regional(rows: list[dict], municipality: str) -> list[dict]
         row["배출유형"] = _normalize(row.get("배출유형", ""), _TYPE_MAP)
         row["연도"] = _to_int(row.get("연도"))
         row["배출량"] = _to_float(row.get("배출량"))
+        row["단위"] = _normalize_co2_unit(row.get("단위", ""))
     rows = _filter_empty_rows(rows, ["배출량"])
     return _deduplicate_rows(rows, ["지자체명", "배출유형", "부문", "세부부문", "연도"])
 
@@ -177,6 +208,7 @@ def _clean_emissions_management(rows: list[dict], municipality: str) -> list[dic
         row["관리부문"] = _normalize_sector(row.get("관리부문", ""))
         row["연도"] = _to_int(row.get("연도"))
         row["배출량"] = _to_float(row.get("배출량"))
+        row["단위"] = _normalize_co2_unit(row.get("단위", ""))
     rows = [r for r in rows if r.get("관리부문")]
     rows = _filter_empty_rows(rows, ["배출량"])
     return _deduplicate_rows(rows, ["지자체명", "관리부문", "세부부문", "직간접구분", "연도"])
@@ -187,6 +219,7 @@ def _clean_emissions_forecast(rows: list[dict], municipality: str) -> list[dict]
         row["지자체명"] = row.get("지자체명") or municipality
         row["연도"] = _to_int(row.get("연도"))
         row["전망값"] = _to_float(row.get("전망값"))
+        row["단위"] = _normalize_co2_unit(row.get("단위", ""))
         method_raw = row.get("전망방법원문", "")
         if not row.get("전망방법코드") and method_raw:
             for keyword, code in _FORECAST_METHOD_MAP.items():
@@ -301,11 +334,185 @@ _CLEANERS = {
 }
 
 
+def _build_visual_inventory(observations: list[dict], municipality: str) -> list[dict]:
+    """
+    이미지 에이전트의 chart_observations(감사 가능한 판독 관찰값)를
+    16_시각자료목록 시트 헤더에 맞춰 변환한다.
+
+    config.EXCEL_HEADERS["16_시각자료목록"]:
+      지자체명, 시각자료ID, 캡션, 유형, 데이터포함여부, 추출값요약, 디지타이징필요, 관련시트
+    """
+    sheet_key_to_name = getattr(config, "SHEET_KEY_TO_NAME", {})
+    inventory: list[dict] = []
+    for idx, obs in enumerate(observations, start=1):
+        if not isinstance(obs, dict):
+            continue
+        page = obs.get("페이지")
+        value = obs.get("값")
+        item = str(obs.get("항목", "") or "").strip()
+        year = obs.get("연도")
+        unit = str(obs.get("단위", "") or "").strip()
+        evidence = str(obs.get("근거", "") or "").strip()
+        summary_bits = [bit for bit in [item, str(year) if year is not None else "",
+                                        str(value) if value is not None else "", unit] if bit]
+        value_summary = " ".join(summary_bits).strip()
+        if evidence:
+            value_summary = f"{value_summary} | {evidence}" if value_summary else evidence
+
+        target_sheet = obs.get("대상시트", "") or ""
+        related_sheet = sheet_key_to_name.get(target_sheet, target_sheet)
+
+        reflected = obs.get("반영여부")
+        confidence = str(obs.get("신뢰도", "") or "").lower()
+        # 본 시트에 반영되지 않았거나(검토) 신뢰도가 낮으면 사람이 직접 디지타이징해야 한다.
+        needs_digitizing = reflected != "반영" or confidence in {"low", "medium"}
+
+        inventory.append({
+            "지자체명": obs.get("지자체명") or municipality,
+            "시각자료ID": f"V{page}-{idx:03d}" if page is not None else f"V{idx:03d}",
+            "캡션": obs.get("제목", "") or "",
+            "유형": obs.get("그래프유형", "") or "",
+            "데이터포함여부": value is not None,
+            "추출값요약": value_summary,
+            "디지타이징필요": needs_digitizing,
+            "관련시트": related_sheet,
+        })
+    return inventory
+
+
+def _issue(municipality: str, severity: str, area: str, item: str, detail: str, action: str) -> dict:
+    return {
+        "지자체명": municipality,
+        "심각도": severity,
+        "영역": area,
+        "항목": item,
+        "문제내용": detail,
+        "권장조치": action,
+    }
+
+
+def _recompute_reduction_rate(rows: list[dict], municipality: str) -> list[dict]:
+    """
+    감축률 = (기준배출량 - 목표배출량) / 기준배출량 × 100 을 결정론적으로 재계산한다.
+
+    - 감축률이 비어 있으면 계산값으로 채운다.
+    - LLM이 준 감축률이 계산값과 크게(>1%p) 다르면 계산값으로 교정하고 리포트에 남긴다.
+    (기준·목표 배출량이 둘 다 있을 때만. 흡수원 등으로 음수가 나오는 건 정상일 수 있어
+     값 자체는 막지 않고, 0~100 범위를 벗어나면 점검 항목으로만 표시한다.)
+    """
+    issues: list[dict] = []
+    for row in rows:
+        base = row.get("기준배출량")
+        target = row.get("목표배출량")
+        rate = row.get("감축률")
+        if isinstance(base, (int, float)) and base != 0 and isinstance(target, (int, float)):
+            computed = round((base - target) / base * 100, 1)
+            sector = row.get("부문") or row.get("목표수준") or ""
+            if rate is None:
+                row["감축률"] = computed
+            elif isinstance(rate, (int, float)) and abs(rate - computed) > 1.0:
+                issues.append(_issue(
+                    municipality, "경고", "감축목표", f"감축률 불일치({sector} {row.get('목표연도')})",
+                    f"보고값 {rate} vs 산식 계산값 {computed}",
+                    "산식 계산값으로 교정함. 기준/목표 배출량 원문 재확인 권장",
+                ))
+                row["감축률"] = computed
+        # 산식과 무관하게 비정상 범위는 점검 항목으로만 표시(흡수원 음수는 정상 가능).
+        final_rate = row.get("감축률")
+        if isinstance(final_rate, (int, float)) and (final_rate > 100 or final_rate < -50):
+            issues.append(_issue(
+                municipality, "경고", "감축목표", f"감축률 범위 의심({row.get('부문')} {row.get('목표연도')})",
+                f"감축률 {final_rate}%는 통상 범위(0~100%)를 벗어남",
+                "흡수원/증가 시나리오가 아니면 원문 수치 재확인",
+            ))
+    return issues
+
+
+def _validate_final_data(cleaned: dict, municipality: str) -> list[dict]:
+    """정제된 16시트 데이터의 완성도·정합성을 결정론적으로 점검해 리포트를 만든다."""
+    issues: list[dict] = []
+
+    # 1) 감축률 산식 재계산(인플레이스 교정 + 불일치 리포트)
+    issues.extend(_recompute_reduction_rate(cleaned.get("reduction_targets", []), municipality))
+
+    # 2) 지역 배출현황 8부문 커버리지
+    regional = cleaned.get("emissions_regional", [])
+    if regional:
+        present = {r.get("부문") for r in regional}
+        missing = [s for s in config.SECTORS if s not in present]
+        if missing:
+            issues.append(_issue(
+                municipality, "정보", "배출현황_지역", "부문 누락 가능",
+                f"표준 8부문 중 미등장: {', '.join(missing)}",
+                "해당 부문이 원문에 있는지(다른 명칭 포함) 확인",
+            ))
+
+    # 3) 감축목표 목표연도(2030/2050) 존재
+    targets = cleaned.get("reduction_targets", [])
+    if targets:
+        years = {r.get("목표연도") for r in targets}
+        for y in (2030, 2050):
+            if y not in years:
+                issues.append(_issue(
+                    municipality, "정보", "감축목표", f"목표연도 {y} 누락",
+                    f"감축목표에 {y}년 행이 없음",
+                    f"{y}년 목표가 원문에 있는지 확인",
+                ))
+
+    # 4) 배출 단위 스케일 혼재(천톤 vs 톤) 감지 — 자동 환산은 하지 않고 리포트만.
+    for sheet_key, sheet_name in (("emissions_regional", "배출현황_지역"),
+                                   ("emissions_management", "배출현황_관리권한")):
+        units = {r.get("단위") for r in cleaned.get(sheet_key, []) if r.get("단위")}
+        co2_units = {u for u in units if "CO2" in str(u)}
+        scales = set()
+        for u in co2_units:
+            if u.startswith("백만톤"):
+                scales.add("백만톤")
+            elif u.startswith("천톤"):
+                scales.add("천톤")
+            else:
+                scales.add("톤")
+        if len(scales) > 1:
+            issues.append(_issue(
+                municipality, "경고", sheet_name, "단위 스케일 혼재",
+                f"한 시트에 {', '.join(sorted(scales))} 단위가 섞여 값 비교 불가: {sorted(co2_units)}",
+                "기준 단위로 환산하거나 출처별로 분리 검토",
+            ))
+
+    # 5) 재정 합계 vs 부분합 교차검증(보수적): (계획구분,부문,연도)별로 '합계' 행과
+    #    재원별 행의 합을 비교해 1% 이상 어긋나면 표시.
+    fin = cleaned.get("financial_plan", [])
+    groups: dict[tuple, dict] = {}
+    for r in fin:
+        key = (r.get("계획구분"), r.get("부문"), r.get("연도"))
+        g = groups.setdefault(key, {"합계": None, "부분합": 0.0, "부분수": 0})
+        amount = r.get("예산액")
+        if not isinstance(amount, (int, float)):
+            continue
+        if str(r.get("재원구분", "")).strip() in ("합계", "총계", "계"):
+            g["합계"] = amount
+        else:
+            g["부분합"] += amount
+            g["부분수"] += 1
+    for (plan, sector, year), g in groups.items():
+        total = g["합계"]
+        if total and g["부분수"] >= 2 and total != 0:
+            if abs(total - g["부분합"]) / abs(total) > 0.01:
+                issues.append(_issue(
+                    municipality, "경고", "재정투자계획", f"합계≠부분합({sector} {year})",
+                    f"합계 {total} vs 재원별 합 {round(g['부분합'],1)}",
+                    "재원별 누락/중복 또는 합계 오기 확인",
+                ))
+
+    return issues
+
+
 class OrganizerAgent:
     """에이전트 3: 정리·정제 에이전트 (가이드라인 기반 16개 시트)"""
 
     def __init__(self):
         self._final_data: dict = {}
+        self._validation_report: list[dict] = []
 
     def organize(self, raw_data: dict, full_text_excerpt: str = "") -> dict:
         print("[에이전트3 정리] 정제 시작...")
@@ -319,8 +526,25 @@ class OrganizerAgent:
             rows = [r for r in rows if isinstance(r, dict)]
             cleaned[sheet_key] = cleaner(rows, municipality)
 
+        # 이미지 에이전트의 판독 관찰값을 16_시각자료목록 시트로 보존한다.
+        # (이전에는 organize()가 시트 키만 복사해 chart_observations가 통째로 유실됐다.)
+        observations = raw_data.get("chart_observations", [])
+        if not isinstance(observations, list):
+            observations = []
+        cleaned["chart_observations"] = observations
+        cleaned["visual_inventory"] = _build_visual_inventory(observations, municipality)
+
+        # 결정론적 검증·정합성 점검(감축률 재계산은 reduction_targets를 인플레이스 교정).
+        self._validation_report = _validate_final_data(cleaned, municipality)
+        cleaned["validation_report"] = self._validation_report
+
         counts = {k: len(v) for k, v in cleaned.items() if isinstance(v, list) and v}
         print(f"[에이전트3 정리] 정제 완료: {counts}")
+        if self._validation_report:
+            sev = {}
+            for it in self._validation_report:
+                sev[it["심각도"]] = sev.get(it["심각도"], 0) + 1
+            print(f"[에이전트3 정리] 검증 리포트 {len(self._validation_report)}건: {sev}")
 
         self._final_data = cleaned
         return cleaned

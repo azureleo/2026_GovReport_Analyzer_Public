@@ -797,7 +797,7 @@ class ImageAgent:
                         })
                         continue
 
-                    # 기본: emissions_regional (온실가스 배출 데이터)
+                    # 기본: 온실가스 배출 계열 → 종류(현황/전망/목표)에 따라 시트 분기.
                     year = item.get("연도")
                     value = item.get("값")
                     if year is None or value is None:
@@ -805,25 +805,62 @@ class ImageAgent:
                     year_int = _chart_year_int(year)
                     if year_int is None:
                         continue
-                    kind = _infer_chart_kind(item, analysis)
                     label = item.get("항목") or analysis.get("title") or "기타"
                     unit = item.get("단위") or analysis.get("unit")
+                    # 금액 단위(원/백만원/억원)는 배출 시트로 보내지 않는다.
+                    # (재정 차트가 배출현황 시트로 잘못 들어가던 오분류 차단)
+                    if unit and any(m in str(unit) for m in ["원", "억원", "백만원"]):
+                        continue
                     numeric = _parse_chart_value(value, unit)
                     if numeric is None:
                         continue
 
-                    existing_ghg.append({
-                        "지자체명": municipality,
-                        "인벤토리출처": "이미지",
-                        "배출범위": "직접배출",
-                        "배출유형": "직접배출",
-                        "부문": label,
-                        "세부부문": "",
-                        "연도": year_int,
-                        "배출량": numeric,
-                        "단위": unit or "tCO2eq",
-                        "흡수원여부": False,
-                    })
+                    kind = _infer_chart_kind(item, analysis)
+                    # 차트가 배출유형을 명시했으면 존중하고, 없으면 None으로 둔다(현황은 직접배출 기본).
+                    emit_type = item.get("배출유형")
+                    if emit_type not in ("직접배출", "간접배출", "흡수원"):
+                        emit_type = None
+
+                    if kind == "전망":
+                        existing_forecast.append({
+                            "지자체명": municipality,
+                            "시나리오": "BAU",
+                            "전망방법코드": "",
+                            "전망방법원문": "",
+                            "부문": label,
+                            "세부부문": "",
+                            "연도": year_int,
+                            "전망값": numeric,
+                            "단위": unit or "tCO2eq",
+                            "주요가정": f"이미지 p.{analysis.get('page_number')}",
+                        })
+                    elif kind == "목표":
+                        existing_targets.append({
+                            "지자체명": municipality,
+                            "목표수준": "총괄" if label in ("합계", "총괄", "전체") else "부문",
+                            "목표범위": "지역전체",
+                            "부문": label,
+                            "기준연도": None,
+                            "기준배출량": None,
+                            "목표연도": year_int,
+                            "배출전망": None,
+                            "목표감축량": None,
+                            "목표배출량": numeric,
+                            "감축률": None,
+                        })
+                    else:
+                        existing_ghg.append({
+                            "지자체명": municipality,
+                            "인벤토리출처": "이미지",
+                            "배출범위": emit_type or "직접배출",
+                            "배출유형": emit_type or "직접배출",
+                            "부문": label,
+                            "세부부문": "",
+                            "연도": year_int,
+                            "배출량": numeric,
+                            "단위": unit or "tCO2eq",
+                            "흡수원여부": emit_type == "흡수원",
+                        })
 
             for series in analysis.get("ghg_data", []):
                 label = series.get("label", "")
