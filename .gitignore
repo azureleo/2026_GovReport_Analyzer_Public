@@ -21,6 +21,7 @@ npm-debug.log*
 
 # 내부 작업 문서
 16guide.md
+CLAUDE.md
 excel_source_verification*.json
 *.hwp
 
