@@ -24,5 +24,7 @@ npm-debug.log*
 CLAUDE.md
 excel_source_verification*.json
 *.hwp
+# 참고용 원본 가이드라인은 예외로 추적
+!docs/references/가이드라인.hwp
 
 .cache/
