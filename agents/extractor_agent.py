@@ -11,6 +11,7 @@ import re
 import config
 from utils.pdf_reader import PageContent
 from utils import llm_client
+from utils.parallel import parallel_map
 
 logger = logging.getLogger(__name__)
 
@@ -466,6 +467,17 @@ def _page_title_score(text: str, keywords: list[str]) -> int:
     return score
 
 
+def _document_frequency(pages: list[PageContent], keywords: set[str]) -> dict[str, int]:
+    """각 키워드가 등장하는 페이지 수(문서 빈도)."""
+    df: dict[str, int] = {kw: 0 for kw in keywords}
+    for page in pages:
+        combined = f"{page.text or ''}\n" + "\n".join(page.tables or [])
+        for kw in keywords:
+            if kw in combined:
+                df[kw] += 1
+    return df
+
+
 def _ubiquitous_weak_keywords(
     pages: list[PageContent],
     ratio: float = 0.4,
@@ -476,8 +488,7 @@ def _ubiquitous_weak_keywords(
 
     예: '탄소중립', '녹색성장', '에너지'처럼 머리말/공통어로 모든 페이지에 찍히는 단어는
     라우팅 점수를 부풀려 거의 전 문서를 모든 시트에 배정하게 만든다. 이런 키워드의 +1
-    가산만 제외한다. strong(+3) 신호는 절대 건드리지 않으므로 실제 데이터 페이지는
-    여전히 선택된다(샤프닝은 선택만 좁히고 추출 입력 텍스트는 그대로 전체를 보냄).
+    가산만 제외한다(샤프닝은 선택만 좁히고 추출 입력 텍스트는 그대로 전체를 보냄).
     """
     n = len(pages)
     if n < min_pages:
@@ -485,12 +496,33 @@ def _ubiquitous_weak_keywords(
     weak_all: set[str] = set()
     for cfg in _ROUTE_CONFIGS.values():
         weak_all.update(cfg["weak"])
-    df: dict[str, int] = {kw: 0 for kw in weak_all}
-    for page in pages:
-        combined = f"{page.text or ''}\n" + "\n".join(page.tables or [])
-        for kw in weak_all:
-            if kw in combined:
-                df[kw] += 1
+    df = _document_frequency(pages, weak_all)
+    threshold = max(min_pages, int(n * ratio))
+    return frozenset(kw for kw, count in df.items() if count >= threshold)
+
+
+def _ubiquitous_strong_keywords(
+    pages: list[PageContent],
+    ratio: float = 0.6,
+    min_pages: int = 8,
+) -> frozenset[str]:
+    """
+    문서 전반(>ratio 비율)에 편재해 변별력을 잃은 strong 키워드 집합.
+
+    예: 보고서 제목인 '기본계획'은 거의 모든 페이지의 머리말/꼬리말에 찍혀 strong(+3)
+    가산을 받는 바람에, document_meta가 문서 전체(서울 기준 500/515p)에 라우팅된다.
+    이런 boilerplate strong 신호의 +3 가산만 제외한다. ratio 기준을 weak(0.5)보다
+    높게 둬(0.6+) 실제 주제 빈출 키워드는 보존하고, 머리말 boilerplate만 떨군다.
+    반드시 scripts/verify_routing_coverage.py로 시트별 정답 리콜 무회귀를 증명한 뒤
+    기본 활성화한다.
+    """
+    n = len(pages)
+    if n < min_pages:
+        return frozenset()
+    strong_all: set[str] = set()
+    for cfg in _ROUTE_CONFIGS.values():
+        strong_all.update(cfg["strong"])
+    df = _document_frequency(pages, strong_all)
     threshold = max(min_pages, int(n * ratio))
     return frozenset(kw for kw, count in df.items() if count >= threshold)
 
@@ -499,6 +531,7 @@ def _score_page_for_sheet(
     page: PageContent,
     sheet_key: str,
     ubiquitous_weak: frozenset[str] = frozenset(),
+    ubiquitous_strong: frozenset[str] = frozenset(),
 ) -> int:
     cfg = _ROUTE_CONFIGS.get(sheet_key)
     if not cfg:
@@ -508,11 +541,12 @@ def _score_page_for_sheet(
     combined = f"{text}\n{table_text}"
 
     weak = [kw for kw in cfg["weak"] if kw not in ubiquitous_weak]
+    strong = [kw for kw in cfg["strong"] if kw not in ubiquitous_strong]
 
     score = 0
-    score += sum(3 for kw in cfg["strong"] if kw in combined)
+    score += sum(3 for kw in strong if kw in combined)
     score += sum(1 for kw in weak if kw in combined)
-    score += _page_title_score(text, cfg["strong"] + weak)
+    score += _page_title_score(text, strong + weak)
 
     if page.tables:
         score += 2
@@ -539,6 +573,14 @@ def _route_pages_by_sheet(
     else:
         ubiquitous_weak = frozenset()
 
+    # boilerplate strong 키워드(보고서 제목 등 머리말 편재)의 +3 가산도 제외.
+    if getattr(config, "ROUTE_DROP_UBIQUITOUS_STRONG", True):
+        ubiquitous_strong = _ubiquitous_strong_keywords(
+            pages, ratio=getattr(config, "ROUTE_STRONG_UBIQUITY_RATIO", 0.6)
+        )
+    else:
+        ubiquitous_strong = frozenset()
+
     for sheet_key in _SHEET_CONFIGS:
         # 구조적으로 전면/후면부에만 존재하는 시트는 후보 페이지를 미리 좁힌다.
         front_back = front_back_by_sheet.get(sheet_key)
@@ -553,7 +595,7 @@ def _route_pages_by_sheet(
 
         scored_pages: list[tuple[int, int]] = []
         for page in candidate_pages:
-            score = _score_page_for_sheet(page, sheet_key, ubiquitous_weak)
+            score = _score_page_for_sheet(page, sheet_key, ubiquitous_weak, ubiquitous_strong)
             if score >= min_score:
                 scored_pages.append((score, page.page_number))
 
@@ -571,7 +613,9 @@ def _route_pages_by_sheet(
         if isinstance(max_pages, int) and max_pages > 0 and len(selected_nums) > max_pages:
             ranked_selected = sorted(
                 selected_nums,
-                key=lambda n: _score_page_for_sheet(by_num[n], sheet_key, ubiquitous_weak),
+                key=lambda n: _score_page_for_sheet(
+                    by_num[n], sheet_key, ubiquitous_weak, ubiquitous_strong
+                ),
                 reverse=True,
             )
             selected_nums = set(ranked_selected[:max_pages])
@@ -587,6 +631,9 @@ class ExtractorAgent:
     def __init__(self):
         self._raw_results: dict = {key: [] for key in _SHEET_CONFIGS}
         self._raw_results["municipality_name"] = ""
+        # 시트별로 1차 추출에서 실제 LLM에 보낸 페이지번호. 빈칸보완(GapFill)이
+        # 이미 보낸 페이지를 다시 보내지 않도록(중복 토큰 제거) 참조한다.
+        self.routed_page_nums: dict[str, set[int]] = {}
 
     def _extract_municipality_name(self, full_text: str) -> str:
         prompt = (
@@ -660,6 +707,119 @@ class ExtractorAgent:
                 item["지자체명"] = municipality
         return [item for item in items if isinstance(item, dict)]
 
+    def _extract_cluster(
+        self,
+        sheet_keys: list[str],
+        batch_text: str,
+        municipality: str,
+        guideline_prompts: dict[str, str],
+    ) -> dict[str, list]:
+        """
+        여러 시트를 한 번의 호출로 추출한다(클러스터링). 같은 배치 텍스트를 시트마다
+        따로 보내던 중복을 없애 호출 수·입력 토큰을 크게 줄인다.
+
+        각 시트의 스키마(cfg['prompt'])와 가이드라인 보조지침을 한 프롬프트에 모아,
+        모든 시트 키를 담은 단일 JSON 객체로 반환하도록 요청한다. 반환 JSON에서 시트별
+        배열을 분리해 per-sheet 경로와 동일한 형태로 돌려준다.
+        """
+        schema_blocks: list[str] = []
+        for sk in sheet_keys:
+            cfg = _SHEET_CONFIGS[sk]
+            schema_blocks.append(f"### 추출 항목 [{sk}]\n{cfg['prompt']}")
+            gp = guideline_prompts.get(sk, "")
+            if gp:
+                schema_blocks.append(
+                    f"[{sk} 환경부 가이드라인 보조지침]\n{gp}\n"
+                    "위 지침과 배치 텍스트가 충돌하면 배치 텍스트의 실제 수치·단위를 우선하되 "
+                    "필드 구성·분류 체계는 가이드라인을 따르세요."
+                )
+        combined_schemas = "\n\n".join(schema_blocks)
+        keys_csv = ", ".join(f'"{sk}"' for sk in sheet_keys)
+        full_prompt = (
+            f"지자체명: {municipality}\n\n"
+            f"[배치 텍스트]\n{batch_text}\n\n"
+            "아래 여러 추출 항목을 각각의 스키마에 정확히 맞춰 모두 추출한 뒤, "
+            "하나의 JSON 객체로 합쳐 반환하세요. 각 항목 키 아래에 해당 항목의 행 배열을 넣고, "
+            "그 항목에 해당하는 데이터가 배치에 없으면 빈 배열([])을 넣으세요. "
+            "항목 간 데이터를 섞지 말고, 각 행은 그 항목의 스키마 필드만 사용하세요.\n\n"
+            f"{combined_schemas}\n\n"
+            f"최종 출력은 다음 키를 모두 포함하는 단일 JSON 객체입니다: {{{keys_csv}}}"
+        )
+        resp = llm_client.call_text(full_prompt, system=EXTRACTION_SYSTEM)
+        parsed = llm_client.parse_json(resp)
+
+        out: dict[str, list] = {sk: [] for sk in sheet_keys}
+        if not isinstance(parsed, dict):
+            return out
+        for sk in sheet_keys:
+            items = parsed.get(sk, [])
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if not item.get("지자체명"):
+                    item["지자체명"] = municipality
+                out[sk].append(item)
+        return out
+
+    def _extract_clustered(
+        self,
+        routed_pages: dict[str, list[PageContent]],
+        municipality: str,
+        extraction_prompts: dict[str, str],
+        batch_size: int,
+    ) -> None:
+        clusters = getattr(config, "EXTRACTION_SHEET_CLUSTERS", [])
+        by_num: dict[int, PageContent] = {}
+        for v in routed_pages.values():
+            for p in v:
+                by_num[p.page_number] = p
+
+        print(f"[에이전트2 텍스트추출] 시트 클러스터링 모드: {len(clusters)}개 그룹")
+        tasks: list[dict] = []
+        for cluster in clusters:
+            members = [sk for sk in cluster if sk in _SHEET_CONFIGS]
+            nums: set[int] = set()
+            for sk in members:
+                nums |= {p.page_number for p in routed_pages.get(sk, [])}
+            if not nums:
+                continue
+            cl_pages = [by_num[n] for n in sorted(nums)]
+            batches = _build_semantic_batches(cl_pages, batch_size)
+            for batch_num, batch in enumerate(batches, start=1):
+                page_nums = [p.page_number for p in batch]
+                page_range = (
+                    f"p{page_nums[0]}~{page_nums[-1]}" if len(page_nums) > 1 else f"p{page_nums[0]}"
+                )
+                tasks.append({
+                    "members": members,
+                    "batch_text": _build_page_text(batch),
+                    "batch_num": batch_num,
+                    "batch_total": len(batches),
+                    "page_range": page_range,
+                })
+
+        results = parallel_map(
+            lambda t: self._extract_cluster(
+                t["members"], t["batch_text"], municipality, extraction_prompts
+            ),
+            tasks,
+            workers=getattr(config, "TEXT_WORKERS", 4),
+        )
+        for task, res in zip(tasks, results):
+            counts = []
+            for sk, items in res.items():
+                self._raw_results[sk].extend(items)
+                if items:
+                    counts.append(f"{sk}={len(items)}")
+            label = "/".join(task["members"][:2]) + ("…" if len(task["members"]) > 2 else "")
+            status = ", ".join(counts) if counts else "추출 없음"
+            print(
+                f"  [{label}] 배치 {task['batch_num']:>2}/{task['batch_total']} "
+                f"({task['page_range']}): {status}"
+            )
+
     def extract(
         self,
         pages: list[PageContent],
@@ -675,15 +835,26 @@ class ExtractorAgent:
         if getattr(config, "FULL_DOCUMENT_SCAN", False):
             print("[에이전트2 텍스트추출] 전체 문서 스캔 모드")
             batches = _build_semantic_batches(pages, batch_size)
+            tasks: list[dict] = []
             for batch_num, batch in enumerate(batches, start=1):
                 batch_text = _build_page_text(batch)
-                page_nums = [p.page_number for p in batch]
-                page_range = f"p{page_nums[0]}~{page_nums[-1]}" if len(page_nums) > 1 else f"p{page_nums[0]}"
                 for sheet_key in _SHEET_CONFIGS:
-                    guideline_prompt = extraction_prompts.get(sheet_key, "")
-                    items = self._extract_sheet(sheet_key, batch_text, municipality, guideline_prompt)
-                    self._raw_results[sheet_key].extend(items)
-                print(f"  [full] 배치 {batch_num:>2}/{len(batches)} ({page_range}) 완료")
+                    tasks.append({
+                        "sheet_key": sheet_key,
+                        "batch_text": batch_text,
+                        "guideline_prompt": extraction_prompts.get(sheet_key, ""),
+                        "batch_num": batch_num,
+                    })
+            results = parallel_map(
+                lambda t: self._extract_sheet(
+                    t["sheet_key"], t["batch_text"], municipality, t["guideline_prompt"]
+                ),
+                tasks,
+                workers=getattr(config, "TEXT_WORKERS", 4),
+            )
+            for task, items in zip(tasks, results):
+                self._raw_results[task["sheet_key"]].extend(items)
+            print(f"  [full] 배치 {len(batches)}개 × 16시트 추출 완료")
 
             total = {k: len(v) for k, v in self._raw_results.items() if isinstance(v, list)}
             print(f"[에이전트2 텍스트추출] 완료. 누적: {total}")
@@ -692,22 +863,53 @@ class ExtractorAgent:
         routed_pages = _route_pages_by_sheet(pages)
         route_summary = {k: len(v) for k, v in routed_pages.items() if v}
         print(f"[에이전트2 텍스트추출] 문서 구조 라우팅 완료: {route_summary}")
+        self.routed_page_nums = {
+            k: {p.page_number for p in v} for k, v in routed_pages.items() if v
+        }
 
+        # 시트 클러스터링: 관련 시트를 묶어 페이지 묶음당 1회 호출로 여러 시트를 동시 추출.
+        if getattr(config, "EXTRACTION_SHEET_CLUSTERING", False):
+            self._extract_clustered(routed_pages, municipality, extraction_prompts, batch_size)
+            total = {k: len(v) for k, v in self._raw_results.items() if isinstance(v, list) and v}
+            print(f"[에이전트2 텍스트추출] 완료(클러스터). 누적: {total}")
+            return self._raw_results
+
+        # (시트, 배치) 조합은 서로 독립적이라 동시에 추출한다. parallel_map이 입력
+        # 순서를 보존하므로 누적 순서는 순차 실행과 동일하다(출력 결정성 유지).
+        tasks: list[dict] = []
         for sheet_key in _SHEET_CONFIGS:
             sheet_pages = routed_pages.get(sheet_key, [])
             if not sheet_pages:
                 continue
-
             batches = _build_semantic_batches(sheet_pages, batch_size)
             for batch_num, batch in enumerate(batches, start=1):
-                batch_text = _build_page_text(batch)
                 page_nums = [p.page_number for p in batch]
-                page_range = f"p{page_nums[0]}~{page_nums[-1]}" if len(page_nums) > 1 else f"p{page_nums[0]}"
-                guideline_prompt = extraction_prompts.get(sheet_key, "")
-                items = self._extract_sheet(sheet_key, batch_text, municipality, guideline_prompt)
-                self._raw_results[sheet_key].extend(items)
-                status = f"{len(items)}건" if items else "추출 없음"
-                print(f"  [{sheet_key}] 배치 {batch_num:>2}/{len(batches)} ({page_range}): {status}")
+                page_range = (
+                    f"p{page_nums[0]}~{page_nums[-1]}" if len(page_nums) > 1 else f"p{page_nums[0]}"
+                )
+                tasks.append({
+                    "sheet_key": sheet_key,
+                    "batch_text": _build_page_text(batch),
+                    "guideline_prompt": extraction_prompts.get(sheet_key, ""),
+                    "batch_num": batch_num,
+                    "batch_total": len(batches),
+                    "page_range": page_range,
+                })
+
+        results = parallel_map(
+            lambda t: self._extract_sheet(
+                t["sheet_key"], t["batch_text"], municipality, t["guideline_prompt"]
+            ),
+            tasks,
+            workers=getattr(config, "TEXT_WORKERS", 4),
+        )
+        for task, items in zip(tasks, results):
+            self._raw_results[task["sheet_key"]].extend(items)
+            status = f"{len(items)}건" if items else "추출 없음"
+            print(
+                f"  [{task['sheet_key']}] 배치 {task['batch_num']:>2}/{task['batch_total']} "
+                f"({task['page_range']}): {status}"
+            )
 
         total = {k: len(v) for k, v in self._raw_results.items() if isinstance(v, list) and v}
         print(f"[에이전트2 텍스트추출] 완료. 누적: {total}")

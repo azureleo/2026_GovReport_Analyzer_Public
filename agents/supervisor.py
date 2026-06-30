@@ -268,6 +268,7 @@ class Supervisor:
                         raw_data=raw_data,
                         cleaned=final_data,
                         pages=pdf_content.pages,
+                        routed_page_nums=getattr(extractor, "routed_page_nums", None),
                     )
                 except llm_client.LLMQuotaExceededError as exc:
                     enhanced_raw = raw_data

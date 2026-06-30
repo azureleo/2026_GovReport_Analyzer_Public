@@ -94,13 +94,20 @@ def main() -> int:
         for p in pages
     }
 
-    print("[2/4] 라우팅 2종 계산 (베이스라인=off / 후보=샤프닝on, LLM 없음)")
-    saved = getattr(config, "ROUTE_DROP_UBIQUITOUS_WEAK", True)
+    print("[2/4] 라우팅 2종 계산 (베이스라인=모든 샤프닝 off / 후보=weak+strong on, LLM 없음)")
+    saved_weak = getattr(config, "ROUTE_DROP_UBIQUITOUS_WEAK", True)
+    saved_strong = getattr(config, "ROUTE_DROP_UBIQUITOUS_STRONG", False)
+    # 베이스라인: 샤프닝을 모두 끈 가장 넓은 라우팅(최대 리콜).
     config.ROUTE_DROP_UBIQUITOUS_WEAK = False
+    config.ROUTE_DROP_UBIQUITOUS_STRONG = False
     base = _routed_nums(pages)
+    # 후보: weak + strong 샤프닝을 모두 켠 좁은 라우팅. 이 커버리지가 베이스라인
+    # 이상이어야(=리콜 무회귀) 토큰 절감 변경을 안전하게 적용할 수 있다.
     config.ROUTE_DROP_UBIQUITOUS_WEAK = True
+    config.ROUTE_DROP_UBIQUITOUS_STRONG = True
     cand = _routed_nums(pages)
-    config.ROUTE_DROP_UBIQUITOUS_WEAK = saved
+    config.ROUTE_DROP_UBIQUITOUS_WEAK = saved_weak
+    config.ROUTE_DROP_UBIQUITOUS_STRONG = saved_strong
 
     print("[3/4] 정답지 앵커 → 페이지 매핑")
     wb = openpyxl.load_workbook(args.golden, read_only=True)

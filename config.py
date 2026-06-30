@@ -252,6 +252,27 @@ EXTRACTION_SHEETS = [
     "changes_actions",
 ]
 
+# ──────────────────────────────────────────────────────────────────────
+# 시트 클러스터링 추출 (agent 모드 핵심 최적화)
+# ──────────────────────────────────────────────────────────────────────
+# 같은 페이지가 시트마다 따로 호출되는 중복(서울 기준 8.8×)을, 관련 시트를 묶어
+# "페이지 묶음당 1회 호출로 여러 시트 동시 추출"해 줄인다. 측정상 텍스트 호출 383→173회
+# (−55%), 입력 page-send 4514→2119(−53%). codex/claude처럼 호출당 오버헤드가 큰
+# agent 모드에서 시간·토큰 절감이 특히 크다.
+#
+# 품질 주의(기본 비활성): 한 번에 2~4개 시트 스키마를 추출하면 출력 JSON이 길어져
+# 파싱 실패·시트별 정확도 저하 위험이 있다. 그래서 기본은 안전한 per-sheet(False)이며,
+# 실제 추출 A/B로 시트별 행 수·정확도 무회귀를 증명한 뒤 1로 켠다.
+EXTRACTION_SHEET_CLUSTERING = _env_bool("EXTRACTION_SHEET_CLUSTERING", False)
+# 클러스터는 (a) 원문에서 같은 구간을 공유하고 (b) 개념적으로 함께 읽히는 시트끼리 묶는다.
+EXTRACTION_SHEET_CLUSTERS = [
+    ["document_meta", "plan_overview", "regional_conditions"],
+    ["emissions_regional", "emissions_management", "emissions_forecast"],
+    ["reduction_targets", "vision_strategy"],
+    ["mitigation_projects", "annual_implementation", "quantitative_reductions", "financial_plan"],
+    ["foundation_measures", "governance_feedback", "monitoring_performance", "changes_actions"],
+]
+
 # 시트 내부 키 → 엑셀 시트명 매핑
 SHEET_KEY_TO_NAME = {
     "document_meta": "00_문서메타",
@@ -344,6 +365,34 @@ DOCUMENT_ROUTE_FRONT_BACK_PAGES: dict[str, tuple[int, int]] = {}
 ROUTE_DROP_UBIQUITOUS_WEAK = _env_bool("ROUTE_DROP_UBIQUITOUS_WEAK", True)
 ROUTE_UBIQUITY_RATIO = _env_float("ROUTE_UBIQUITY_RATIO", 0.5)
 
+# 라우팅 샤프닝(strong): 보고서 제목('기본계획')처럼 머리말/꼬리말로 거의 모든
+# 페이지에 편재해 strong(+3) 가산을 부당하게 받는 boilerplate 키워드를 제외한다.
+# 이게 없으면 document_meta가 문서 전체(서울 기준 500/515p)에 라우팅돼 큰 중복이 발생한다.
+#
+# 주의(기본 비활성): 서울 문서 측정 결과, 이 샤프닝은 document_meta를 500→180p로 줄여
+# 총 page-send를 7.1% 절감하지만, 떨군 320p 중 법적근거(p252)·조례(p14,429)·발간(p45,515)
+# 등 실제 메타 필드를 가진 페이지가 포함되고, 기준연도 2018이 있는 p161도 떨어진다.
+# 이 필드들이 보존 페이지로 충분히 커버되는지는 정답지 기반 Check A
+# (scripts/verify_routing_coverage.py)로만 증명할 수 있는데, 검증을 통과하기 전에는
+# document_meta 리콜 회귀 위험이 있어 기본 비활성으로 둔다.
+# 활성화 전: `python scripts/verify_routing_coverage.py <golden.xlsx> <source.pdf>`로
+# document_meta 커버리지 무회귀를 먼저 증명할 것. 증명되면 ROUTE_DROP_UBIQUITOUS_STRONG=1.
+ROUTE_DROP_UBIQUITOUS_STRONG = _env_bool("ROUTE_DROP_UBIQUITOUS_STRONG", False)
+ROUTE_STRONG_UBIQUITY_RATIO = _env_float("ROUTE_STRONG_UBIQUITY_RATIO", 0.6)
+
+# ──────────────────────────────────────────────────────────────────────
+# 병렬 실행 설정
+# ──────────────────────────────────────────────────────────────────────
+# 추출(시트×배치)·이미지 vision 호출은 서로 완전히 독립적이라 동시에 실행해도
+# 보내는 프롬프트·받는 응답이 동일하다 → 추출 결과 불변, 기존 LLM 캐시와도 호환.
+# 순수하게 벽시계 시간만 줄인다(품질·토큰 변화 없음).
+# Gemini API/로컬 에이전트 동시성 한도를 고려해 보수적 기본값을 둔다.
+PARALLEL_PROCESSING_ENABLED = _env_bool("PARALLEL_PROCESSING_ENABLED", True)
+# 텍스트 추출(extractor/gap_fill) 동시 호출 수.
+TEXT_WORKERS = _env_int("TEXT_WORKERS", 4)
+# 이미지 vision 동시 호출 수. vision은 호출당 페이로드가 커 보수적으로 둔다.
+VISION_WORKERS = _env_int("VISION_WORKERS", 2)
+
 LLM_CACHE_ENABLED = _env_bool("LLM_CACHE_ENABLED", True)
 LLM_CACHE_DIR = os.environ.get("LLM_CACHE_DIR", ".cache/llm_responses").strip()
 LLM_CACHE_VERSION = os.environ.get("LLM_CACHE_VERSION", "carbon-report-llm-cache-v1").strip()
@@ -394,6 +443,12 @@ GAP_FILL_MAX_TARGETS = {
 }
 GAP_FILL_CONTEXT_PAGES = 8
 GAP_FILL_TARGET_BATCH_SIZE = 10
+# True이면 빈칸보완 재추출에서 1차 추출이 이미 LLM에 보낸 페이지를 제외하고,
+# 라우팅이 놓친 새 페이지(1차 임계값 미만 점수)만 재추출한다. 이것이 GapFill의
+# 본래 목적("1차 패스가 놓친 페이지를 다시 잡는다")이며, 1차에서 이미 보내고 추출까지
+# 끝낸 페이지를 다시 보내던 중복 토큰을 제거한다. 만약 보완 recall이 떨어지는 게
+# 관찰되면 False로 두어 기존(전체 재스코어) 동작으로 되돌릴 수 있다.
+GAP_FILL_SKIP_ALREADY_ROUTED = _env_bool("GAP_FILL_SKIP_ALREADY_ROUTED", True)
 
 # 자동차/에너지처럼 원문 구간이 보고서마다 달라지는 시트는
 # 전체 문서에서 관련 구간을 다시 점수화해 집중 재추출한다.

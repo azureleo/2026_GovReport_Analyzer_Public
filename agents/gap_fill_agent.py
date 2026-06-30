@@ -16,6 +16,7 @@ import logging
 
 import config
 from utils import llm_client
+from utils.parallel import parallel_map
 from utils.pdf_reader import PageContent
 from agents.extractor_agent import (
     _SHEET_CONFIGS,
@@ -83,10 +84,13 @@ class GapFillAgent:
         sheet_key: str,
         min_score: int,
         max_pages: int,
+        exclude_nums: set[int] | None = None,
     ) -> list[PageContent]:
+        exclude_nums = exclude_nums or set()
         scored = [
             (_score_page_for_sheet(page, sheet_key), page)
             for page in pages
+            if page.page_number not in exclude_nums
         ]
         scored = [(score, page) for score, page in scored if score >= min_score]
         scored.sort(key=lambda item: (item[0], -item[1].page_number), reverse=True)
@@ -124,12 +128,16 @@ class GapFillAgent:
         cleaned: dict,
         pages: list[PageContent],
         batch_size: int | None = None,
+        routed_page_nums: dict[str, set[int]] | None = None,
     ) -> dict:
         """
         Args:
             raw_data: 1차 추출(+이미지 병합) 원시 결과. 보완 행이 여기에 append 된다.
             cleaned: organize() 1차 결과(시트별 정제 데이터). 채움률 판단 기준.
             pages: 문서 전체 페이지.
+            routed_page_nums: 1차 추출이 시트별로 이미 LLM에 보낸 페이지번호.
+                GAP_FILL_SKIP_ALREADY_ROUTED=True이면 이 페이지들을 재추출 후보에서
+                제외해(=라우팅이 놓친 새 페이지만 보완) 중복 토큰을 없앤다.
 
         Returns:
             보완 행이 추가된 raw_data(추가가 전혀 없으면 원본 raw_data 그대로).
@@ -142,8 +150,12 @@ class GapFillAgent:
         batch_size = batch_size or config.BATCH_SIZE
         min_score = getattr(config, "GAP_FILL_REEXTRACT_MIN_SCORE", 2)
         max_pages = getattr(config, "GAP_FILL_REEXTRACT_MAX_PAGES", 24)
+        skip_routed = getattr(config, "GAP_FILL_SKIP_ALREADY_ROUTED", True)
+        routed_page_nums = routed_page_nums or {}
         self._total_added = 0
 
+        # 보완 대상 시트별로 재추출 배치를 모두 모은 뒤 동시에 호출한다(배치 간 독립).
+        sheet_batches: list[tuple[str, list, str, int]] = []  # (sheet_key, batch, reason, relevant_n)
         print("[에이전트3b 빈칸보완] 채움률 점검 및 보완 재추출 시작...")
         for sheet_key in _GAP_FILL_SHEETS:
             rows = cleaned.get(sheet_key, [])
@@ -156,28 +168,45 @@ class GapFillAgent:
             if not needs:
                 continue
 
-            relevant = self._relevant_pages(pages, sheet_key, min_score, max_pages)
+            exclude_nums = routed_page_nums.get(sheet_key, set()) if skip_routed else set()
+            relevant = self._relevant_pages(
+                pages, sheet_key, min_score, max_pages, exclude_nums=exclude_nums
+            )
             if not relevant:
-                self._stats[sheet_key]["reason"] = reason + " / 관련 페이지 없음"
+                note = " / 관련 페이지 없음"
+                if skip_routed and exclude_nums:
+                    note = " / 1차 미전송 신규 페이지 없음(이미 라우팅됨)"
+                self._stats[sheet_key]["reason"] = reason + note
                 continue
 
-            added_rows: list[dict] = []
             # 점수순으로 뽑힌 페이지를 페이지번호 순으로 정렬한 뒤 의미 단위 배치로 묶는다.
             ordered = sorted(relevant, key=lambda p: p.page_number)
-            batches = _build_semantic_batches(ordered, batch_size)
-            for batch in batches:
-                added_rows.extend(
-                    self._reextract(sheet_key, _build_page_text(batch), municipality)
-                )
+            for batch in _build_semantic_batches(ordered, batch_size):
+                sheet_batches.append((sheet_key, batch, reason, len(relevant)))
 
-            if added_rows:
-                updated[sheet_key] = list(updated.get(sheet_key, [])) + added_rows
-                self._total_added += len(added_rows)
-                self._stats[sheet_key]["added"] = len(added_rows)
-                print(
-                    f"  [{sheet_key}] {reason} → 관련 {len(relevant)}p 재추출, "
-                    f"보완 후보 {len(added_rows)}건"
-                )
+        results = parallel_map(
+            lambda sb: self._reextract(sb[0], _build_page_text(sb[1]), municipality),
+            sheet_batches,
+            workers=getattr(config, "TEXT_WORKERS", 4),
+        )
+
+        added_by_sheet: dict[str, list[dict]] = {}
+        info_by_sheet: dict[str, tuple[str, int]] = {}
+        for (sheet_key, _batch, reason, relevant_n), added_rows in zip(sheet_batches, results):
+            added_by_sheet.setdefault(sheet_key, []).extend(added_rows)
+            info_by_sheet[sheet_key] = (reason, relevant_n)
+
+        for sheet_key, added_rows in added_by_sheet.items():
+            if not added_rows:
+                continue
+            updated[sheet_key] = list(updated.get(sheet_key, [])) + added_rows
+            self._total_added += len(added_rows)
+            self._stats[sheet_key]["added"] = len(added_rows)
+            reason, relevant_n = info_by_sheet[sheet_key]
+            print(
+                f"  [{sheet_key}] {reason} → 관련 {relevant_n}p 재추출, "
+                f"보완 후보 {len(added_rows)}건"
+            )
 
         print(f"[에이전트3b 빈칸보완] 완료. 보완 후보 총 {self._total_added}건 추가")
         return updated if self._total_added > 0 else raw_data

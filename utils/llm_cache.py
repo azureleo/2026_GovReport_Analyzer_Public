@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TypedDict
@@ -27,15 +28,24 @@ class LLMCacheRequest:
 # 실행 단위 캐시 통계. Supervisor가 시작 시 reset_cache_stats()로 초기화하고
 # 종료 시 get_cache_stats()로 hit/miss/write/disabled 요약을 출력한다.
 _CACHE_STATS: dict[str, int] = {"hit": 0, "miss": 0, "write": 0, "disabled": 0}
+# 병렬 호출 시 여러 스레드가 통계를 증가시키므로 보호한다.
+_CACHE_STATS_LOCK = threading.Lock()
+
+
+def _bump_stat(key: str) -> None:
+    with _CACHE_STATS_LOCK:
+        _CACHE_STATS[key] += 1
 
 
 def reset_cache_stats() -> None:
-    for key in _CACHE_STATS:
-        _CACHE_STATS[key] = 0
+    with _CACHE_STATS_LOCK:
+        for key in _CACHE_STATS:
+            _CACHE_STATS[key] = 0
 
 
 def get_cache_stats() -> dict[str, int]:
-    return dict(_CACHE_STATS)
+    with _CACHE_STATS_LOCK:
+        return dict(_CACHE_STATS)
 
 
 def _sha256_text(text: str) -> str:
@@ -108,19 +118,19 @@ def _write_response(request: LLMCacheRequest, response: str) -> None:
 
 def cached_response(request: LLMCacheRequest, producer: Callable[[], str]) -> str:
     if not _is_enabled():
-        _CACHE_STATS["disabled"] += 1
+        _bump_stat("disabled")
         return producer()
 
     cached = _read_response(request)
     if cached is not None:
-        _CACHE_STATS["hit"] += 1
+        _bump_stat("hit")
         return cached
 
-    _CACHE_STATS["miss"] += 1
+    _bump_stat("miss")
     response = producer()
     try:
         _write_response(request, response)
-        _CACHE_STATS["write"] += 1
+        _bump_stat("write")
     except OSError:
         return response
     return response

@@ -15,6 +15,7 @@ import re
 import config
 from utils.pdf_reader import PageContent
 from utils import llm_client
+from utils.parallel import parallel_map
 from PIL import Image, ImageFilter, ImageStat
 
 logger = logging.getLogger(__name__)
@@ -982,28 +983,41 @@ class ImageAgent:
             pages_with_images[i:i + batch_size]
             for i in range(0, len(pages_with_images), batch_size)
         ]
-        processed = 0
-        for batch_num, image_batch in enumerate(image_batches, start=1):
-            processed += len(image_batch)
-            page_nums = [page.page_number for page, _ in image_batch]
-            print(
-                f"[에이전트2b 이미지분석] 배치 {batch_num}/{len(image_batches)} "
-                f"(누적 {processed}/{total}, 페이지 {page_nums[0]}~{page_nums[-1]}) 분석 중..."
-            )
+        def _run_batch(image_batch: list) -> list:
             if config.IMAGE_CHART_TABLE_EXTRACTION:
-                batch_results = self._chart_to_table_batch(image_batch, municipality)
-            else:
-                batch_results = []
-                for page, image in image_batch:
-                    result = self._analyze_image(image, page.page_number, municipality)
-                    if result:
-                        batch_results.append(result)
+                return self._chart_to_table_batch(image_batch, municipality)
+            out = []
+            for page, image in image_batch:
+                result = self._analyze_image(image, page.page_number, municipality)
+                if result:
+                    out.append(result)
+            return out
+
+        # vision 배치는 서로 독립적이라 동시에 호출한다(VISION_WORKERS). 입력 순서를
+        # 보존하므로 누적 결과는 순차 실행과 동일하다.
+        print(
+            f"[에이전트2b 이미지분석] 배치 {len(image_batches)}개 분석 중 "
+            f"(이미지당 batch={batch_size}, 동시={getattr(config, 'VISION_WORKERS', 2)})..."
+        )
+        batch_results_list = parallel_map(
+            _run_batch, image_batches, workers=getattr(config, "VISION_WORKERS", 2)
+        )
+        for batch_num, (image_batch, batch_results) in enumerate(
+            zip(image_batches, batch_results_list), start=1
+        ):
+            page_nums = [page.page_number for page, _ in image_batch]
             analyses.extend(batch_results)
             if batch_results:
                 titles = ", ".join(str(r.get("title", "제목없음"))[:30] for r in batch_results[:3])
-                print(f"  → 유효 {len(batch_results)}건: {titles}")
+                print(
+                    f"  배치 {batch_num}/{len(image_batches)} "
+                    f"(p{page_nums[0]}~{page_nums[-1]}) → 유효 {len(batch_results)}건: {titles}"
+                )
             else:
-                print("  → 관련 있는 표/그래프 없음")
+                print(
+                    f"  배치 {batch_num}/{len(image_batches)} "
+                    f"(p{page_nums[0]}~{page_nums[-1]}) → 관련 있는 표/그래프 없음"
+                )
 
         self._image_results = analyses
         print(f"[에이전트2b 이미지분석] 유효 분석 {len(analyses)}개 완료")
