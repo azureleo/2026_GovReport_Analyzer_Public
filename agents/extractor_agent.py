@@ -675,6 +675,12 @@ class ExtractorAgent:
         self.routed_page_nums: dict[str, set[int]] = {}
         self.ledger: list[BatchRecord] = []
 
+    def partial_results(self) -> dict:
+        return {
+            key: list(value) if isinstance(value, list) else value
+            for key, value in self._raw_results.items()
+        }
+
     @property
     def extracted_page_nums(self) -> dict[str, set[int]]:
         extracted: dict[str, set[int]] = {}
@@ -742,8 +748,6 @@ class ExtractorAgent:
         try:
             resp = llm_client.call_text(prompt, system="당신은 한국 행정구역 명칭 전문가입니다.")
             name = (llm_client.parse_json(resp).get("municipality_name") or "").strip()
-        except llm_client.LLMQuotaExceededError:
-            raise
         except llm_client.LLMCallError as exc:
             logger.warning("지자체명 LLM 추출 실패, 정규식 fallback 사용: %s", exc)
 

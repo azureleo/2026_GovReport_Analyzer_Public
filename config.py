@@ -509,9 +509,8 @@ LLM_QUOTA_WAIT_POLL_SECONDS = _env_int("LLM_QUOTA_WAIT_POLL_SECONDS", 120)
 LLM_QUOTA_WAIT_MAX_SECONDS = _env_int("LLM_QUOTA_WAIT_MAX_SECONDS", 1800)
 # 대기 중 "아직 살아 있음"을 알리는 하트비트 로그 간격(초). 기본 5분.
 LLM_QUOTA_WAIT_HEARTBEAT_SECONDS = _env_int("LLM_QUOTA_WAIT_HEARTBEAT_SECONDS", 300)
-# codex/claude는 한도 근처에서 깨끗한 quota 메시지 대신 그냥 hang(타임아웃)으로 나타나기도 한다.
-# 한 호출에서 연속 N회 타임아웃이면 throttling으로 간주해, 일반 재시도(3회) 대신
-# 위 quota 대기-재개 로직으로 전환한다(LLM_QUOTA_WAIT_ENABLED=True일 때).
+# codex/claude 명시적 quota와 연속 타임아웃은 짧게 대기 후 재개하고, 상한 초과 시
+# 해당 배치 실패로 격리한다(LLM_QUOTA_WAIT_ENABLED=True일 때).
 LLM_TIMEOUT_AS_QUOTA_THRESHOLD = _env_int("LLM_TIMEOUT_AS_QUOTA_THRESHOLD", 2)
 
 # 이미지 최대 크기 (픽셀, 긴 변 기준)

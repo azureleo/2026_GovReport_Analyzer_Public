@@ -247,11 +247,15 @@ class Supervisor:
 
             extractor = ExtractorAgent()
             t0 = time.time()
-            raw_data = extractor.extract(
-                pages=pdf_content.pages,
-                full_text=pdf_content.full_text,
-                extraction_prompts=extraction_prompts,
-            )
+            try:
+                raw_data = extractor.extract(
+                    pages=pdf_content.pages,
+                    full_text=pdf_content.full_text,
+                    extraction_prompts=extraction_prompts,
+                )
+            except llm_client.LLMQuotaExceededError as exc:
+                raw_data = extractor.partial_results()
+                logger.warning("텍스트 추출 quota/한도 문제로 부분 결과로 계속 진행: %s", exc)
             elapsed = time.time() - t0
             self._add_timing("텍스트 추출", elapsed)
             self._log(extractor.report())
@@ -264,11 +268,14 @@ class Supervisor:
             if include_images:
                 image_agent = ImageAgent()
                 t0 = time.time()
-                raw_data = image_agent.extract(
-                    pages=pdf_content.pages,
-                    text_results=raw_data,
-                    municipality=municipality,
-                )
+                try:
+                    raw_data = image_agent.extract(
+                        pages=pdf_content.pages,
+                        text_results=raw_data,
+                        municipality=municipality,
+                    )
+                except llm_client.LLMQuotaExceededError as exc:
+                    logger.warning("이미지 분석 quota/한도 문제로 기존 텍스트 결과로 계속 진행: %s", exc)
                 elapsed = time.time() - t0
                 self._add_timing("이미지 분석", elapsed)
                 self._log(image_agent.report())

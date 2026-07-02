@@ -69,8 +69,9 @@ def parallel_map_collect(
     items의 각 원소에 fn을 적용하되, 일반 예외는 항목별 실패로 수집한다.
 
     반환값은 입력 순서를 보존하는 (결과, None) 또는 (None, 예외) 튜플 목록이다.
-    LLMQuotaExceededError는 해당 단계 전체가 중단돼야 하는 한도 문제이므로 수집하지 않고
-    즉시 전파한다.
+    LLMQuotaExceededError는 해당 항목부터 남은 미완료 항목을 실패로 채워 반환한다.
+    quota 이후 이미 완료된 작업은 보존하고, 실행 중이던 작업은 기다리지 않고 건너뜀으로
+    기록한다.
     """
     n = len(items)
     if n == 0:
@@ -78,32 +79,49 @@ def parallel_map_collect(
     enabled = getattr(config, "PARALLEL_PROCESSING_ENABLED", True)
     if not enabled or workers <= 1 or n == 1:
         sequential: list[tuple[R | None, Exception | None]] = []
-        for item in items:
+        for index, item in enumerate(items):
             try:
                 sequential.append((fn(item), None))
-            except LLMQuotaExceededError:
-                raise
+            except LLMQuotaExceededError as exc:
+                sequential.append((None, exc))
+                skip = LLMQuotaExceededError("선행 배치 quota로 건너뜀")
+                sequential.extend((None, skip) for _ in items[index + 1:])
+                return sequential
             except Exception as exc:  # noqa: BLE001 - 항목 실패를 원장에 남기기 위한 경계
                 sequential.append((None, exc))
         return sequential
 
     results: list[tuple[R | None, Exception | None] | None] = [None] * n
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-    try:
-        future_to_index = {executor.submit(fn, item): i for i, item in enumerate(items)}
-        for future in concurrent.futures.as_completed(future_to_index):
-            index = future_to_index[future]
+    future_to_index = {executor.submit(fn, item): i for i, item in enumerate(items)}
+    quota_error: LLMQuotaExceededError | None = None
+    for future in concurrent.futures.as_completed(future_to_index):
+        index = future_to_index[future]
+        try:
+            results[index] = (future.result(), None)
+        except LLMQuotaExceededError as exc:
+            results[index] = (None, exc)
+            quota_error = exc
+            executor.shutdown(wait=False, cancel_futures=True)
+            break
+        except Exception as exc:  # noqa: BLE001 - 항목별 실패 수집 API
+            results[index] = (None, exc)
+
+    if quota_error is None:
+        executor.shutdown(wait=True)
+    else:
+        skip = LLMQuotaExceededError("선행 배치 quota로 건너뜀")
+        for future, index in future_to_index.items():
+            if results[index] is not None:
+                continue
+            if future.cancelled() or not future.done():
+                results[index] = (None, skip)
+                continue
             try:
                 results[index] = (future.result(), None)
-            except LLMQuotaExceededError:
-                executor.shutdown(wait=False, cancel_futures=True)
-                raise
+            except LLMQuotaExceededError as exc:
+                results[index] = (None, exc)
             except Exception as exc:  # noqa: BLE001 - 항목별 실패 수집 API
                 results[index] = (None, exc)
-    except BaseException:
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise
-    else:
-        executor.shutdown(wait=True)
 
     return [item if item is not None else (None, RuntimeError("작업 결과 누락")) for item in results]

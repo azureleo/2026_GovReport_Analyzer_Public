@@ -19,6 +19,7 @@ class LLMClientTests(unittest.TestCase):
                 "LOCAL_AGENT_MODEL",
                 "LOCAL_AGENT_TIMEOUT",
                 "GEMINI_API_KEY",
+                "LLM_QUOTA_WAIT_ENABLED",
             )
         }
         self._saved_optional = {
@@ -194,6 +195,7 @@ class LLMClientTests(unittest.TestCase):
             llm_client.config.CODEX_COMMAND = self._fake_quota_command(Path(tmp))
             llm_client.config.LOCAL_AGENT_TIMEOUT = 5
             llm_client.config.LOCAL_AGENT_MODEL = ""
+            llm_client.config.LLM_QUOTA_WAIT_ENABLED = False
 
             with self.assertRaises(llm_client.LLMQuotaExceededError):
                 llm_client.call_text('{"answer": true}', system="system", max_retries=3)

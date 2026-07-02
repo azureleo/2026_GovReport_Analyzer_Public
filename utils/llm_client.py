@@ -478,8 +478,26 @@ def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
                 time.sleep(wait)
         except LLMQuotaExceededError as exc:
             consecutive_timeouts = 0
-            logger.error("%s quota/세션 한도 초과. 해당 단계가 원장/상위 정책으로 처리하도록 전파합니다.", label)
-            raise
+            if not getattr(config, "LLM_QUOTA_WAIT_ENABLED", True):
+                raise
+            parsed = _parse_quota_reset_seconds(str(exc))
+            poll = int(getattr(config, "LLM_QUOTA_WAIT_POLL_SECONDS", 120))
+            wait = (parsed + 30) if parsed is not None else poll
+            cap = int(getattr(config, "LLM_QUOTA_WAIT_MAX_SECONDS", 1800))
+            if quota_waited + wait > cap:
+                logger.error(
+                    "%s quota/세션 한도 대기 누적 %s 가 상한 %s 초과. 배치 실패로 격리합니다.",
+                    label, _fmt_duration(quota_waited), _fmt_duration(cap),
+                )
+                raise
+            quota_waited += wait
+            attempt -= 1
+            _inc_stat("retries")
+            logger.warning(
+                "%s quota/세션 한도 감지. %s 후 자동 재개(누적 대기 %s).",
+                label, _fmt_duration(wait), _fmt_duration(quota_waited),
+            )
+            _sleep_with_heartbeat(wait, label)
         except (LLMCallError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
             consecutive_timeouts = 0  # 비-타임아웃 오류는 연속 타임아웃 카운트를 끊는다.
             if attempt >= max_retries:

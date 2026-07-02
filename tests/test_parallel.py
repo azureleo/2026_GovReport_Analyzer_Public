@@ -30,7 +30,7 @@ class ParallelMapCollectTests(unittest.TestCase):
         self.assertIsInstance(results[1][1], LLMCallError)
         self.assertEqual(results[2], (30, None))
 
-    def test_quota_failure_is_raised_immediately(self):
+    def test_quota_failure_is_collected_and_remaining_items_are_skipped(self):
         # Given: quota 실패를 내는 작업
         config.PARALLEL_PROCESSING_ENABLED = True
 
@@ -39,9 +39,13 @@ class ParallelMapCollectTests(unittest.TestCase):
                 raise LLMQuotaExceededError("quota")
             return value
 
-        # When / Then: quota는 항목 실패가 아니라 단계 중단으로 전파된다.
-        with self.assertRaises(LLMQuotaExceededError):
-            parallel_map_collect(worker, [1, 2, 3], workers=3)
+        # When: quota가 발생하는 수집형 병렬 실행을 수행하면
+        results = parallel_map_collect(worker, [1, 2, 3], workers=3)
+
+        # Then: raise 없이 quota 항목과 미완료 항목을 실패로 남긴다.
+        self.assertEqual(results[0], (1, None))
+        self.assertIsNone(results[1][0])
+        self.assertIsInstance(results[1][1], LLMQuotaExceededError)
 
     def test_sequential_fallback_returns_same_tuple_shape(self):
         # Given: 병렬 비활성 상태와 실패 항목
