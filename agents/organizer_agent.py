@@ -522,32 +522,6 @@ def _build_visual_inventory(observations: list[dict], municipality: str) -> list
     return inventory
 
 
-def _apply_context_summary_evidence(cleaned: dict, context: str) -> None:
-    """문서 컨텍스트에서 확인되는 대표 감축목표를 summary 행에 보강한다."""
-    rows = cleaned.get("summary", [])
-    if not isinstance(rows, list):
-        return
-    text = context or ""
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        item = row.get("항목")
-        if item == "감축목표(2030)" and not row.get("내용"):
-            parts: list[str] = []
-            if "30% 감축" in text:
-                parts.append("2030년 30% 감축")
-            match = re.search(r"2030년[^\n]{0,120}?줄어든\s*([\d,]+천\s*톤CO₂eq)", text)
-            if match:
-                parts.append(f"목표배출량 {match.group(1)}")
-            if parts:
-                row["내용"] = ", ".join(parts)
-                row["근거"] = "컨텍스트 감축목표 페이지"
-        if item == "감축목표(2035)" and not row.get("내용"):
-            if "2035" not in text and "2033" in text:
-                row["내용"] = "2035년 별도 목표는 확인되지 않는다. 인접 연도로 2033년 목표가 제시됨"
-                row["근거"] = "컨텍스트 감축목표 페이지"
-
-
 def _issue(municipality: str, severity: str, area: str, item: str, detail: str, action: str) -> dict:
     return {
         "지자체명": municipality,

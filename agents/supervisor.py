@@ -7,7 +7,6 @@ carbon_guideline.md 기반 16개 시트 구조에 맞춰 동작합니다.
 
 import json
 import logging
-import re
 import time
 from pathlib import Path
 
@@ -51,17 +50,6 @@ def _fmt_seconds(seconds: float) -> str:
         return f"{int(minutes)}분 {sec:.1f}초"
     hours, minutes = divmod(int(minutes), 60)
     return f"{hours}시간 {minutes}분 {sec:.1f}초"
-
-
-def _build_summary_context(full_text: str, max_chars: int = 12000) -> str:
-    """감축목표 요약 보강에 쓸 고신호 페이지 블록을 추린다."""
-    blocks = re.split(r"(?=\[페이지\s+\d+\])", full_text or "")
-    keywords = ("감축목표", "목표배출", "목표배출량", "2030", "2033", "2035", "2050", "탄소중립")
-    selected = [block.strip() for block in blocks if any(keyword in block for keyword in keywords)]
-    if not selected:
-        return (full_text or "")[:max_chars]
-    context = "\n".join(selected)
-    return context[:max_chars]
 
 
 def _quality_score(final_data: dict) -> tuple[float, list[str]]:
