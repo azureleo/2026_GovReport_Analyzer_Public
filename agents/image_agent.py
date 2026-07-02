@@ -15,7 +15,7 @@ import re
 import config
 from utils.pdf_reader import PageContent
 from utils import llm_client
-from utils.parallel import parallel_map
+from utils.parallel import parallel_map_collect
 from PIL import Image, ImageFilter, ImageStat
 
 logger = logging.getLogger(__name__)
@@ -470,8 +470,9 @@ class ImageAgent:
   "other_data": {{}}
 }}"""
 
-        resp = llm_client.call_vision(image["base64"], prompt, system=IMAGE_SYSTEM)
-        parsed = llm_client.parse_json(resp)
+        parsed, parse_ok = llm_client.call_vision_json(image["base64"], prompt, system=IMAGE_SYSTEM)
+        if not parse_ok:
+            return None
         # list나 빈 값이 반환되면 건너뜀
         if not parsed or not isinstance(parsed, dict):
             return None
@@ -511,8 +512,9 @@ class ImageAgent:
 차량 등록대수/주행거리 표라면 target_sheet는 vehicle, 에너지 소비량 표라면 target_sheet는 energy로 두세요.
 이미지에 숫자축만 있고 정확한 값을 읽기 어려우면 대략값을 만들지 말고 null로 반환하세요."""
 
-        resp = llm_client.call_vision(image["base64"], prompt, system=CHART_TABLE_SYSTEM)
-        parsed = llm_client.parse_json(resp)
+        parsed, parse_ok = llm_client.call_vision_json(image["base64"], prompt, system=CHART_TABLE_SYSTEM)
+        if not parse_ok:
+            return None
         if not parsed or not isinstance(parsed, dict):
             return None
         if parsed.get("type") == "해당없음":
@@ -585,8 +587,9 @@ class ImageAgent:
 - 반드시 JSON만 반환하세요."""
 
         images = [image["base64"] for _, image in batch]
-        response = llm_client.call_vision_batch(images, prompt, system=CHART_TABLE_SYSTEM)
-        parsed = llm_client.parse_json(response)
+        parsed, parse_ok = llm_client.call_vision_batch_json(images, prompt, system=CHART_TABLE_SYSTEM)
+        if not parse_ok:
+            return []
         raw_analyses = parsed.get("analyses", []) if isinstance(parsed, dict) else parsed
         if not isinstance(raw_analyses, list):
             return []
@@ -763,6 +766,7 @@ class ImageAgent:
                             "값": val,
                             "단위": merged_item.get("단위") or analysis.get("unit") or "",
                             "출처": f"이미지 p.{analysis.get('page_number')}",
+                            "출처페이지": analysis.get("page_number"),
                         })
                         continue
 
@@ -780,6 +784,7 @@ class ImageAgent:
                             "성과지표명": merged_item.get("성과지표") or "",
                             "성과지표단위": "",
                             "정량여부": True,
+                            "출처페이지": analysis.get("page_number"),
                         })
                         continue
 
@@ -795,6 +800,7 @@ class ImageAgent:
                             "연도": year_int,
                             "예산액": val,
                             "예산단위": merged_item.get("단위") or analysis.get("unit") or "",
+                            "출처페이지": analysis.get("page_number"),
                         })
                         continue
 
@@ -834,6 +840,7 @@ class ImageAgent:
                             "전망값": numeric,
                             "단위": unit or "tCO2eq",
                             "주요가정": f"이미지 p.{analysis.get('page_number')}",
+                            "출처페이지": analysis.get("page_number"),
                         })
                     elif kind == "목표":
                         existing_targets.append({
@@ -848,6 +855,7 @@ class ImageAgent:
                             "목표감축량": None,
                             "목표배출량": numeric,
                             "감축률": None,
+                            "출처페이지": analysis.get("page_number"),
                         })
                     else:
                         existing_ghg.append({
@@ -861,6 +869,7 @@ class ImageAgent:
                             "배출량": numeric,
                             "단위": unit or "tCO2eq",
                             "흡수원여부": emit_type == "흡수원",
+                            "출처페이지": analysis.get("page_number"),
                         })
 
             for series in analysis.get("ghg_data", []):
@@ -889,6 +898,7 @@ class ImageAgent:
                         "배출량": numeric,
                         "단위": "tCO2eq",
                         "흡수원여부": False,
+                        "출처페이지": analysis.get("page_number"),
                     })
 
         text_results["emissions_regional"] = existing_ghg
@@ -999,25 +1009,37 @@ class ImageAgent:
             f"[에이전트2b 이미지분석] 배치 {len(image_batches)}개 분석 중 "
             f"(이미지당 batch={batch_size}, 동시={getattr(config, 'VISION_WORKERS', 2)})..."
         )
-        batch_results_list = parallel_map(
+        batch_results_list = parallel_map_collect(
             _run_batch, image_batches, workers=getattr(config, "VISION_WORKERS", 2)
         )
-        for batch_num, (image_batch, batch_results) in enumerate(
+        failed_batches = 0
+        for batch_num, (image_batch, result) in enumerate(
             zip(image_batches, batch_results_list), start=1
         ):
+            batch_results, err = result
             page_nums = [page.page_number for page, _ in image_batch]
-            analyses.extend(batch_results)
-            if batch_results:
-                titles = ", ".join(str(r.get("title", "제목없음"))[:30] for r in batch_results[:3])
+            if err is not None:
+                failed_batches += 1
                 print(
                     f"  배치 {batch_num}/{len(image_batches)} "
-                    f"(p{page_nums[0]}~{page_nums[-1]}) → 유효 {len(batch_results)}건: {titles}"
+                    f"(p{page_nums[0]}~{page_nums[-1]}) → 호출 실패({type(err).__name__})"
+                )
+                continue
+            rows = batch_results or []
+            analyses.extend(rows)
+            if rows:
+                titles = ", ".join(str(r.get("title", "제목없음"))[:30] for r in rows[:3])
+                print(
+                    f"  배치 {batch_num}/{len(image_batches)} "
+                    f"(p{page_nums[0]}~{page_nums[-1]}) → 유효 {len(rows)}건: {titles}"
                 )
             else:
                 print(
                     f"  배치 {batch_num}/{len(image_batches)} "
                     f"(p{page_nums[0]}~{page_nums[-1]}) → 관련 있는 표/그래프 없음"
                 )
+        if failed_batches:
+            print(f"[에이전트2b 이미지분석] 호출 실패 배치 {failed_batches}건 건너뜀")
 
         self._image_results = analyses
         print(f"[에이전트2b 이미지분석] 유효 분석 {len(analyses)}개 완료")

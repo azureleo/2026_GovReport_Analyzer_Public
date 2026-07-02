@@ -7,6 +7,7 @@ carbon_guideline.md 기반 16개 시트 구조에 맞춰 동작합니다.
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -50,6 +51,17 @@ def _fmt_seconds(seconds: float) -> str:
         return f"{int(minutes)}분 {sec:.1f}초"
     hours, minutes = divmod(int(minutes), 60)
     return f"{hours}시간 {minutes}분 {sec:.1f}초"
+
+
+def _build_summary_context(full_text: str, max_chars: int = 12000) -> str:
+    """감축목표 요약 보강에 쓸 고신호 페이지 블록을 추린다."""
+    blocks = re.split(r"(?=\[페이지\s+\d+\])", full_text or "")
+    keywords = ("감축목표", "목표배출", "목표배출량", "2030", "2033", "2035", "2050", "탄소중립")
+    selected = [block.strip() for block in blocks if any(keyword in block for keyword in keywords)]
+    if not selected:
+        return (full_text or "")[:max_chars]
+    context = "\n".join(selected)
+    return context[:max_chars]
 
 
 def _quality_score(final_data: dict) -> tuple[float, list[str]]:
@@ -139,6 +151,17 @@ class Supervisor:
                 f"write {stats.get('write', 0)}, "
                 f"disabled {stats.get('disabled', 0)}"
             )
+        llm_stats = llm_client.get_llm_stats()
+        if llm_stats:
+            wait_seconds = llm_stats.get("quota_wait_seconds", 0.0)
+            self._log(
+                "  - LLM 호출: "
+                f"{llm_stats.get('total_calls', 0)}회"
+                f"(실패 {llm_stats.get('failures', 0)}, "
+                f"재시도 {llm_stats.get('retries', 0)}, "
+                f"타임아웃 {llm_stats.get('timeouts', 0)}), "
+                f"quota 대기 누적 {_fmt_seconds(float(wait_seconds))}"
+            )
 
     def _llm_quality_review(self, final_data: dict) -> dict:
         municipality = final_data.get("municipality_name", "?")
@@ -188,6 +211,7 @@ class Supervisor:
         pipeline_start = time.time()
         self._timings = {}
         llm_cache.reset_cache_stats()
+        llm_client.reset_llm_stats()
 
         self._log("=" * 60)
         self._log("[감독관] 파이프라인 시작 (가이드라인 기반 16개 시트)")
@@ -231,8 +255,10 @@ class Supervisor:
             elapsed = time.time() - t0
             self._add_timing("텍스트 추출", elapsed)
             self._log(extractor.report())
+            self._log(extractor.ledger_summary())
             self._log(f"[감독관] 텍스트 추출 완료: {elapsed:.1f}초")
 
+            ledger_records = list(extractor.ledger)
             municipality = raw_data.get("municipality_name", "알 수 없음")
 
             if include_images:
@@ -252,7 +278,11 @@ class Supervisor:
 
             organizer = OrganizerAgent()
             t0 = time.time()
-            final_data = organizer.organize(raw_data)
+            final_data = organizer.organize(
+                raw_data,
+                ledger=ledger_records,
+                routed_page_nums=getattr(extractor, "routed_page_nums", None),
+            )
             elapsed = time.time() - t0
             self._add_timing("정리·정제", elapsed)
             self._log(organizer.report())
@@ -268,7 +298,7 @@ class Supervisor:
                         raw_data=raw_data,
                         cleaned=final_data,
                         pages=pdf_content.pages,
-                        routed_page_nums=getattr(extractor, "routed_page_nums", None),
+                        extracted_page_nums=getattr(extractor, "extracted_page_nums", None),
                     )
                 except llm_client.LLMQuotaExceededError as exc:
                     enhanced_raw = raw_data
@@ -278,11 +308,17 @@ class Supervisor:
                 self._log(gap_agent.report())
                 self._log(f"[감독관] 빈칸 보완 완료: {elapsed:.1f}초")
 
-                # 보완 후보가 추가된 경우에만 같은 organizer로 재정제(_final_data 갱신).
-                if enhanced_raw is not raw_data:
+                ledger_records = list(extractor.ledger) + list(getattr(gap_agent, "ledger", []))
+
+                # 보완 후보가 추가됐거나 보완 실패 원장이 생기면 같은 organizer로 재정제해 검증리포트를 갱신한다.
+                if enhanced_raw is not raw_data or getattr(gap_agent, "ledger", []):
                     raw_data = enhanced_raw
                     t0 = time.time()
-                    final_data = organizer.organize(raw_data)
+                    final_data = organizer.organize(
+                        raw_data,
+                        ledger=ledger_records,
+                        routed_page_nums=getattr(extractor, "routed_page_nums", None),
+                    )
                     elapsed = time.time() - t0
                     self._add_timing("정리·정제", elapsed)
                     self._log(f"[감독관] 빈칸 보완 후 재정제 완료: {elapsed:.1f}초")

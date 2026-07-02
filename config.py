@@ -62,7 +62,9 @@ def _env_list(name: str, default: list[str]) -> list[str]:
 # gemini / openai / codex / claude / auto 중 선택합니다.
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
 LOCAL_AGENT_MODEL = os.environ.get("LOCAL_AGENT_MODEL", "").strip()
-LOCAL_AGENT_TIMEOUT = _env_int("LOCAL_AGENT_TIMEOUT", 900)
+# 정상 추출 호출은 보통 1~2분 내 끝난다. 900초 기본값은 hang을 15분씩 방치해
+# 로컬 에이전트 실행을 수 시간 지연시켰으므로, 필요 시 env로만 되돌린다.
+LOCAL_AGENT_TIMEOUT = _env_int("LOCAL_AGENT_TIMEOUT", 300)
 CODEX_COMMAND = os.environ.get("CODEX_COMMAND", "codex").strip()
 CLAUDE_COMMAND = os.environ.get("CLAUDE_COMMAND", "claude").strip()
 GUIDELINE_AGENT_SPEC_ENABLED = _env_bool("GUIDELINE_AGENT_SPEC_ENABLED", True)
@@ -141,6 +143,8 @@ STRATEGY_TYPES = [
     "계획(지표)", "계획(감축량)", "계획(예산)",
     "실적(지표)", "실적(감축량)", "실적(예산)"
 ]
+
+SUMMARY_ITEMS = ["감축목표(2030)", "감축목표(2035)"]
 
 # 달성여부 코드 (가이드라인 3.3절)
 ACHIEVEMENT_STATUS = ["달성", "정상추진", "지연", "미달성"]
@@ -300,6 +304,14 @@ SHEET_KEY_TO_NAME = {
 # 데이터가 있을 때만 생성하는 선택 시트
 OPTIONAL_EXCEL_SHEETS = {"17_보조검수후보", "18_보조병합로그", "19_검증리포트"}
 
+# 행 단위 원문 대조를 위한 페이지 근거. 헤더에는 항상 맨 뒤에 추가하되,
+# 실제 엑셀 출력에서만 PROVENANCE_ENABLED=0으로 v3 스키마를 복원할 수 있다.
+PROVENANCE_ENABLED = _env_bool("PROVENANCE_ENABLED", True)
+_PROVENANCE_DATA_SHEETS = [name for name in EXCEL_HEADERS if name[:2].isdigit() and int(name[:2]) <= 15]
+for _sheet_name in _PROVENANCE_DATA_SHEETS:
+    if "출처페이지" not in EXCEL_HEADERS[_sheet_name]:
+        EXCEL_HEADERS[_sheet_name].append("출처페이지")
+
 # PDF 페이지 배치 처리 크기.
 # 너무 크면 출력 JSON이 길어져 파싱 실패가 늘 수 있어 안정성 위주로 둔다.
 BATCH_SIZE = _env_int("BATCH_SIZE", 15)
@@ -443,12 +455,18 @@ GAP_FILL_MAX_TARGETS = {
 }
 GAP_FILL_CONTEXT_PAGES = 8
 GAP_FILL_TARGET_BATCH_SIZE = 10
-# True이면 빈칸보완 재추출에서 1차 추출이 이미 LLM에 보낸 페이지를 제외하고,
-# 라우팅이 놓친 새 페이지(1차 임계값 미만 점수)만 재추출한다. 이것이 GapFill의
-# 본래 목적("1차 패스가 놓친 페이지를 다시 잡는다")이며, 1차에서 이미 보내고 추출까지
-# 끝낸 페이지를 다시 보내던 중복 토큰을 제거한다. 만약 보완 recall이 떨어지는 게
-# 관찰되면 False로 두어 기존(전체 재스코어) 동작으로 되돌릴 수 있다.
+# True이면 빈칸보완 재추출에서 1차 추출이 이미 성공한 페이지를 제외한다.
+# "보냈다"가 아니라 원장 status==ok 기준이므로 호출/파싱 실패 페이지는 다시 후보가 된다.
 GAP_FILL_SKIP_ALREADY_ROUTED = _env_bool("GAP_FILL_SKIP_ALREADY_ROUTED", True)
+GAP_FILL_COVERAGE_THRESHOLDS = {
+    "emissions_regional_min_sectors": _env_int("GAP_FILL_EMISSIONS_REGIONAL_MIN_SECTORS", 4),
+    "emissions_regional_min_years": _env_int("GAP_FILL_EMISSIONS_REGIONAL_MIN_YEARS", 2),
+    "emissions_management_min_sectors": _env_int("GAP_FILL_EMISSIONS_MANAGEMENT_MIN_SECTORS", 2),
+    "emissions_forecast_min_years": _env_int("GAP_FILL_EMISSIONS_FORECAST_MIN_YEARS", 2),
+    "financial_plan_min_years": _env_int("GAP_FILL_FINANCIAL_PLAN_MIN_YEARS", 2),
+    "financial_plan_min_sectors": _env_int("GAP_FILL_FINANCIAL_PLAN_MIN_SECTORS", 2),
+    "project_ratio": _env_float("GAP_FILL_PROJECT_RATIO", 0.3),
+}
 
 # 자동차/에너지처럼 원문 구간이 보고서마다 달라지는 시트는
 # 전체 문서에서 관련 구간을 다시 점수화해 집중 재추출한다.
@@ -480,15 +498,15 @@ MAX_RETRIES = 3
 # ──────────────────────────────────────────────────────────────────────
 # 할당량(quota/세션 한도) 회복 대기-재개 설정
 # ──────────────────────────────────────────────────────────────────────
-# True이면 codex/claude 로컬 에이전트가 한도 초과로 막혔을 때 즉시 죽지 않고,
-# 에러 메시지에 적힌 회복 시각(없으면 폴링 간격)만큼 대기했다가 같은 호출을
-# 그 자리에서 자동 재개한다. 파이프라인이 메모리에 그대로 묶여 이어진다.
+# True이면 codex/claude 로컬 에이전트가 quota 메시지 없이 반복 타임아웃될 때
+# throttling으로 추정해 짧게 대기 후 재시도한다. 명시적 quota/session-limit 오류는
+# 배치 원장과 상위 단계 정책이 처리하도록 즉시 전파한다.
 LLM_QUOTA_WAIT_ENABLED = _env_bool("LLM_QUOTA_WAIT_ENABLED", True)
-# 회복 시각을 메시지에서 파싱하지 못한 경우의 재시도 폴링 간격(초). 기본 10분.
-# quota로 막힌 호출은 즉시 실패로 돌아오므로 폴링 비용은 거의 없다.
-LLM_QUOTA_WAIT_POLL_SECONDS = _env_int("LLM_QUOTA_WAIT_POLL_SECONDS", 600)
-# 누적 대기 상한(초). 이 시간을 넘기면 포기하고 중단한다. 기본 6시간(리셋 ~5h 대비 여유).
-LLM_QUOTA_WAIT_MAX_SECONDS = _env_int("LLM_QUOTA_WAIT_MAX_SECONDS", 21600)
+# 반복 타임아웃 추정 시 재시도 폴링 간격(초).
+# 10분 폴링은 기본 실행에서 과도한 정지를 만들었으므로 기본 2분으로 줄이고 env로 조정한다.
+LLM_QUOTA_WAIT_POLL_SECONDS = _env_int("LLM_QUOTA_WAIT_POLL_SECONDS", 120)
+# 누적 대기 상한(초). 6시간은 밤샘 완주용으로만 env에서 선택하고 기본은 30분으로 제한한다.
+LLM_QUOTA_WAIT_MAX_SECONDS = _env_int("LLM_QUOTA_WAIT_MAX_SECONDS", 1800)
 # 대기 중 "아직 살아 있음"을 알리는 하트비트 로그 간격(초). 기본 5분.
 LLM_QUOTA_WAIT_HEARTBEAT_SECONDS = _env_int("LLM_QUOTA_WAIT_HEARTBEAT_SECONDS", 300)
 # codex/claude는 한도 근처에서 깨끗한 quota 메시지 대신 그냥 hang(타임아웃)으로 나타나기도 한다.

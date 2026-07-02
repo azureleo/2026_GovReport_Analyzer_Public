@@ -27,6 +27,15 @@ HEADER_KEY_ALIASES = {
 }
 
 
+def _headers_for_output(sheet_name: str, headers: list[str]) -> list[str]:
+    """출처페이지 opt-out을 엑셀 쓰기 직전에 적용한다."""
+    if getattr(config, "PROVENANCE_ENABLED", True):
+        return list(headers)
+    if sheet_name[:2].isdigit() and int(sheet_name[:2]) <= 15:
+        return [header for header in headers if header != "출처페이지"]
+    return list(headers)
+
+
 def _thin_border() -> Border:
     side = Side(style="thin", color="AAAAAA")
     return Border(left=side, right=side, top=side, bottom=side)
@@ -125,7 +134,7 @@ def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
             continue
 
         ws = wb.create_sheet(sheet_name)
-        _write_generic_sheet(ws, headers, data)
+        _write_generic_sheet(ws, _headers_for_output(sheet_name, headers), data)
 
     wb.save(str(output_path))
     return output_path

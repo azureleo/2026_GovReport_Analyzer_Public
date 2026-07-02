@@ -7,13 +7,53 @@ carbon_guideline.md 기반 16개 시트 구조에 맞춰 문서를 추출합니�
 
 import logging
 import re
+from dataclasses import dataclass
 
 import config
 from utils.pdf_reader import PageContent
 from utils import llm_client
-from utils.parallel import parallel_map
+from utils.parallel import parallel_map, parallel_map_collect
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class BatchRecord:
+    """추출 배치 원장 기록."""
+
+    sheet_key: str
+    page_nums: list[int]
+    status: str
+    rows: int
+    error: str = ""
+
+
+_PROVENANCE_INSTRUCTION = (
+    '각 행에 "출처페이지" 필드를 추가하고, 그 행의 근거가 된 페이지 번호'
+    '(=== 페이지 N === 마커 기준)를 정수 또는 정수 배열로 기록하세요. 확실하지 않으면 null.'
+)
+_PAGE_MARKER_RE = re.compile(r"===\s*페이지\s*(\d+)\s*===")
+
+
+def _page_nums_from_batch_text(batch_text: str) -> list[int]:
+    """배치 텍스트의 페이지 마커에서 페이지 번호를 추출한다."""
+    return [int(match) for match in _PAGE_MARKER_RE.findall(batch_text or "")]
+
+
+def _page_range_label(page_nums: list[int]) -> str:
+    if not page_nums:
+        return "p?"
+    return f"p{page_nums[0]}~{page_nums[-1]}" if len(page_nums) > 1 else f"p{page_nums[0]}"
+
+
+def _attach_row_context(row: dict, municipality: str, page_nums: list[int]) -> dict:
+    """행에 지자체명과 출처페이지 fallback을 결정론적으로 보강한다."""
+    if not row.get("지자체명"):
+        row["지자체명"] = municipality
+    if not row.get("출처페이지") and page_nums:
+        row["출처페이지"] = list(page_nums)
+        row["출처페이지추정"] = True
+    return row
 
 
 EXTRACTION_SYSTEM = """당신은 한국 지자체 탄소중립 녹색성장 기본계획 보고서에서
@@ -574,7 +614,7 @@ def _route_pages_by_sheet(
         ubiquitous_weak = frozenset()
 
     # boilerplate strong 키워드(보고서 제목 등 머리말 편재)의 +3 가산도 제외.
-    if getattr(config, "ROUTE_DROP_UBIQUITOUS_STRONG", True):
+    if getattr(config, "ROUTE_DROP_UBIQUITOUS_STRONG", False):
         ubiquitous_strong = _ubiquitous_strong_keywords(
             pages, ratio=getattr(config, "ROUTE_STRONG_UBIQUITY_RATIO", 0.6)
         )
@@ -631,9 +671,65 @@ class ExtractorAgent:
     def __init__(self):
         self._raw_results: dict = {key: [] for key in _SHEET_CONFIGS}
         self._raw_results["municipality_name"] = ""
-        # 시트별로 1차 추출에서 실제 LLM에 보낸 페이지번호. 빈칸보완(GapFill)이
-        # 이미 보낸 페이지를 다시 보내지 않도록(중복 토큰 제거) 참조한다.
+        # 시트별로 1차 추출에서 실제 LLM에 보낸 페이지번호. 라우팅 통계용으로 유지한다.
         self.routed_page_nums: dict[str, set[int]] = {}
+        self.ledger: list[BatchRecord] = []
+
+    @property
+    def extracted_page_nums(self) -> dict[str, set[int]]:
+        extracted: dict[str, set[int]] = {}
+        for record in self.ledger:
+            if record.status != "ok":
+                continue
+            extracted.setdefault(record.sheet_key, set()).update(record.page_nums)
+        return extracted
+
+    def _record_batch(
+        self,
+        sheet_key: str,
+        page_nums: list[int],
+        status: str,
+        rows: int,
+        error: str = "",
+    ) -> None:
+        self.ledger.append(BatchRecord(sheet_key, list(page_nums), status, rows, error))
+
+    def _record_call_failure(self, task: dict, exc: Exception) -> None:
+        page_nums = list(task.get("page_nums", []))
+        error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        if "members" in task:
+            for sheet_key in task["members"]:
+                self._record_batch(sheet_key, page_nums, "call_fail", 0, error)
+            label = "/".join(task["members"][:2]) + ("…" if len(task["members"]) > 2 else "")
+        else:
+            sheet_key = task.get("sheet_key", "?")
+            self._record_batch(sheet_key, page_nums, "call_fail", 0, error)
+            label = sheet_key
+        print(
+            f"  [{label}] 배치 {task.get('batch_num', 0)}/{task.get('batch_total', 0)} "
+            f"({task.get('page_range', _page_range_label(page_nums))}): 호출 실패({type(exc).__name__}) — 원장 기록"
+        )
+
+    def ledger_summary(self) -> str:
+        total = len(self.ledger)
+        ok = sum(1 for record in self.ledger if record.status == "ok")
+        call_fail = sum(1 for record in self.ledger if record.status == "call_fail")
+        parse_fail = sum(1 for record in self.ledger if record.status == "parse_fail")
+        failed_pages = sorted({
+            page
+            for record in self.ledger
+            if record.status != "ok"
+            for page in record.page_nums
+        })
+        page_text = ", ".join(f"p{page}" for page in failed_pages[:12])
+        if len(failed_pages) > 12:
+            page_text += ", …"
+        if not page_text:
+            page_text = "없음"
+        return (
+            f"[감독관] 추출 원장: 배치 {total}건 중 성공 {ok}, "
+            f"호출실패 {call_fail}, 파싱실패 {parse_fail} (실패 페이지: {page_text})"
+        )
 
     def _extract_municipality_name(self, full_text: str) -> str:
         prompt = (
@@ -684,28 +780,31 @@ class ExtractorAgent:
                 "필드 구성과 분류 체계는 가이드라인을 따르세요.\n"
             )
 
+        page_nums = _page_nums_from_batch_text(batch_text)
         full_prompt = (
             f"지자체명: {municipality}"
             f"{guideline_block}\n\n"
             f"[배치 텍스트]\n{batch_text}\n\n"
-            f"{cfg['prompt']}"
+            f"{cfg['prompt']}\n\n{_PROVENANCE_INSTRUCTION}"
         )
-        resp = llm_client.call_text(full_prompt, system=EXTRACTION_SYSTEM)
-        parsed = llm_client.parse_json(resp)
+        parsed, parse_ok = llm_client.call_text_json(full_prompt, system=EXTRACTION_SYSTEM)
 
-        if not parsed or not isinstance(parsed, dict):
+        if not parse_ok or not isinstance(parsed, dict):
+            self._record_batch(sheet_key, page_nums, "parse_fail", 0, "JSON 파싱 실패")
             return []
 
         items = parsed.get(sheet_key, [])
         if not isinstance(items, list):
+            self._record_batch(sheet_key, page_nums, "parse_fail", 0, "스키마 불일치")
             return []
 
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            if not item.get("지자체명"):
-                item["지자체명"] = municipality
-        return [item for item in items if isinstance(item, dict)]
+        rows = [
+            _attach_row_context(item, municipality, page_nums)
+            for item in items
+            if isinstance(item, dict)
+        ]
+        self._record_batch(sheet_key, page_nums, "ok", len(rows))
+        return rows
 
     def _extract_cluster(
         self,
@@ -735,6 +834,7 @@ class ExtractorAgent:
                 )
         combined_schemas = "\n\n".join(schema_blocks)
         keys_csv = ", ".join(f'"{sk}"' for sk in sheet_keys)
+        page_nums = _page_nums_from_batch_text(batch_text)
         full_prompt = (
             f"지자체명: {municipality}\n\n"
             f"[배치 텍스트]\n{batch_text}\n\n"
@@ -743,24 +843,26 @@ class ExtractorAgent:
             "그 항목에 해당하는 데이터가 배치에 없으면 빈 배열([])을 넣으세요. "
             "항목 간 데이터를 섞지 말고, 각 행은 그 항목의 스키마 필드만 사용하세요.\n\n"
             f"{combined_schemas}\n\n"
+            f"{_PROVENANCE_INSTRUCTION}\n\n"
             f"최종 출력은 다음 키를 모두 포함하는 단일 JSON 객체입니다: {{{keys_csv}}}"
         )
-        resp = llm_client.call_text(full_prompt, system=EXTRACTION_SYSTEM)
-        parsed = llm_client.parse_json(resp)
+        parsed, parse_ok = llm_client.call_text_json(full_prompt, system=EXTRACTION_SYSTEM)
 
         out: dict[str, list] = {sk: [] for sk in sheet_keys}
-        if not isinstance(parsed, dict):
+        if not parse_ok or not isinstance(parsed, dict):
+            for sk in sheet_keys:
+                self._record_batch(sk, page_nums, "parse_fail", 0, "JSON 파싱 실패")
             return out
         for sk in sheet_keys:
             items = parsed.get(sk, [])
             if not isinstance(items, list):
+                self._record_batch(sk, page_nums, "parse_fail", 0, "스키마 불일치")
                 continue
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                if not item.get("지자체명"):
-                    item["지자체명"] = municipality
-                out[sk].append(item)
+                out[sk].append(_attach_row_context(item, municipality, page_nums))
+            self._record_batch(sk, page_nums, "ok", len(out[sk]))
         return out
 
     def _extract_clustered(
@@ -798,16 +900,22 @@ class ExtractorAgent:
                     "batch_num": batch_num,
                     "batch_total": len(batches),
                     "page_range": page_range,
+                    "page_nums": page_nums,
                 })
 
-        results = parallel_map(
+        results = parallel_map_collect(
             lambda t: self._extract_cluster(
                 t["members"], t["batch_text"], municipality, extraction_prompts
             ),
             tasks,
             workers=getattr(config, "TEXT_WORKERS", 4),
         )
-        for task, res in zip(tasks, results):
+        for task, (res, err) in zip(tasks, results):
+            if err is not None:
+                self._record_call_failure(task, err)
+                continue
+            if res is None:
+                continue
             counts = []
             for sk, items in res.items():
                 self._raw_results[sk].extend(items)
@@ -834,26 +942,34 @@ class ExtractorAgent:
 
         if getattr(config, "FULL_DOCUMENT_SCAN", False):
             print("[에이전트2 텍스트추출] 전체 문서 스캔 모드")
+            self.routed_page_nums = {key: {page.page_number for page in pages} for key in _SHEET_CONFIGS}
             batches = _build_semantic_batches(pages, batch_size)
             tasks: list[dict] = []
             for batch_num, batch in enumerate(batches, start=1):
                 batch_text = _build_page_text(batch)
+                page_nums = [p.page_number for p in batch]
                 for sheet_key in _SHEET_CONFIGS:
                     tasks.append({
                         "sheet_key": sheet_key,
                         "batch_text": batch_text,
                         "guideline_prompt": extraction_prompts.get(sheet_key, ""),
                         "batch_num": batch_num,
+                        "batch_total": len(batches),
+                        "page_nums": page_nums,
+                        "page_range": _page_range_label(page_nums),
                     })
-            results = parallel_map(
+            results = parallel_map_collect(
                 lambda t: self._extract_sheet(
                     t["sheet_key"], t["batch_text"], municipality, t["guideline_prompt"]
                 ),
                 tasks,
                 workers=getattr(config, "TEXT_WORKERS", 4),
             )
-            for task, items in zip(tasks, results):
-                self._raw_results[task["sheet_key"]].extend(items)
+            for task, (items, err) in zip(tasks, results):
+                if err is not None:
+                    self._record_call_failure(task, err)
+                    continue
+                self._raw_results[task["sheet_key"]].extend(items or [])
             print(f"  [full] 배치 {len(batches)}개 × 16시트 추출 완료")
 
             total = {k: len(v) for k, v in self._raw_results.items() if isinstance(v, list)}
@@ -894,18 +1010,23 @@ class ExtractorAgent:
                     "batch_num": batch_num,
                     "batch_total": len(batches),
                     "page_range": page_range,
+                    "page_nums": page_nums,
                 })
 
-        results = parallel_map(
+        results = parallel_map_collect(
             lambda t: self._extract_sheet(
                 t["sheet_key"], t["batch_text"], municipality, t["guideline_prompt"]
             ),
             tasks,
             workers=getattr(config, "TEXT_WORKERS", 4),
         )
-        for task, items in zip(tasks, results):
-            self._raw_results[task["sheet_key"]].extend(items)
-            status = f"{len(items)}건" if items else "추출 없음"
+        for task, (items, err) in zip(tasks, results):
+            if err is not None:
+                self._record_call_failure(task, err)
+                continue
+            rows = items or []
+            self._raw_results[task["sheet_key"]].extend(rows)
+            status = f"{len(rows)}건" if rows else "추출 없음"
             print(
                 f"  [{task['sheet_key']}] 배치 {task['batch_num']:>2}/{task['batch_total']} "
                 f"({task['page_range']}): {status}"

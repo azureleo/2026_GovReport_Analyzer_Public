@@ -8,6 +8,7 @@
 
 import logging
 import re
+import unicodedata
 from copy import deepcopy
 from typing import Any
 
@@ -141,17 +142,158 @@ def _normalize_sector(val: str) -> str:
     return v
 
 
+_DEDUP_CONFLICTS: list[dict] = []
+_NUMERIC_CONFLICT_FIELDS = {
+    "배출량", "전망값", "예산액", "예상감축량", "목표배출량", "목표감축량",
+    "기준배출량", "배출전망", "값", "활동량", "목표물량", "감축률",
+}
+
+
+def _normalize_provenance_pages(value: Any) -> str:
+    """출처페이지 값을 엑셀에 쓰기 쉬운 오름차순 문자열로 정규화한다."""
+    pages: set[int] = set()
+
+    def add_one(item: Any) -> None:
+        if item is None or isinstance(item, bool):
+            return
+        if isinstance(item, int):
+            pages.add(item)
+            return
+        if isinstance(item, float):
+            if item.is_integer():
+                pages.add(int(item))
+            return
+        if isinstance(item, (list, tuple, set)):
+            for nested in item:
+                add_one(nested)
+            return
+        text = str(item)
+        for start, end in re.findall(r"(\d+)\s*(?:~|-|–|—)\s*(\d+)", text):
+            a = int(start)
+            b = int(end)
+            lo, hi = (a, b) if a <= b else (b, a)
+            pages.update(range(lo, hi + 1))
+        for number in re.findall(r"\d+", text):
+            pages.add(int(number))
+
+    add_one(value)
+    return ",".join(str(page) for page in sorted(page for page in pages if page > 0))
+
+
+def _merge_provenance(left: Any, right: Any) -> str:
+    """두 출처페이지 값을 중복 없는 합집합 문자열로 병합한다."""
+    return _normalize_provenance_pages([left, right])
+
+
+def _normalize_row_provenance(row: dict) -> dict:
+    if "출처페이지" in row or "출처페이지추정" in row:
+        page_value = row.get("출처페이지") or row.get("출처페이지추정")
+        normalized = _normalize_provenance_pages(page_value)
+        if normalized:
+            row["출처페이지"] = normalized
+    return row
+
+
+def _dedup_key_text(val: Any) -> str:
+    """dedup 키 생성 전용 텍스트 정규화. 원본 셀 값은 바꾸지 않는다."""
+    if val is None:
+        return ""
+    text = unicodedata.normalize("NFKC", str(val))
+    text = text.replace("ㆍ", "·").replace("･", "·").replace("ᆞ", "·").replace("・", "·")
+    text = re.sub(r"\s+", " ", text).strip().casefold()
+    return text.replace(" ", "")
+
+
+def _has_cell_value(value: Any) -> bool:
+    return value is not None and str(value).strip() != ""
+
+
+def _values_conflict(left: Any, right: Any) -> bool:
+    if not _has_cell_value(left) or not _has_cell_value(right):
+        return False
+    left_num = _to_float(left)
+    right_num = _to_float(right)
+    if left_num is None or right_num is None:
+        return False
+    if left_num == right_num:
+        return False
+    scale = max(abs(left_num), abs(right_num), 1.0)
+    return abs(left_num - right_num) / scale > 0.005
+
+
+def _row_conflicts(kept: dict, discarded: dict) -> list[str]:
+    conflicts: list[str] = []
+    for field in _NUMERIC_CONFLICT_FIELDS:
+        if field in kept or field in discarded:
+            if _values_conflict(kept.get(field), discarded.get(field)):
+                conflicts.append(field)
+    return conflicts
+
+
+def _remember_dedup_conflict(key_fields: list[str], kept: dict, discarded: dict, fields: list[str]) -> None:
+    key_summary = ", ".join(f"{field}={kept.get(field) or discarded.get(field) or ''}" for field in key_fields)
+    detail = "; ".join(
+        f"{field}: 유지 {kept.get(field)} vs 폐기 {discarded.get(field)}"
+        for field in fields
+    )
+    _DEDUP_CONFLICTS.append({"key": key_summary, "detail": detail})
+
+
+def _merge_missing_values(target: dict, source: dict) -> None:
+    for key, value in source.items():
+        if key == "출처페이지":
+            merged = _merge_provenance(target.get("출처페이지"), value)
+            if merged:
+                target["출처페이지"] = merged
+            continue
+        if _has_cell_value(value) and not _has_cell_value(target.get(key)):
+            target[key] = value
+
+
+def _same_except_detail(left: dict, right: dict, key_fields: list[str], detail_field: str) -> bool:
+    return all(
+        field == detail_field or _dedup_key_text(left.get(field)) == _dedup_key_text(right.get(field))
+        for field in key_fields
+    )
+
+
+def _absorb_blank_detail_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
+    detail_field = "세부부문"
+    if detail_field not in key_fields:
+        return rows
+    retained: list[dict] = [row for row in rows if _dedup_key_text(row.get(detail_field))]
+    blanks = [row for row in rows if not _dedup_key_text(row.get(detail_field))]
+    for blank in blanks:
+        absorbed = False
+        for candidate in retained:
+            if not _same_except_detail(blank, candidate, key_fields, detail_field):
+                continue
+            conflicts = _row_conflicts(candidate, blank)
+            if conflicts:
+                _remember_dedup_conflict(key_fields, candidate, blank, conflicts)
+                continue
+            _merge_missing_values(candidate, blank)
+            absorbed = True
+            break
+        if not absorbed:
+            retained.append(blank)
+    return retained
+
+
 def _deduplicate_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
     seen: dict[tuple, dict] = {}
-    for row in rows:
-        key = tuple(str(row.get(f, "")).strip() for f in key_fields)
+    for source_row in rows:
+        row = _normalize_row_provenance(dict(source_row))
+        key = tuple(_dedup_key_text(row.get(f)) for f in key_fields)
         if key not in seen:
             seen[key] = row
-        else:
-            for k, v in row.items():
-                if v is not None and seen[key].get(k) is None:
-                    seen[key][k] = v
-    return list(seen.values())
+            continue
+        kept = seen[key]
+        conflicts = _row_conflicts(kept, row)
+        if conflicts:
+            _remember_dedup_conflict(key_fields, kept, row, conflicts)
+        _merge_missing_values(kept, row)
+    return _absorb_blank_detail_rows(list(seen.values()), key_fields)
 
 
 def _filter_empty_rows(rows: list[dict], required_fields: list[str]) -> list[dict]:
@@ -380,6 +522,32 @@ def _build_visual_inventory(observations: list[dict], municipality: str) -> list
     return inventory
 
 
+def _apply_context_summary_evidence(cleaned: dict, context: str) -> None:
+    """문서 컨텍스트에서 확인되는 대표 감축목표를 summary 행에 보강한다."""
+    rows = cleaned.get("summary", [])
+    if not isinstance(rows, list):
+        return
+    text = context or ""
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item = row.get("항목")
+        if item == "감축목표(2030)" and not row.get("내용"):
+            parts: list[str] = []
+            if "30% 감축" in text:
+                parts.append("2030년 30% 감축")
+            match = re.search(r"2030년[^\n]{0,120}?줄어든\s*([\d,]+천\s*톤CO₂eq)", text)
+            if match:
+                parts.append(f"목표배출량 {match.group(1)}")
+            if parts:
+                row["내용"] = ", ".join(parts)
+                row["근거"] = "컨텍스트 감축목표 페이지"
+        if item == "감축목표(2035)" and not row.get("내용"):
+            if "2035" not in text and "2033" in text:
+                row["내용"] = "2035년 별도 목표는 확인되지 않는다. 인접 연도로 2033년 목표가 제시됨"
+                row["근거"] = "컨텍스트 감축목표 페이지"
+
+
 def _issue(municipality: str, severity: str, area: str, item: str, detail: str, action: str) -> dict:
     return {
         "지자체명": municipality,
@@ -428,7 +596,169 @@ def _recompute_reduction_rate(rows: list[dict], municipality: str) -> list[dict]
     return issues
 
 
-def _validate_final_data(cleaned: dict, municipality: str) -> list[dict]:
+
+
+def _sheet_area(sheet_key: str) -> str:
+    return getattr(config, "SHEET_KEY_TO_NAME", {}).get(sheet_key, sheet_key)
+
+
+def _record_attr(record, name: str, default=None):
+    if isinstance(record, dict):
+        return record.get(name, default)
+    return getattr(record, name, default)
+
+
+def _relative_gap(left: float, right: float) -> float:
+    return abs(left - right) / max(abs(left), abs(right), 1.0)
+
+
+def _emissions_total_by_year(rows: list[dict]) -> dict[int, float]:
+    totals: dict[int, float] = {}
+    explicit_totals: dict[int, float] = {}
+    for row in rows:
+        year = row.get("연도")
+        amount = row.get("배출량")
+        if not isinstance(year, int) or not isinstance(amount, (int, float)):
+            continue
+        sector = str(row.get("부문", "") or "").strip()
+        if sector in {"합계", "총계", "전체"}:
+            explicit_totals[year] = float(amount)
+        else:
+            totals[year] = totals.get(year, 0.0) + float(amount)
+    return {**totals, **explicit_totals}
+
+
+def _append_dedup_conflict_issues(issues: list[dict], municipality: str) -> None:
+    for conflict in _DEDUP_CONFLICTS:
+        issues.append(_issue(
+            municipality,
+            "경고",
+            "중복제거",
+            f"중복 키 값 충돌({conflict['key']})",
+            conflict["detail"],
+            "원문 페이지 재확인",
+        ))
+
+
+def _append_cross_sheet_issues(issues: list[dict], cleaned: dict, municipality: str) -> None:
+    regional_totals = _emissions_total_by_year(cleaned.get("emissions_regional", []))
+    for row in cleaned.get("reduction_targets", []):
+        if str(row.get("목표수준", "")).strip() not in {"총괄", "합계", "전체", ""}:
+            continue
+        base_year = row.get("기준연도")
+        base_amount = row.get("기준배출량")
+        if not isinstance(base_year, int) or not isinstance(base_amount, (int, float)):
+            continue
+        regional = regional_totals.get(base_year)
+        if regional is None or regional == 0:
+            continue
+        if _relative_gap(float(base_amount), regional) <= 0.05:
+            continue
+        scaled = regional * 1000
+        if _relative_gap(float(base_amount), scaled) <= 0.05:
+            issues.append(_issue(
+                municipality, "정보", "교차시트", f"기준배출량 단위 스케일 차이 추정({base_year})",
+                f"감축목표 {base_amount} vs 배출현황 {regional} (1000배 보정 시 근접)",
+                "단위가 톤/천톤으로 섞였는지 확인",
+            ))
+            continue
+        issues.append(_issue(
+            municipality, "경고", "교차시트", f"기준배출량≠배출현황({base_year})",
+            f"감축목표 기준배출량 {base_amount} vs 배출현황 합계 {regional}",
+            "기준연도·단위·총괄 범위 원문 재확인",
+        ))
+
+    reductions_by_year: dict[int, float] = {}
+    for row in cleaned.get("quantitative_reductions", []):
+        year = row.get("연도")
+        amount = row.get("예상감축량")
+        if isinstance(year, int) and isinstance(amount, (int, float)):
+            reductions_by_year[year] = reductions_by_year.get(year, 0.0) + float(amount)
+    for row in cleaned.get("reduction_targets", []):
+        target_year = row.get("목표연도")
+        target_amount = row.get("목표감축량")
+        if not isinstance(target_year, int) or not isinstance(target_amount, (int, float)):
+            continue
+        summed = reductions_by_year.get(target_year)
+        if summed is None or target_amount == 0:
+            continue
+        if _relative_gap(float(target_amount), summed) > 0.10:
+            issues.append(_issue(
+                municipality, "정보", "교차시트", f"정량감축량 합≠목표감축량({target_year})",
+                f"정량감축량 합 {round(summed, 2)} vs 목표감축량 {target_amount}",
+                "계획서 자체 불일치 또는 일부 사업 감축량 누락 여부 확인",
+            ))
+
+
+def _append_gap_fill_summary(issues: list[dict], cleaned: dict, municipality: str) -> None:
+    for sheet_key in getattr(config, "EXTRACTION_SHEETS", []):
+        rows = cleaned.get(sheet_key, [])
+        if not isinstance(rows, list):
+            continue
+        count = sum(1 for row in rows if isinstance(row, dict) and row.get("보완출처") == "gap_fill")
+        if count:
+            issues.append(_issue(
+                municipality, "정보", _sheet_area(sheet_key), "GapFill 기여",
+                f"빈칸보완 재추출 행 {count}건 반영",
+                "보완 행은 출처페이지 기준으로 원문 확인",
+            ))
+
+
+def _append_ledger_issues(
+    issues: list[dict],
+    municipality: str,
+    ledger: list | None,
+    raw_counts: dict | None,
+    routed_page_nums: dict[str, set[int]] | None,
+    cleaned: dict,
+) -> None:
+    if ledger is None and raw_counts is None and routed_page_nums is None:
+        return
+    records = list(ledger or [])
+    by_sheet: dict[str, list] = {}
+    for record in records:
+        by_sheet.setdefault(str(_record_attr(record, "sheet_key", "")), []).append(record)
+        status = _record_attr(record, "status", "")
+        if status in {"call_fail", "parse_fail"}:
+            pages = ",".join(f"p{page}" for page in _record_attr(record, "page_nums", []) or [])
+            label = "호출실패" if status == "call_fail" else "파싱실패"
+            issues.append(_issue(
+                municipality, "경고", _sheet_area(_record_attr(record, "sheet_key", "")),
+                f"원장 {label}", f"{pages or 'p?'} 배치 실패: {_record_attr(record, 'error', '')}",
+                "해당 페이지 재추출 또는 원문 수동 확인",
+            ))
+
+    for sheet_key in getattr(config, "EXTRACTION_SHEETS", []):
+        rows = cleaned.get(sheet_key, [])
+        if isinstance(rows, list) and rows:
+            continue
+        sheet_records = by_sheet.get(sheet_key, [])
+        raw_count = int((raw_counts or {}).get(sheet_key, 0) or 0)
+        routed = (routed_page_nums or {}).get(sheet_key, set())
+        if raw_count > 0:
+            cause = "정제에서 전부 제거"
+        elif any(_record_attr(record, "status", "") in {"call_fail", "parse_fail"} for record in sheet_records):
+            cause = "호출·파싱 실패"
+        elif any(_record_attr(record, "status", "") == "ok" and int(_record_attr(record, "rows", 0) or 0) == 0 for record in sheet_records):
+            cause = "추출 0행"
+        elif not routed and not sheet_records:
+            cause = "라우팅 0페이지"
+        else:
+            cause = "추출 0행"
+        issues.append(_issue(
+            municipality, "정보", _sheet_area(sheet_key), "빈 시트 원인",
+            cause,
+            "원장·라우팅 후보·정제 필터를 순서대로 확인",
+        ))
+
+def _validate_final_data(
+    cleaned: dict,
+    municipality: str,
+    *,
+    ledger: list | None = None,
+    raw_counts: dict | None = None,
+    routed_page_nums: dict[str, set[int]] | None = None,
+) -> list[dict]:
     """정제된 16시트 데이터의 완성도·정합성을 결정론적으로 점검해 리포트를 만든다."""
     issues: list[dict] = []
 
@@ -504,6 +834,11 @@ def _validate_final_data(cleaned: dict, municipality: str) -> list[dict]:
                     "재원별 누락/중복 또는 합계 오기 확인",
                 ))
 
+    _append_dedup_conflict_issues(issues, municipality)
+    _append_cross_sheet_issues(issues, cleaned, municipality)
+    _append_gap_fill_summary(issues, cleaned, municipality)
+    _append_ledger_issues(issues, municipality, ledger, raw_counts, routed_page_nums, cleaned)
+
     return issues
 
 
@@ -514,17 +849,28 @@ class OrganizerAgent:
         self._final_data: dict = {}
         self._validation_report: list[dict] = []
 
-    def organize(self, raw_data: dict, full_text_excerpt: str = "") -> dict:
+    def organize(
+        self,
+        raw_data: dict,
+        full_text_excerpt: str = "",
+        *,
+        ledger: list | None = None,
+        routed_page_nums: dict[str, set[int]] | None = None,
+    ) -> dict:
         print("[에이전트3 정리] 정제 시작...")
         municipality = raw_data.get("municipality_name", "알 수 없음")
 
+        _DEDUP_CONFLICTS.clear()
+        raw_counts: dict[str, int] = {}
         cleaned: dict = {"municipality_name": municipality}
         for sheet_key, cleaner in _CLEANERS.items():
             rows = raw_data.get(sheet_key, [])
             if not isinstance(rows, list):
                 rows = []
-            rows = [r for r in rows if isinstance(r, dict)]
-            cleaned[sheet_key] = cleaner(rows, municipality)
+            rows = [dict(r) for r in rows if isinstance(r, dict)]
+            raw_counts[sheet_key] = len(rows)
+            cleaned_rows = cleaner(rows, municipality)
+            cleaned[sheet_key] = [_normalize_row_provenance(row) for row in cleaned_rows]
 
         # 이미지 에이전트의 판독 관찰값을 16_시각자료목록 시트로 보존한다.
         # (이전에는 organize()가 시트 키만 복사해 chart_observations가 통째로 유실됐다.)
@@ -535,7 +881,13 @@ class OrganizerAgent:
         cleaned["visual_inventory"] = _build_visual_inventory(observations, municipality)
 
         # 결정론적 검증·정합성 점검(감축률 재계산은 reduction_targets를 인플레이스 교정).
-        self._validation_report = _validate_final_data(cleaned, municipality)
+        self._validation_report = _validate_final_data(
+            cleaned,
+            municipality,
+            ledger=ledger,
+            raw_counts=raw_counts,
+            routed_page_nums=routed_page_nums,
+        )
         cleaned["validation_report"] = self._validation_report
 
         counts = {k: len(v) for k, v in cleaned.items() if isinstance(v, list) and v}

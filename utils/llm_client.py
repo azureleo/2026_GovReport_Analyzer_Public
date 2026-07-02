@@ -24,6 +24,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -56,6 +57,63 @@ _QUOTA_ERROR_MARKERS = (
     "한도",
     "할당량",
 )
+
+
+_LLM_STATS_LOCK = threading.Lock()
+_LLM_STATS = {
+    "calls": {},
+    "failures": 0,
+    "retries": 0,
+    "quota_wait_seconds": 0.0,
+    "timeouts": 0,
+}
+
+
+def reset_llm_stats() -> None:
+    """현재 실행의 LLM 호출/대기 통계를 초기화한다."""
+    with _LLM_STATS_LOCK:
+        _LLM_STATS["calls"] = {}
+        _LLM_STATS["failures"] = 0
+        _LLM_STATS["retries"] = 0
+        _LLM_STATS["quota_wait_seconds"] = 0.0
+        _LLM_STATS["timeouts"] = 0
+
+
+def get_llm_stats() -> dict[str, Any]:
+    """현재 실행의 LLM 호출/대기 통계 스냅샷을 반환한다."""
+    with _LLM_STATS_LOCK:
+        calls = dict(_LLM_STATS["calls"])
+        return {
+            "calls": calls,
+            "total_calls": sum(calls.values()),
+            "failures": int(_LLM_STATS["failures"]),
+            "retries": int(_LLM_STATS["retries"]),
+            "quota_wait_seconds": float(_LLM_STATS["quota_wait_seconds"]),
+            "timeouts": int(_LLM_STATS["timeouts"]),
+        }
+
+
+def _inc_stat(name: str, amount: int = 1) -> None:
+    with _LLM_STATS_LOCK:
+        _LLM_STATS[name] = int(_LLM_STATS[name]) + amount
+
+
+def _add_wait_seconds(seconds: float) -> None:
+    with _LLM_STATS_LOCK:
+        _LLM_STATS["quota_wait_seconds"] = float(_LLM_STATS["quota_wait_seconds"]) + seconds
+
+
+def _record_call(kind: str, provider: str, producer) -> str:
+    with _LLM_STATS_LOCK:
+        calls = dict(_LLM_STATS["calls"])
+        key = f"{kind}:{provider}"
+        calls[key] = calls.get(key, 0) + 1
+        _LLM_STATS["calls"] = calls
+    try:
+        return producer()
+    except (LLMCallError, OSError, RuntimeError, subprocess.SubprocessError):
+        _inc_stat("failures")
+        raise
 
 _JSON_ONLY_INSTRUCTION = """
 당신은 지자체 탄소중립 계획 문서에서 구조화 데이터를 추출하는 로컬 에이전트입니다.
@@ -366,6 +424,7 @@ def _parse_quota_reset_seconds(message: str) -> int | None:
 
 def _sleep_with_heartbeat(total_seconds: float, label: str) -> None:
     """대기 중 주기적으로 '아직 살아 있음'을 로깅하며 sleep."""
+    _add_wait_seconds(total_seconds)
     heartbeat = max(30, int(getattr(config, "LLM_QUOTA_WAIT_HEARTBEAT_SECONDS", 300)))
     remaining = int(total_seconds)
     while remaining > 0:
@@ -389,6 +448,7 @@ def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
             return result
         except subprocess.TimeoutExpired as exc:
             consecutive_timeouts += 1
+            _inc_stat("timeouts")
             wait_enabled = getattr(config, "LLM_QUOTA_WAIT_ENABLED", True)
             # 연속 타임아웃이 임계값 이상이면 throttling으로 보고 quota처럼 대기-재개한다.
             if wait_enabled and consecutive_timeouts >= timeout_threshold:
@@ -401,6 +461,7 @@ def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
                     )
                     raise LLMCallError(f"{label} 반복 타임아웃(throttling 추정) 상한 초과") from exc
                 quota_waited += poll
+                _inc_stat("retries")
                 attempt -= 1  # throttling 대기는 일반 재시도 예산을 소모하지 않는다.
                 logger.warning(
                     "%s 연속 %s회 타임아웃 → throttling 추정. %s 후 자동 재개(누적 대기 %s).",
@@ -413,31 +474,12 @@ def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
             else:
                 wait = min(5 * attempt, 30)
                 logger.warning("%s 타임아웃. %s초 후 재시도 (%s/%s)", label, wait, attempt, max_retries)
+                _inc_stat("retries")
                 time.sleep(wait)
         except LLMQuotaExceededError as exc:
             consecutive_timeouts = 0
-            if not getattr(config, "LLM_QUOTA_WAIT_ENABLED", True):
-                logger.error("%s quota/세션 한도 초과. 현재 결과로 진행하지 않고 중단합니다.", label)
-                raise
-            # 회복 시각을 메시지에서 파싱(없으면 폴링 간격). 리셋 직후 여유로 +30초.
-            parsed = _parse_quota_reset_seconds(str(exc))
-            poll = int(getattr(config, "LLM_QUOTA_WAIT_POLL_SECONDS", 600))
-            wait = (parsed + 30) if parsed is not None else poll
-            cap = int(getattr(config, "LLM_QUOTA_WAIT_MAX_SECONDS", 21600))
-            if quota_waited + wait > cap:
-                logger.error(
-                    "%s 할당량 회복 대기 누적 %s + 다음 대기 %s 가 상한 %s 초과. 중단합니다.",
-                    label, _fmt_duration(quota_waited), _fmt_duration(wait), _fmt_duration(cap),
-                )
-                raise
-            quota_waited += wait
-            attempt -= 1  # 할당량 대기는 일반 재시도 예산을 소모하지 않는다.
-            source = "메시지 기준" if parsed is not None else "폴링 간격"
-            logger.warning(
-                "%s 할당량 한도 도달. %s 후 자동 재개 (%s, 누적 대기 %s). 프로세스는 대기 상태로 유지됩니다.",
-                label, _fmt_duration(wait), source, _fmt_duration(quota_waited),
-            )
-            _sleep_with_heartbeat(wait, label)
+            logger.error("%s quota/세션 한도 초과. 해당 단계가 원장/상위 정책으로 처리하도록 전파합니다.", label)
+            raise
         except (LLMCallError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
             consecutive_timeouts = 0  # 비-타임아웃 오류는 연속 타임아웃 카운트를 끊는다.
             if attempt >= max_retries:
@@ -445,6 +487,7 @@ def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
                 raise LLMCallError(f"{label} 최대 재시도 초과") from exc
             wait = min(5 * attempt, 30)
             logger.warning("%s 오류: %s. %s초 후 재시도 (%s/%s)", label, exc, wait, attempt, max_retries)
+            _inc_stat("retries")
             time.sleep(wait)
 
 
@@ -466,15 +509,19 @@ def call_text(prompt: str, system: str = "", max_retries: int = config.MAX_RETRI
     if provider == "gemini":
         return cached_response(
             request,
-            lambda: _call_gemini_text(prompt, system, max_retries=max_retries),
+            lambda: _record_call("text", provider, lambda: _call_gemini_text(prompt, system, max_retries=max_retries)),
         )
 
     return cached_response(
         request,
-        lambda: _retry_local_call(
-            lambda: _call_local_agent(prompt, system, provider=provider),
+        lambda: _record_call(
+            "text",
+            provider,
+            lambda: _retry_local_call(
+                lambda: _call_local_agent(prompt, system, provider=provider),
             max_retries=max_retries,
-            label=provider,
+                label=provider,
+            ),
         ),
     )
 
@@ -498,15 +545,19 @@ def call_vision(image_b64: str, prompt: str, system: str = "", max_retries: int 
     if provider == "gemini":
         return cached_response(
             request,
-            lambda: _call_gemini_vision(image_b64, prompt, system, max_retries=max_retries),
+            lambda: _record_call("vision", provider, lambda: _call_gemini_vision(image_b64, prompt, system, max_retries=max_retries)),
         )
 
     return cached_response(
         request,
-        lambda: _retry_local_call(
-            lambda: _call_local_agent(prompt, system, image_b64=image_b64, provider=provider),
+        lambda: _record_call(
+            "vision",
+            provider,
+            lambda: _retry_local_call(
+                lambda: _call_local_agent(prompt, system, image_b64=image_b64, provider=provider),
             max_retries=max_retries,
-            label=f"{provider} vision",
+                label=f"{provider} vision",
+            ),
         ),
     )
 
@@ -539,15 +590,19 @@ def call_vision_batch(
     if provider == "gemini":
         return cached_response(
             request,
-            lambda: _call_gemini_vision_batch(images_b64, prompt, system, max_retries=max_retries),
+            lambda: _record_call("vision_batch", provider, lambda: _call_gemini_vision_batch(images_b64, prompt, system, max_retries=max_retries)),
         )
 
     return cached_response(
         request,
-        lambda: _retry_local_call(
-            lambda: _call_local_agent(prompt, system, images_b64=images_b64, provider=provider),
+        lambda: _record_call(
+            "vision_batch",
+            provider,
+            lambda: _retry_local_call(
+                lambda: _call_local_agent(prompt, system, images_b64=images_b64, provider=provider),
             max_retries=max_retries,
-            label=f"{provider} vision batch",
+                label=f"{provider} vision batch",
+            ),
         ),
     )
 
@@ -792,3 +847,62 @@ def parse_json(text: str) -> Any:
 
     logger.warning("JSON 파싱 실패 (응답 앞 200자): %s", text[:200])
     return {}
+
+_JSON_RETRY_SUFFIX = "\n\n[재요청] 직전 응답이 유효한 JSON이 아니었습니다. 설명·코드블록 없이 유효한 JSON만 다시 출력하세요."
+
+
+def _json_parse_ok(raw_text: str, parsed: Any) -> bool:
+    stripped = (raw_text or "").strip()
+    if not stripped:
+        return False
+    if stripped == "{}" and parsed == {}:
+        return True
+    return isinstance(parsed, dict) and parsed != {}
+
+
+def call_text_json(prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> tuple[Any, bool]:
+    """
+    call_text 후 JSON 파싱까지 수행한다.
+
+    JSON 파싱 실패가 의심되면 같은 프롬프트에 재요청 지시문을 덧붙여 1회 재호출한다.
+    반환값은 (파싱 결과, 파싱 성공 여부)다.
+    """
+    raw = call_text(prompt, system=system, max_retries=max_retries)
+    parsed = parse_json(raw)
+    if _json_parse_ok(raw, parsed):
+        return parsed, True
+    retry_raw = call_text(f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries)
+    retry_parsed = parse_json(retry_raw)
+    return retry_parsed, _json_parse_ok(retry_raw, retry_parsed)
+
+
+def call_vision_json(
+    image_b64: str,
+    prompt: str,
+    system: str = "",
+    max_retries: int = config.MAX_RETRIES,
+) -> tuple[Any, bool]:
+    """call_vision 후 JSON 파싱 실패 시 1회 재요청한다."""
+    raw = call_vision(image_b64, prompt, system=system, max_retries=max_retries)
+    parsed = parse_json(raw)
+    if _json_parse_ok(raw, parsed):
+        return parsed, True
+    retry_raw = call_vision(image_b64, f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries)
+    retry_parsed = parse_json(retry_raw)
+    return retry_parsed, _json_parse_ok(retry_raw, retry_parsed)
+
+
+def call_vision_batch_json(
+    images_b64: Sequence[str],
+    prompt: str,
+    system: str = "",
+    max_retries: int = config.MAX_RETRIES,
+) -> tuple[Any, bool]:
+    """call_vision_batch 후 JSON 파싱 실패 시 1회 재요청한다."""
+    raw = call_vision_batch(images_b64, prompt, system=system, max_retries=max_retries)
+    parsed = parse_json(raw)
+    if _json_parse_ok(raw, parsed):
+        return parsed, True
+    retry_raw = call_vision_batch(images_b64, f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries)
+    retry_parsed = parse_json(retry_raw)
+    return retry_parsed, _json_parse_ok(retry_raw, retry_parsed)

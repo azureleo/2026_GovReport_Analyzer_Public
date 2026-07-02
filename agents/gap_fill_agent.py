@@ -16,13 +16,18 @@ import logging
 
 import config
 from utils import llm_client
-from utils.parallel import parallel_map
+from utils.parallel import parallel_map_collect
 from utils.pdf_reader import PageContent
 from agents.extractor_agent import (
     _SHEET_CONFIGS,
     _score_page_for_sheet,
     _build_page_text,
     _build_semantic_batches,
+    _page_nums_from_batch_text,
+    _attach_row_context,
+    _PROVENANCE_INSTRUCTION,
+    _ROUTE_CONFIGS,
+    BatchRecord,
     EXTRACTION_SYSTEM,
 )
 
@@ -59,10 +64,73 @@ class GapFillAgent:
     def __init__(self):
         self._stats: dict[str, dict] = {}
         self._total_added = 0
+        self.ledger: list[BatchRecord] = []
 
-    def _needs_backfill(self, sheet_key: str, rows: list[dict]) -> tuple[bool, str]:
+    def _rows_for(self, sheet_key: str, cleaned: dict | list[dict]) -> list[dict]:
+        if isinstance(cleaned, list):
+            return cleaned
+        rows = cleaned.get(sheet_key, [])
+        return rows if isinstance(rows, list) else []
+
+    def _needs_backfill(self, sheet_key: str, cleaned: dict | list[dict]) -> tuple[bool, str]:
+        rows = self._rows_for(sheet_key, cleaned)
         if not rows:
             return True, "빈 시트"
+        thresholds = getattr(config, "GAP_FILL_COVERAGE_THRESHOLDS", {})
+
+        if sheet_key == "emissions_regional":
+            sectors = {r.get("부문") for r in rows if isinstance(r, dict) and r.get("부문")}
+            years = {r.get("연도") for r in rows if isinstance(r, dict) and r.get("연도")}
+            min_sectors = int(thresholds.get("emissions_regional_min_sectors", 4))
+            min_years = int(thresholds.get("emissions_regional_min_years", 2))
+            reasons = []
+            if len(sectors) < min_sectors:
+                reasons.append(f"부문 {len(sectors)}/{min_sectors}")
+            if len(years) < min_years:
+                reasons.append(f"연도 {len(years)}/{min_years}")
+            return (bool(reasons), ", ".join(reasons))
+
+        if sheet_key == "emissions_management":
+            sectors = {r.get("관리부문") for r in rows if isinstance(r, dict) and r.get("관리부문")}
+            min_sectors = int(thresholds.get("emissions_management_min_sectors", 2))
+            if len(sectors) < min_sectors:
+                return True, f"관리부문 {len(sectors)}/{min_sectors}"
+            return False, ""
+
+        if sheet_key == "emissions_forecast":
+            years = {r.get("연도") for r in rows if isinstance(r, dict) and r.get("연도")}
+            min_years = int(thresholds.get("emissions_forecast_min_years", 2))
+            if len(years) < min_years:
+                return True, f"연도 {len(years)}/{min_years}"
+            return False, ""
+
+        if sheet_key == "reduction_targets":
+            years = {r.get("목표연도") for r in rows if isinstance(r, dict) and r.get("목표연도")}
+            missing = [year for year in (2030, 2050) if year not in years]
+            if missing:
+                return True, "목표연도 누락: " + ", ".join(str(year) for year in missing)
+            return False, ""
+
+        if isinstance(cleaned, dict) and sheet_key in {"quantitative_reductions", "annual_implementation"}:
+            project_rows = cleaned.get("mitigation_projects", [])
+            project_count = len(project_rows) if isinstance(project_rows, list) else 0
+            ratio = float(thresholds.get("project_ratio", 0.3))
+            if project_count and len(rows) < project_count * ratio:
+                return True, f"사업 대비 행수 {len(rows)}/{project_count} < {ratio:.0%}"
+            return False, ""
+
+        if sheet_key == "financial_plan":
+            years = {r.get("연도") for r in rows if isinstance(r, dict) and r.get("연도")}
+            sectors = {r.get("부문") for r in rows if isinstance(r, dict) and r.get("부문")}
+            min_years = int(thresholds.get("financial_plan_min_years", 2))
+            min_sectors = int(thresholds.get("financial_plan_min_sectors", 2))
+            reasons = []
+            if len(years) < min_years:
+                reasons.append(f"연도 {len(years)}/{min_years}")
+            if len(sectors) < min_sectors:
+                reasons.append(f"부문 {len(sectors)}/{min_sectors}")
+            return (bool(reasons), ", ".join(reasons))
+
         value_fields = _VALUE_FIELDS.get(sheet_key, [])
         if not value_fields:
             return False, ""
@@ -78,6 +146,11 @@ class GapFillAgent:
             return True, f"채움률 {ratio:.0%} < {min_ratio:.0%}"
         return False, ""
 
+    def _has_strong_keyword(self, page: PageContent, sheet_key: str) -> bool:
+        cfg = _ROUTE_CONFIGS.get(sheet_key, {})
+        combined = f"{page.text or ''}\n" + "\n".join(page.tables or [])
+        return any(keyword in combined for keyword in cfg.get("strong", []))
+
     def _relevant_pages(
         self,
         pages: list[PageContent],
@@ -90,7 +163,7 @@ class GapFillAgent:
         scored = [
             (_score_page_for_sheet(page, sheet_key), page)
             for page in pages
-            if page.page_number not in exclude_nums
+            if page.page_number not in exclude_nums and self._has_strong_keyword(page, sheet_key)
         ]
         scored = [(score, page) for score, page in scored if score >= min_score]
         scored.sort(key=lambda item: (item[0], -item[1].page_number), reverse=True)
@@ -100,26 +173,29 @@ class GapFillAgent:
         cfg = _SHEET_CONFIGS.get(sheet_key)
         if not cfg:
             return []
+        page_nums = _page_nums_from_batch_text(batch_text)
         prompt = (
             f"지자체명: {municipality}\n\n"
             "아래 배치 텍스트는 1차 추출에서 값이 누락되었을 가능성이 큰 구간입니다.\n"
             f"[배치 텍스트]\n{batch_text}\n\n"
-            f"{cfg['prompt']}"
+            f"{cfg['prompt']}\n\n{_PROVENANCE_INSTRUCTION}"
         )
-        resp = llm_client.call_text(prompt, system=GAP_FILL_SYSTEM)
-        parsed = llm_client.parse_json(resp)
-        if not isinstance(parsed, dict):
+        parsed, parse_ok = llm_client.call_text_json(prompt, system=GAP_FILL_SYSTEM)
+        if not parse_ok or not isinstance(parsed, dict):
+            self.ledger.append(BatchRecord(sheet_key, page_nums, "parse_fail", 0, "JSON 파싱 실패"))
             return []
         items = parsed.get(sheet_key, [])
         if not isinstance(items, list):
+            self.ledger.append(BatchRecord(sheet_key, page_nums, "parse_fail", 0, "스키마 불일치"))
             return []
         out: list[dict] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if not item.get("지자체명"):
-                item["지자체명"] = municipality
-            out.append(item)
+            row = _attach_row_context(item, municipality, page_nums)
+            row["보완출처"] = "gap_fill"
+            out.append(row)
+        self.ledger.append(BatchRecord(sheet_key, page_nums, "ok", len(out)))
         return out
 
     def enhance(
@@ -128,6 +204,7 @@ class GapFillAgent:
         cleaned: dict,
         pages: list[PageContent],
         batch_size: int | None = None,
+        extracted_page_nums: dict[str, set[int]] | None = None,
         routed_page_nums: dict[str, set[int]] | None = None,
     ) -> dict:
         """
@@ -135,9 +212,8 @@ class GapFillAgent:
             raw_data: 1차 추출(+이미지 병합) 원시 결과. 보완 행이 여기에 append 된다.
             cleaned: organize() 1차 결과(시트별 정제 데이터). 채움률 판단 기준.
             pages: 문서 전체 페이지.
-            routed_page_nums: 1차 추출이 시트별로 이미 LLM에 보낸 페이지번호.
-                GAP_FILL_SKIP_ALREADY_ROUTED=True이면 이 페이지들을 재추출 후보에서
-                제외해(=라우팅이 놓친 새 페이지만 보완) 중복 토큰을 없앤다.
+            extracted_page_nums: 1차 추출 원장에서 status==ok인 성공 페이지번호.
+                GAP_FILL_SKIP_ALREADY_ROUTED=True이면 이 페이지만 재추출 후보에서 제외한다.
 
         Returns:
             보완 행이 추가된 raw_data(추가가 전혀 없으면 원본 raw_data 그대로).
@@ -151,24 +227,23 @@ class GapFillAgent:
         min_score = getattr(config, "GAP_FILL_REEXTRACT_MIN_SCORE", 2)
         max_pages = getattr(config, "GAP_FILL_REEXTRACT_MAX_PAGES", 24)
         skip_routed = getattr(config, "GAP_FILL_SKIP_ALREADY_ROUTED", True)
-        routed_page_nums = routed_page_nums or {}
+        extracted_page_nums = extracted_page_nums or routed_page_nums or {}
         self._total_added = 0
+        self.ledger = []
 
         # 보완 대상 시트별로 재추출 배치를 모두 모은 뒤 동시에 호출한다(배치 간 독립).
-        sheet_batches: list[tuple[str, list, str, int]] = []  # (sheet_key, batch, reason, relevant_n)
+        sheet_batches: list[dict] = []
         print("[에이전트3b 빈칸보완] 채움률 점검 및 보완 재추출 시작...")
         for sheet_key in _GAP_FILL_SHEETS:
-            rows = cleaned.get(sheet_key, [])
-            if not isinstance(rows, list):
-                rows = []
-            needs, reason = self._needs_backfill(sheet_key, rows)
+            rows = self._rows_for(sheet_key, cleaned)
+            needs, reason = self._needs_backfill(sheet_key, cleaned)
             self._stats[sheet_key] = {
                 "before": len(rows), "needs": needs, "reason": reason, "added": 0,
             }
             if not needs:
                 continue
 
-            exclude_nums = routed_page_nums.get(sheet_key, set()) if skip_routed else set()
+            exclude_nums = extracted_page_nums.get(sheet_key, set()) if skip_routed else set()
             relevant = self._relevant_pages(
                 pages, sheet_key, min_score, max_pages, exclude_nums=exclude_nums
             )
@@ -182,19 +257,36 @@ class GapFillAgent:
             # 점수순으로 뽑힌 페이지를 페이지번호 순으로 정렬한 뒤 의미 단위 배치로 묶는다.
             ordered = sorted(relevant, key=lambda p: p.page_number)
             for batch in _build_semantic_batches(ordered, batch_size):
-                sheet_batches.append((sheet_key, batch, reason, len(relevant)))
+                page_nums = [page.page_number for page in batch]
+                sheet_batches.append({
+                    "sheet_key": sheet_key,
+                    "batch": batch,
+                    "reason": reason,
+                    "relevant_n": len(relevant),
+                    "page_nums": page_nums,
+                })
 
-        results = parallel_map(
-            lambda sb: self._reextract(sb[0], _build_page_text(sb[1]), municipality),
+        results = parallel_map_collect(
+            lambda sb: self._reextract(sb["sheet_key"], _build_page_text(sb["batch"]), municipality),
             sheet_batches,
             workers=getattr(config, "TEXT_WORKERS", 4),
         )
 
         added_by_sheet: dict[str, list[dict]] = {}
         info_by_sheet: dict[str, tuple[str, int]] = {}
-        for (sheet_key, _batch, reason, relevant_n), added_rows in zip(sheet_batches, results):
-            added_by_sheet.setdefault(sheet_key, []).extend(added_rows)
-            info_by_sheet[sheet_key] = (reason, relevant_n)
+        failed_batches = 0
+        for task, (added_rows, err) in zip(sheet_batches, results):
+            sheet_key = task["sheet_key"]
+            if err is not None:
+                failed_batches += 1
+                self.ledger.append(BatchRecord(
+                    sheet_key, list(task["page_nums"]), "call_fail", 0,
+                    f"{type(err).__name__}: {str(err)[:200]}",
+                ))
+                print(f"  [{sheet_key}] 보완 배치 호출 실패({type(err).__name__}) — 원장 기록")
+                continue
+            added_by_sheet.setdefault(sheet_key, []).extend(added_rows or [])
+            info_by_sheet[sheet_key] = (task["reason"], task["relevant_n"])
 
         for sheet_key, added_rows in added_by_sheet.items():
             if not added_rows:
@@ -208,6 +300,8 @@ class GapFillAgent:
                 f"보완 후보 {len(added_rows)}건"
             )
 
+        if failed_batches:
+            print(f"[에이전트3b 빈칸보완] 호출 실패 배치 {failed_batches}건 원장 기록")
         print(f"[에이전트3b 빈칸보완] 완료. 보완 후보 총 {self._total_added}건 추가")
         return updated if self._total_added > 0 else raw_data
 
