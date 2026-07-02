@@ -57,6 +57,29 @@ class LLMJsonRetryStatsTests(unittest.TestCase):
         )
         return f"{sys.executable} {fake}"
 
+    def _fixed_json_command(self, tmpdir: Path, response: str) -> str:
+        fake = tmpdir / "fake_fixed_json.py"
+        count_path = tmpdir / "count.txt"
+        fake.write_text(
+            textwrap.dedent(
+                f"""
+                import sys
+                from pathlib import Path
+
+                args = sys.argv[1:]
+                sys.stdin.read()
+                output_path = args[args.index('--output-last-message') + 1]
+                count_path = Path({str(count_path)!r})
+                current = int(count_path.read_text(encoding='utf-8')) if count_path.exists() else 0
+                count_path.write_text(str(current + 1), encoding='utf-8')
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write({response!r})
+                """
+            ),
+            encoding="utf-8",
+        )
+        return f"{sys.executable} {fake}"
+
     def test_call_text_json_retries_once_after_parse_failure(self):
         # Given: 첫 응답은 JSON이 아니고 재요청 때만 JSON을 주는 로컬 에이전트
         with tempfile.TemporaryDirectory() as tmp:
@@ -72,6 +95,38 @@ class LLMJsonRetryStatsTests(unittest.TestCase):
         self.assertEqual(parsed, {"ok": True})
         self.assertEqual(count, "2")
         self.assertEqual(llm_client.get_llm_stats()["total_calls"], 2)
+
+    def test_call_text_json_accepts_fenced_empty_object_without_retry(self):
+        # Given: 코드펜스에 감싼 빈 객체 응답을 내는 로컬 에이전트
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            llm_client.config.CODEX_COMMAND = self._fixed_json_command(tmpdir, "```json\n{}\n```")
+
+            # When: JSON 호출 헬퍼를 사용하면
+            parsed, ok = llm_client.call_text_json('{"ok": true}', max_retries=1)
+            count = (tmpdir / "count.txt").read_text(encoding="utf-8")
+
+        # Then: 의도적 빈 객체로 보고 재요청하지 않는다.
+        self.assertTrue(ok)
+        self.assertEqual(parsed, {})
+        self.assertEqual(count, "1")
+        self.assertEqual(llm_client.get_llm_stats()["total_calls"], 1)
+
+    def test_call_text_json_accepts_top_level_array_without_retry(self):
+        # Given: 최상위 배열 응답을 내는 로컬 에이전트
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            llm_client.config.CODEX_COMMAND = self._fixed_json_command(tmpdir, '[{"a": 1}]')
+
+            # When: JSON 호출 헬퍼를 사용하면
+            parsed, ok = llm_client.call_text_json('{"ok": true}', max_retries=1)
+            count = (tmpdir / "count.txt").read_text(encoding="utf-8")
+
+        # Then: 유효한 JSON 배열로 보고 재요청하지 않는다.
+        self.assertTrue(ok)
+        self.assertEqual(parsed, [{"a": 1}])
+        self.assertEqual(count, "1")
+        self.assertEqual(llm_client.get_llm_stats()["total_calls"], 1)
 
 
 if __name__ == "__main__":

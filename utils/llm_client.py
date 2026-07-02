@@ -873,9 +873,14 @@ def _json_parse_ok(raw_text: str, parsed: Any) -> bool:
     stripped = (raw_text or "").strip()
     if not stripped:
         return False
-    if stripped == "{}" and parsed == {}:
+    if isinstance(parsed, (dict, list)) and parsed:
         return True
-    return isinstance(parsed, dict) and parsed != {}
+    body = _strip_code_block(stripped)
+    if parsed == {} and body == "{}":
+        return True
+    if parsed == [] and body == "[]":
+        return True
+    return False
 
 
 def call_text_json(prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> tuple[Any, bool]:
