@@ -1,516 +1,371 @@
 # 가이드라인 기반 지자체 탄소중립 계획 정보 추출 시스템
 
-환경부 「지자체 탄소중립 녹색성장 기본계획 수립 및 추진상황 점검 가이드라인」(`carbon_guideline.md`) 기반으로 지자체 보고서에서 **16개 표준 시트**의 구조화 데이터를 추출해 Excel 파일로 정리하는 Python 프로젝트입니다.
+환경부 「지자체 탄소중립 녹색성장 기본계획 수립 및 추진상황 점검 가이드라인」(`carbon_guideline.md`)을 기준으로 지자체 탄소중립 계획서에서 구조화 데이터를 추출해 Excel로 정리하는 파이프라인입니다.
 
-PDF를 주 입력으로 지원하며, HWP/HWPX 문서는 `kordoc`를 통해 텍스트와 표를 읽어 파이프라인에 연결합니다.
+이 프로젝트의 핵심 목표는 단순히 많이 뽑는 것이 아니라, **조용한 데이터 유실을 막고 사람이 검증할 수 있는 근거를 남기는 것**입니다. v4/v4.1은 이 목표를 위해 부분 실패 허용, 배치 원장, 검증리포트, 출처페이지, quota 복구를 중심으로 안정성을 강화했습니다.
 
-## v2 (2026-06-29): 추출 정확도·완결성·실행 안정성
+## 현재 구현 요약
 
-"빠짐없이·정확하게 추출하고, 이미지까지 놓치지 않으며, 결과를 정형화해 Excel에 담는다"를 목표로 파이프라인 전반을 보강했습니다.
+- 입력: PDF, HWP, HWPX
+- 출력: `00_문서메타`부터 `16_시각자료목록`까지 17개 기본 시트
+- 선택 출력: `17_보조검수후보`, `18_보조병합로그`, `19_검증리포트`
+- 기본 LLM 백엔드: Gemini API
+- 선택 백엔드: OpenAI API, Codex CLI, Claude Code CLI
+- 기본 정책: 정확도와 검증 가능성을 우선하고, 위험한 최적화는 opt-in으로만 사용
 
-**추출 누락 방지 (recall)**
-- **의미 단위 배치**: 페이지를 연속 구간으로 묶고, 여러 페이지에 걸친 표가 배치 경계에서 잘리지 않게 보호
-- **라우팅 이중 게이트 제거**: 라우팅이 고른 페이지를 키워드로 또 거르던 필터 제거 → 표만 있고 본문 키워드가 약한 페이지도 추출
-- **표 파싱 강건화**: `lines_strict → lines → text` 폴백 (서울 표본 기준 표 추출 34 → 79개)
-- **빈칸 보완 연결**: 비었거나 채움률이 낮은 시트를 자동으로 재추출 (`GAP_FILL_ENABLED`)
-- **지자체명 fallback**: LLM 추출 실패 시 정규식으로 행정구역명 보정
+## v4/v4.1에서 달라진 핵심
 
-**이미지 매칭**
-- **벡터 차트 누락 방지**: 임베드 이미지로 안 잡히는 벡터 차트 페이지를 렌더링 대상으로 승격
-- **종류별 분기**: 이미지 차트 값을 현황/전망/목표에 따라 올바른 시트로 라우팅, 금액 단위 행의 배출 시트 오분류 차단
-- **판독 결과 보존**: 이미지·표 판독값을 `16_시각자료목록`에 빠짐없이 기록 (이전 버전은 유실)
+### 1. 실패를 숨기지 않는 추출 원장
 
-**정형화·검증**
-- **단위 표기 통일**: `천 톤CO2eq.` · `천톤CO₂eq` 등 → `천톤CO2eq`로 정규화
-- **검증 리포트(`19_검증리포트`)**: 감축률 산식 재계산, 부문/목표연도 누락, 단위 스케일 혼재, 재정 합계≠부분합을 결정론적으로 점검
-- **빈 보조 시트 생략**: `17`/`18`/`19`는 데이터가 있을 때만 생성
+각 LLM 배치의 결과를 원장으로 남깁니다.
 
-**실행 안정성**
-- **한도 대기-재개**: 세션/사용량 한도에 막히면 죽지 않고, 회복 시각까지 대기 후 그 자리에서 자동 재개 (`LLM_QUOTA_WAIT_*`)
-- **타임아웃 = throttling 대응**: codex가 한도 근처에서 hang(타임아웃)으로 나타나면 연속 N회부터 대기-재개로 전환 (`LLM_TIMEOUT_AS_QUOTA_THRESHOLD`)
-- 디스크 캐시로 재실행 시 완료된 구간은 건너뜀
+- `ok`: 추출 성공
+- `call_fail`: 호출 실패
+- `parse_fail`: JSON 파싱 실패
 
-<details>
-<summary><b>이전 업데이트 기록</b> (하이브리드 검수 · 토큰 최적화 · 16시트 전환)</summary>
+실패한 배치가 있어도 이미 성공한 배치 결과는 버리지 않습니다. 실패 정보는 `19_검증리포트`에 `원장 호출실패` 또는 `원장 파싱실패`로 남아 사람이 어느 시트·어느 페이지를 다시 확인해야 하는지 알 수 있습니다.
 
-## 2026-06-28 업데이트: 하이브리드 검수·실행 안정화
+### 2. quota/세션 한도 복구
 
-동료의 개선 코드 분석 이후, 기본 파이프라인은 유지하되 **재현성, 검수 신뢰도, 모델 비교 가능성**을 높이는 방향으로 보완했습니다.
+v4.1 기준 quota 동작은 다음 원칙을 따릅니다.
 
-- **OpenAI 백엔드 정식 연결**: `--agent openai --agent-model gpt-5.4-mini` 실행 경로를 추가해 GPT 계열 모델을 기본 추출 엔진으로 비교할 수 있게 했습니다. OpenAI 호출도 JSON 모드, 재시도, 캐시 체계에 포함됩니다.
-- **GPT 기본본 + 보조 모델 검수 구조**: 기본 추출본은 GPT/OpenAI 등 한 모델이 만들고, `--hybrid-review` 사용 시 Gemini Flash가 고위험 시트의 누락·충돌 후보를 별도 탐색합니다. 후보는 `17_보조검수후보` 시트에 기록됩니다.
-- **후보 전체 판정과 모델 교체 지원**: `HYBRID_ADJUDICATION_MAX_CANDIDATES=0`이면 보조검수 후보 전체를 판정합니다. 판정 모델은 `HYBRID_ADJUDICATION_PROVIDER`와 `HYBRID_ADJUDICATION_MODEL`로 바꿀 수 있어 `gemini-2.5-pro`와 `gpt-5.4`를 같은 후보에 대해 비교할 수 있습니다.
-- **판정 등급 세분화**: 후보 판정값을 `accept`, `fix_then_merge`, `reject`, `needs_human`으로 나눴습니다. `accept`는 그대로 병합 가능, `fix_then_merge`는 부문명·단위·직간접구분 같은 정규화 후 병합 가능한 후보를 뜻합니다.
-- **보수적 자동 병합**: 기본값에서는 후보를 본문 시트에 자동 반영하지 않고 `18_보조병합로그`에 근거와 차단 사유만 남깁니다. `--hybrid-auto-merge`를 켠 경우에만 `accept` 또는 `fix_then_merge`이면서 `high` 신뢰도, 원문 근거, 중복·참고자료 차단 조건을 통과한 후보를 본문 시트에 반영합니다.
-- **표 번호 기반 근거페이지 보정**: 후보 사유에 `표 2-31` 같은 표 번호가 있을 때 목차 페이지(`p4`, `p6` 등)가 근거로 들어가는 문제를 줄이기 위해, PDF 전체에서 실제 표 본문 페이지를 다시 찾아 판정 문맥으로 사용합니다.
-- **LLM 캐시와 단계별 소요시간 로그 정리**: 반복 테스트에서는 `.cache/llm_responses`의 캐시를 재사용해 시간과 비용을 줄입니다. 파이프라인 종료 시 텍스트 추출, 이미지 분석, 보조검수, 후보판정 등 단계별 소요 시간과 캐시 hit/miss를 출력합니다.
-- **Gemini 일시 오류 내성 강화**: Gemini 503/서버 과부하 오류는 quota 오류와 분리해 재시도하며, 설정에 따라 해당 호출만 빈 JSON으로 처리하고 파이프라인을 계속 진행할 수 있게 했습니다.
+1. 짧게 기다려 회복을 시도한다.
+2. 정해진 상한을 넘으면 해당 배치만 실패로 격리한다.
+3. 이미 성공한 배치 결과는 보존한다.
+4. 가능한 경우 파이프라인은 부분 데이터로 끝까지 완주한다.
 
-권장 비교 실행 예시는 다음과 같습니다.
+즉, quota가 발생했다고 전체 실행 결과가 통째로 사라지지 않습니다. 다만 quota가 실제로 발생한 경우에는 회복 대기 때문에 실행 시간이 길어질 수 있습니다.
 
-```powershell
-# GPT-Mini 기본 추출 + Gemini Flash 후보탐색 + GPT-5.4 후보판정
-py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model gpt-5.4-mini --hybrid-review
-```
+### 3. 부분 실패 허용 병렬 실행
 
-```env
-HYBRID_REVIEW_ENABLED=1
-HYBRID_REVIEW_PROVIDER=gemini
-HYBRID_REVIEW_MODEL=gemini-2.5-flash
-HYBRID_ADJUDICATION_PROVIDER=openai
-HYBRID_ADJUDICATION_MODEL=gpt-5.4
-HYBRID_ADJUDICATION_MAX_CANDIDATES=0
-HYBRID_AUTO_MERGE_ENABLED=0
-LLM_CACHE_ENABLED=1
-```
+`parallel_map_collect`는 독립적인 LLM 배치를 병렬로 실행하되, 항목별 성공/실패를 `(결과, 예외)` 형태로 수집합니다.
 
-## 2026년 6월 업데이트: Claude Code 모드 토큰 최적화
+- 일반 실패는 해당 배치 원장에 기록하고 나머지 배치는 계속 처리
+- quota는 이후 미완료 배치를 실패로 채우고, 이미 완료된 결과는 보존
+- 입력 순서가 유지되어 출력 결정성이 흔들리지 않음
 
-`--agent claude` 실행 시 세션/사용량 한도 초과를 완화하기 위해, **추출 품질은 그대로 유지**하면서 호출당 오버헤드와 라우팅 중복만 줄였습니다. 모든 변경은 LLM 토큰을 쓰지 않는 검증기로 품질 비회귀를 증명했습니다.
+### 4. JSON 재시도와 성공 판정 보정
 
-- **기본 백엔드 설명 정리 및 실행 로그 강화**: 실제 기본값은 Gemini API입니다. `main.py`, `config.py`, README의 설명을 이에 맞췄고, 실행 시작 시 백엔드·모델·이미지 상한·캐시·라우팅 설정을 출력합니다. 파이프라인 종료 시 단계별 소요 시간과 LLM 캐시 hit/miss도 함께 보여줍니다.
-- **OpenAI API 백엔드 추가**: Gemini Flash 계열 대안 테스트를 위해 `--agent openai` / `LLM_PROVIDER=openai` 실행 경로를 추가했습니다. 기본 OpenAI 모델은 `gpt-5.4-mini`이며, 텍스트·이미지·이미지 배치 호출 모두 Responses API JSON 모드로 동작합니다.
-- **GPT 기본본 + Gemini 2단계 보조 검수 구조 추가**: `--hybrid-review`를 켜면 GPT/OpenAI 기본본을 유지한 채 Gemini Flash가 고위험 시트의 누락·충돌 후보를 찾고, Gemini Pro가 후보별 원문 근거를 다시 판정합니다. 결과는 `17_보조검수후보`, `18_보조병합로그`에 남기며, 자동 병합은 기본 비활성입니다.
-- **Gemini 503 내성 강화**: Gemini 서버 과부하/일시 장애는 quota 오류와 분리해 처리합니다. `GEMINI_MAX_RETRIES`만큼 지수 백오프로 재시도하고, 계속 실패하면 해당 호출만 빈 JSON으로 처리해 전체 파이프라인 중단을 막습니다. `GEMINI_FAIL_SOFT_ON_TRANSIENT=0`으로 기존처럼 중단시킬 수 있습니다.
-- **문서메타 라우팅 상한은 기본 비활성**: 테스트와 비교 재현성을 위해 `document_meta`도 기본적으로 전체 후보 범위를 유지합니다. 속도 최적화가 필요할 때만 `DOCUMENT_ROUTE_MAX_PAGES_DOCUMENT_META` 환경변수로 별도 상한을 줄 수 있습니다.
-- **세션 오버헤드 제거** (`utils/llm_client.py`): 로컬 에이전트를 중립 임시 디렉터리에서 실행해 프로젝트 `CLAUDE.md`/`AGENTS.md` 자동 로드를 막고, Claude Code 호출 시 MCP 서버·스킬·설정/훅·동적 시스템 프롬프트 섹션을 비활성화합니다(텍스트 호출은 도구 없음, 이미지 호출은 Read만 허용). 추출 입력·출력은 동일하며 `CLAUDE_MINIMAL_SESSION=0`으로 끌 수 있습니다.
-- **라우팅 샤프닝** (`agents/extractor_agent.py`): 문서 전반에 편재해 변별력이 없는 weak 키워드(예: 머리말의 `탄소중립`·`녹색성장`)의 점수 가산을 제외해, 거의 전 문서가 모든 시트에 배정되던 중복을 줄입니다. strong 신호는 보존하므로 실제 데이터 페이지는 그대로 선택됩니다(서울 기준 텍스트 호출 297→273). `ROUTE_UBIQUITY_RATIO=0.5`가 무회귀 최대치입니다.
-- **라우팅 커버리지 검증기** (`scripts/verify_routing_coverage.py`): 정답지 값을 원문 페이지에 매핑해 시트별 리콜이 베이스라인 이상인지 LLM 없이 증명합니다. 라우팅을 더 공격적으로 조이기 전에는 반드시 이 게이트를 통과해야 합니다.
+LLM 응답이 JSON으로 파싱되지 않으면 같은 프롬프트에 재요청 문구를 붙여 1회만 다시 호출합니다.
 
-```powershell
-# 라우팅 변경이 정답 리콜을 떨어뜨리지 않는지 토큰 0으로 검증
-py scripts/verify_routing_coverage.py "서울특별시_탄소중립계획_정리.xlsx" "서울특별시_탄소중립계획.pdf"
-```
+v4.1에서는 불필요한 재호출을 줄이기 위해 다음 응답도 정상 JSON으로 인정합니다.
 
-> 참고: 페이지가 여러 시트의 정당한 strong 신호에 걸리는 **구조적 중복**은 라우팅만으로 품질 무손실로 제거하기 어렵습니다. 한도 초과의 실질적 해결은 위 세션 오버헤드 제거이며, 더 큰 절감이 필요하면 배치당 다중 시트 통합 추출을 검증기로 보증하며 도입할 수 있습니다.
+- 최상위 JSON 배열: `[ { ... } ]`
+- 코드펜스에 감싼 의도적 빈 객체: 예를 들어 `json` 코드블록 안의 `{}`
+- 의도적 빈 배열: `[]`
 
-## 2026년 6월 업데이트: 가이드라인 기반 16시트 구조 전환
+### 5. 출처페이지와 검증리포트
 
-전체 파이프라인을 `carbon_guideline.md` 기반으로 재설계했습니다.
+데이터 행에는 가능한 경우 `출처페이지`를 붙입니다. 정제 단계에서는 아래 항목을 결정론적으로 점검해 `19_검증리포트`에 남깁니다.
 
-- **16개 표준 시트**: 가이드라인 §5.2절에 정의된 문서메타, 계획개요, 지역여건, 배출현황(지역/관리권한), 배출전망, 감축목표, 비전전략, 감축사업목록, 연차별이행계획, 정량감축량, 재정투자계획, 대응기반강화, 이행관리환류, 점검실적, 변경과제 + 시각자료목록
-- **가이드라인 마크다운 직접 로드**: HWP 파싱 없이 `carbon_guideline.md`에서 시트별 보조 지침을 바로 생성
-- **기본 LLM 백엔드**: Gemini API (`GEMINI_API_KEY` 필요)
-- **OpenAI API 지원**: `--agent openai --agent-model gpt-5.4-mini`로 GPT 계열 모델 테스트 가능
-- **로컬 에이전트 지원**: `--agent codex` 또는 `--agent claude`로 로컬 CLI 사용 가능
-- **이미지 분석**: 기본 포함. 그래프·표 이미지에서 수치를 추출해 해당 시트에 병합
+- 배치 호출/파싱 실패
+- 빈 시트 원인
+- 감축률 산식 불일치
+- 부문/목표연도 누락 가능성
+- 단위 스케일 혼재
+- 기준배출량과 배출현황 불일치
+- 재정 합계와 부분합 불일치
+- 중복 키의 값 충돌
 
-</details>
+### 6. GapFill 보완
 
-## 주요 기능
+1차 추출 후 비어 있거나 커버리지가 낮은 핵심 시트를 다시 점검합니다. 단순히 “라우팅된 페이지”가 아니라 **성공적으로 추출된 페이지**를 기준으로 보완 대상을 정하므로, 호출 실패나 파싱 실패로 유실된 페이지도 다시 후보가 될 수 있습니다.
 
-- PDF, HWP, HWPX 입력 지원
-- `carbon_guideline.md` 기반 16개 표준 시트 자동 추출
-- 문서 구조 라우팅으로 시트별 관련 페이지 선별 (16개 카테고리)
-- Gemini API / OpenAI API / Codex CLI / Claude Code CLI 선택 가능
-- ChartQA-style 이미지 triage + DePlot-inspired chart-to-table 변환
-- 부문명 정규화, 중복 제거, 달성여부/사업유형 코드 정규화
-- 기본 17개 시트 Excel 자동 생성, `--hybrid-review` 사용 시 보조 검수 후보·병합 로그 시트 추가
+### 7. Organizer는 결정론적 정제만 수행
+
+`OrganizerAgent`는 LLM을 호출하지 않습니다. 정제·중복 제거·검증은 Python 규칙으로 처리합니다. 이 설계는 재현성과 디버깅 가능성을 위해 유지합니다.
+
+## 무거운 기능은 기본으로 켜지지 않습니다
+
+아래 기능은 품질 회귀 가능성이 있어 기본값이 꺼져 있습니다.
+
+| 설정 | 기본값 | 의미 |
+|---|---:|---|
+| `EXTRACTION_SHEET_CLUSTERING` | `False` | 여러 시트를 한 번에 추출해 호출 수를 줄이는 opt-in 최적화 |
+| `ROUTE_DROP_UBIQUITOUS_STRONG` | `False` | 문서 전반에 반복되는 strong 키워드까지 라우팅 점수에서 제외하는 실험적 최적화 |
+| `HYBRID_REVIEW_ENABLED` | `False` | 기본 추출 후 보조 모델로 누락/충돌 후보를 검수하는 선택 기능 |
+
+테스트 파일이 늘어난 것은 런타임을 무겁게 만들기 위해서가 아니라, 위 안정성 계약을 깨지 못하게 막기 위한 회귀 테스트입니다. 일반 실행 시 `tests/`는 실행되지 않습니다.
 
 ## 처리 흐름
 
 ```mermaid
 flowchart TD
-    A["입력 문서<br/>PDF / HWP / HWPX"] --> B["문서 파싱<br/>PyMuPDF / kordoc"]
-    B --> C["가이드라인 로드<br/>carbon_guideline.md"]
-    C --> D["문서 구조 라우팅<br/>16개 시트별 후보 페이지 선별"]
-    D --> E["텍스트·표 추출<br/>LLM 기반 JSON 추출"]
-    B --> F["이미지 후보 추출<br/>PDF 렌더링 이미지"]
-    F --> G["ChartQA-style triage"]
-    G --> H["DePlot-inspired<br/>chart-to-table 변환"]
-    E --> I["정리·정제<br/>Python deterministic logic"]
+    A[입력 문서\nPDF / HWP / HWPX] --> B[문서 파싱\nPyMuPDF / kordoc]
+    B --> C[가이드라인 로드\ncarbon_guideline.md]
+    C --> D[시트별 페이지 라우팅]
+    D --> E[텍스트·표 LLM 추출]
+    E --> F[배치 원장 기록]
+    B --> G[이미지 후보 추출]
+    G --> H[이미지 triage / Vision 분석]
+    F --> I[정리·정제\nOrganizerAgent]
     H --> I
-    I --> L["Gemini Flash 후보탐색<br/>고위험 시트 제한 검수"]
-    L --> M["Gemini Pro 후보판정<br/>근거 확인 + 병합 로그"]
-    M --> J["Excel 작성<br/>17개 시트 + 선택 보조검수"]
-    J --> K["품질 검수<br/>점수 계산 + LLM 리뷰"]
+    I --> J[검증리포트 생성]
+    J --> K[GapFill 보완]
+    K --> L[선택: Hybrid Review]
+    L --> M[Excel 작성]
 ```
 
-## 프로젝트 구조
+## 출력 Excel 시트
 
-```text
-졸업프로젝트/
-├─ main.py                    # CLI 진입점
-├─ config.py                  # 모델, 배치, 라우팅, 이미지 분석 설정
-├─ requirements.txt           # Python 의존성
-├─ package.json               # kordoc(Node.js) 의존성
-├─ install.bat                # Windows 설치 보조 스크립트
-├─ agents/
-│  ├─ guideline_agent.py      # 환경부 가이드라인/스키마 관리
-│  ├─ extractor_agent.py      # 텍스트·표 추출
-│  ├─ image_agent.py          # 이미지 triage 및 그래프 표 변환
-│  ├─ organizer_agent.py      # 정제·정규화·이상치 처리
-│  ├─ hybrid_review_agent.py  # 보조 모델 기반 누락/충돌 후보 검수
-│  ├─ excel_agent.py          # Excel 작성 에이전트
-│  └─ supervisor.py           # 전체 파이프라인 조율
-├─ utils/
-│  ├─ llm_client.py           # Gemini/OpenAI API, Codex/Claude Code 호출, JSON 파싱, 재시도
-│  ├─ llm_cache.py            # 프롬프트 해시 기반 LLM 응답 캐시(중단 시 재실행 이어받기)
-│  ├─ pdf_reader.py           # PDF 파싱
-│  ├─ hwp_reader.py           # HWP/HWPX 파싱(kordoc)
-│  └─ excel_writer.py         # openpyxl 기반 Excel 생성
-└─ scripts/
-   └─ verify_routing_coverage.py  # 라우팅 커버리지 검증기(LLM 토큰 0)
-```
+### 기본 시트
+
+| 시트 | 내용 |
+|---|---|
+| `00_문서메타` | 계획명, 지자체, 발간기관, 계획기간, 기준/목표연도 |
+| `01_계획개요` | 수립 배경, 법적 근거, 추진체계, 추진경과 |
+| `02_지역여건` | 자연·인문·경제·에너지 지표 |
+| `03_배출현황_지역` | 지역 기준 온실가스 배출·흡수 현황 |
+| `04_배출현황_관리권한` | 지자체 관리권한 인벤토리 |
+| `05_배출전망` | BAU 및 시나리오별 배출 전망 |
+| `06_감축목표` | 총괄·부문별 감축목표, 감축률 |
+| `07_비전전략` | 비전문구, 추진전략, 세부전략 |
+| `08_감축사업목록` | 감축사업, 관리번호, 성과지표 |
+| `09_연차별이행계획` | 사업별 연도별 계획과 목표물량 |
+| `10_정량감축량` | 활동량, 감축원단위, 예상감축량 |
+| `11_재정투자계획` | 부문·사업·재원·연도별 예산 |
+| `12_대응기반강화` | 적응, 교육, 녹색성장 등 대응 기반 과제 |
+| `13_이행관리환류` | 점검체계, 담당조직, 절차, 산출물 |
+| `14_점검실적` | 연도별 이행실적, 달성여부, 사업유형 |
+| `15_변경과제_조치` | 변경사업, 미달성 사유, 조치계획 |
+| `16_시각자료목록` | 이미지·그래프 판독 결과와 디지타이징 필요 여부 |
+
+### 선택 시트
+
+| 시트 | 생성 조건 | 내용 |
+|---|---|---|
+| `17_보조검수후보` | `--hybrid-review` | 보조 모델이 찾은 누락 후보, 값 충돌, 오염 의심 항목 |
+| `18_보조병합로그` | `--hybrid-review` | 후보 판정, 원문 근거, 병합 여부와 차단 사유 |
+| `19_검증리포트` | 검증 이슈 존재 | 원장 실패, 정합성 경고, 빈 시트 원인 등 |
 
 ## 설치
-
-### 1. Python 패키지
 
 Python 3.10 이상을 권장합니다.
 
 ```powershell
 py -m pip install -r requirements.txt
-```
-
-`py -m ...` 실행 시 `No installed Python found!`가 나오면 Python 런타임이 설치되어 있지 않거나 Windows Python Launcher가 실제 Python을 찾지 못하는 상태입니다. 이 경우 [python.org](https://www.python.org/downloads/windows/)에서 Python 3.11 이상을 설치하고, 설치 화면에서 `Add python.exe to PATH`를 체크한 뒤 새 PowerShell을 열어 아래 명령으로 확인합니다.
-
-```powershell
-py -0p
-py --version
-```
-
-또는 Windows에서:
-
-```powershell
-.\install.bat
-```
-
-### 2. HWP/HWPX 지원용 Node 패키지
-
-PDF만 사용할 경우 필수는 아니지만, HWP/HWPX 입력 또는 가이드라인 HWP를 쓰려면 Node.js 18 이상과 `kordoc`가 필요합니다.
-
-```powershell
 npm install
 ```
 
-프로젝트는 가능한 경우 전역 `npx`보다 로컬 `node_modules/.bin/kordoc.cmd`를 우선 사용합니다.
+PDF만 처리한다면 Node.js는 필수가 아닙니다. HWP/HWPX 입력이나 kordoc 기반 파싱을 사용하려면 Node.js 18 이상과 `npm install`이 필요합니다.
 
-### 3. LLM 백엔드 준비
+### API 키 설정
 
-기본 실행은 **Gemini API**를 사용합니다. `.env` 파일 또는 환경변수에 API 키를 설정하세요.
+기본 백엔드는 Gemini입니다.
 
-```text
+```env
 GEMINI_API_KEY=
 ```
 
-Gemini SDK(`google-genai`)는 `requirements.txt`에 포함되어 있습니다. 설치가 안 되어 있으면 아래로 설치하세요:
-```powershell
-py -m pip install -r requirements.txt
-```
+OpenAI 백엔드를 사용할 때는 다음 값을 설정합니다.
 
-OpenAI API를 테스트하려면 `.env` 파일 또는 환경변수에 아래 값을 설정합니다:
-
-```text
+```env
 LLM_PROVIDER=openai
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5.4-mini
 ```
 
-OpenAI SDK는 `requirements.txt`에 포함되어 있습니다. 기존 환경이라면 한 번 더 설치하세요:
+로컬 에이전트를 사용할 때는 Codex CLI 또는 Claude Code CLI가 설치·로그인되어 있어야 합니다.
 
-```powershell
-py -m pip install -r requirements.txt
-```
-
-로컬 에이전트를 사용하려면 아래처럼 설정합니다:
-
-```text
-LLM_PROVIDER=codex    # Codex CLI 사용
-# 또는
-LLM_PROVIDER=claude   # Claude Code CLI 사용
-```
-
-로컬 에이전트는 각각 로그인 상태가 필요합니다:
 ```powershell
 codex --version
-# 또는
 claude --version
 ```
 
-## 실행
+## 실행 방법
 
-### 기본 실행 (Gemini API)
+### 기본 실행
 
 ```powershell
 py main.py "서울특별시_탄소중립계획.pdf" -o "서울_결과.xlsx"
 ```
 
-### Codex CLI로 실행
+### 백엔드 선택
 
 ```powershell
-py main.py "서울특별시_탄소중립계획.pdf" --agent codex -o "서울_결과.xlsx"
-```
-
-### OpenAI API로 실행
-
-```powershell
+py main.py "서울특별시_탄소중립계획.pdf" --agent gemini -o "서울_결과.xlsx"
 py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model gpt-5.4-mini -o "서울_결과.xlsx"
-```
-
-### OpenAI 기본 추출 + Gemini 보조 검수
-
-Gemini를 전체 재추출에 쓰지 않고, 고위험 시트의 누락 후보 탐지와 후보 판정에만 사용합니다. 기본 흐름은 `GPT-Mini 기본본 → Gemini Flash 후보탐색 → Gemini Pro 후보판정 → 규칙 기반 병합 로그`입니다.
-
-```powershell
-py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model gpt-5.4-mini --hybrid-review -o "서울_결과.xlsx"
-```
-
-기본값에서는 후보를 본 시트에 자동 병합하지 않고 `17_보조검수후보`, `18_보조병합로그`에 기록합니다. Pro가 `accept` 또는 `fix_then_merge`와 `high` 신뢰도로 판정하고 규칙 검사를 통과한 후보를 실제 본 시트에 반영하려면 아래처럼 명시적으로 켭니다.
-
-```powershell
-py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model gpt-5.4-mini --hybrid-review --hybrid-auto-merge -o "서울_결과.xlsx"
-```
-
-### Claude Code CLI로 실행
-
-```powershell
+py main.py "서울특별시_탄소중립계획.pdf" --agent codex -o "서울_결과.xlsx"
 py main.py "서울특별시_탄소중립계획.pdf" --agent claude -o "서울_결과.xlsx"
 ```
 
 ### 이미지 분석 제외
 
-이미지 Vision 호출이 느리거나 비용을 줄이고 싶을 때:
+이미지 Vision 호출 비용이나 시간을 줄이고 싶을 때 사용합니다.
 
 ```powershell
 py main.py "서울특별시_탄소중립계획.pdf" --no-images -o "서울_결과.xlsx"
 ```
 
-### 전체 페이지 스캔 (라우팅 누락 방지)
+### 전체 페이지 스캔
+
+라우팅 누락이 의심될 때 사용합니다. 비용과 시간이 늘어납니다.
 
 ```powershell
 py main.py "서울특별시_탄소중립계획.pdf" --full-scan -o "서울_결과.xlsx"
 ```
 
-### 주요 옵션
+### 보조 모델 검수
+
+기본 추출본을 만든 뒤 고위험 시트만 보조 모델로 다시 검수합니다. 기본값에서는 후보를 본 시트에 자동 병합하지 않고 `17_보조검수후보`, `18_보조병합로그`에 남깁니다.
+
+```powershell
+py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model gpt-5.4-mini --hybrid-review -o "서울_결과.xlsx"
+```
+
+자동 병합까지 테스트하려면 명시적으로 켭니다.
+
+```powershell
+py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model gpt-5.4-mini --hybrid-review --hybrid-auto-merge -o "서울_결과.xlsx"
+```
+
+## 주요 옵션
 
 | 옵션 | 설명 |
 |---|---|
 | `input_path` | 입력 문서 경로. PDF, HWP, HWPX 지원 |
 | `-o`, `--output` | 출력 Excel 파일 경로 |
 | `-g`, `--guideline` | 환경부 가이드라인 HWP/HWPX 경로 |
-| `--agent` | LLM 백엔드: `gemini`, `openai`, `codex`, `claude`, `auto` |
-| `--agent-model` | Gemini/OpenAI 또는 로컬 에이전트 모델명 |
+| `--agent` | `gemini`, `openai`, `codex`, `claude`, `auto` 중 선택 |
+| `--agent-model` | 선택 백엔드 모델명 |
 | `--agent-timeout` | 로컬 에이전트 1회 호출 제한 시간(초) |
-| `-k`, `--api-key` | 선택한 API 백엔드 키 (`gemini` 또는 `openai`) |
-| `-r`, `--retries` | 품질 미달 시 파이프라인 재시도 횟수 |
+| `-k`, `--api-key` | API 백엔드 키 |
+| `-r`, `--retries` | 품질 미달 시 전체 파이프라인 재시도 횟수 |
 | `-v`, `--verbose` | 상세 로그 출력 |
 | `--no-images` | 이미지·그래프 분석 생략 |
-| `--hybrid-review` | 기본 추출 후 보조 모델로 누락/충돌 후보 검수 |
+| `--max-images` | Vision 분석 이미지 수를 명시적으로 제한 |
+| `--full-scan` | 시트 라우팅 대신 전체 페이지를 스캔 |
+| `--hybrid-review` | 보조 모델 후보 검수 활성화 |
 | `--hybrid-review-max-batches` | 보조 검수 시 시트당 최대 배치 수 |
-| `--hybrid-adjudication-model` | 보조 후보를 최종 판정할 모델명. 기본값 `gemini-2.5-pro` |
-| `--hybrid-adjudication-max-candidates` | Pro 판정 후보 최대 개수. 기본값 0(전체 후보) |
-| `--no-hybrid-adjudication` | Flash 후보탐색만 수행하고 Pro 후보판정은 생략 |
-| `--hybrid-auto-merge` | Pro accept/fix_then_merge + high 신뢰도 + 규칙 검사를 통과한 후보를 본 시트에 자동 병합 |
+| `--hybrid-adjudication-model` | 보조 후보 판정 모델 |
+| `--hybrid-adjudication-max-candidates` | 판정 후보 최대 개수. `0`이면 전체 |
+| `--no-hybrid-adjudication` | 후보 판정 생략 |
+| `--hybrid-auto-merge` | 안전 조건을 통과한 후보를 본 시트에 자동 병합 |
 
-## 출력 Excel
+## 중요한 설정
 
-생성 파일은 `carbon_guideline.md` §5.2절 기준 17개 기본 시트(`00`~`16`)로 구성됩니다. 선택 시트는 데이터가 있을 때만 추가됩니다: `--hybrid-review`를 켜면 후보 검토용 `17_보조검수후보`·Pro 판정 추적용 `18_보조병합로그`가, 정제 단계에서 정합성 문제가 발견되면 `19_검증리포트`가 생성됩니다.
+`config.py` 또는 환경변수로 조정합니다.
 
-| 시트 | 내용 |
+| 설정 | 기본값 | 설명 |
+|---|---:|---|
+| `LLM_PROVIDER` | `gemini` | 기본 LLM 백엔드 |
+| `LOCAL_AGENT_TIMEOUT` | `300` | Codex/Claude 1회 호출 제한 시간 |
+| `PARALLEL_PROCESSING_ENABLED` | `True` | 독립 배치 병렬 실행 |
+| `TEXT_WORKERS` | `4` | 텍스트 추출 병렬 워커 수 |
+| `LLM_CACHE_ENABLED` | `True` | 성공한 LLM 응답 캐시 |
+| `LLM_CACHE_DIR` | `.cache/llm_responses` | 캐시 저장 위치 |
+| `LLM_QUOTA_WAIT_ENABLED` | `True` | quota 발생 시 짧게 대기 후 재개 |
+| `LLM_QUOTA_WAIT_POLL_SECONDS` | `120` | quota 회복 대기 기본 간격 |
+| `LLM_QUOTA_WAIT_MAX_SECONDS` | `1800` | quota 누적 대기 상한 |
+| `GAP_FILL_ENABLED` | `True` | 커버리지 낮은 시트 재추출 |
+| `PROVENANCE_ENABLED` | `True` | 본문 시트에 `출처페이지` 컬럼 추가 |
+| `MAX_IMAGES` | `None` | 기본은 triage 통과 이미지 전수 분석 |
+| `HYBRID_REVIEW_ENABLED` | `False` | 보조 모델 검수 기본 비활성 |
+| `HYBRID_AUTO_MERGE_ENABLED` | `False` | 보조 후보 자동 병합 기본 비활성 |
+| `EXTRACTION_SHEET_CLUSTERING` | `False` | 시트 클러스터링 추출 opt-in |
+| `ROUTE_DROP_UBIQUITOUS_STRONG` | `False` | strong 키워드 라우팅 샤프닝 opt-in |
+
+## 프로젝트 구조
+
+```text
+2026_GovReport_Analyzer/
+├─ main.py                    # CLI 진입점
+├─ config.py                  # 백엔드, 배치, 라우팅, quota, 검수 설정
+├─ carbon_guideline.md        # 환경부 가이드라인 기반 보조 지침
+├─ agents/
+│  ├─ guideline_agent.py      # 가이드라인/스키마 관리
+│  ├─ extractor_agent.py      # 텍스트·표 추출, 배치 원장
+│  ├─ image_agent.py          # 이미지 triage와 그래프 판독
+│  ├─ organizer_agent.py      # 결정론적 정제·중복 제거·검증
+│  ├─ gap_fill_agent.py       # 커버리지 기반 빈칸 보완
+│  ├─ hybrid_review_agent.py  # 선택 보조 모델 검수
+│  ├─ excel_agent.py          # Excel 작성
+│  └─ supervisor.py           # 전체 파이프라인 조율
+├─ utils/
+│  ├─ llm_client.py           # LLM 호출, JSON 파싱, quota 대기, 재시도
+│  ├─ llm_cache.py            # 성공 응답 캐시
+│  ├─ parallel.py             # 순서 보존 병렬 실행/실패 수집
+│  ├─ pdf_reader.py           # PDF 파싱
+│  ├─ hwp_reader.py           # HWP/HWPX 파싱(kordoc)
+│  └─ excel_writer.py         # openpyxl 기반 Excel 생성
+├─ scripts/
+│  ├─ run_ab_validation.py    # A/B 검증 리포트 생성
+│  └─ verify_routing_coverage.py
+└─ tests/                     # v4/v4.1 신뢰성 계약 회귀 테스트
+```
+
+## 테스트
+
+전체 테스트는 현재 v4/v4.1의 핵심 계약을 검증합니다.
+
+```powershell
+python -m pytest tests/ -q
+```
+
+주요 테스트 역할은 다음과 같습니다.
+
+| 영역 | 테스트 파일 |
 |---|---|
-| `00_문서메타` | 계획명, 지자체, 계획기간, 기준연도, 목표연도 |
-| `01_계획개요` | 수립배경, 법적근거, 추진체계, 추진경과 |
-| `02_지역여건` | 자연/인문/경제/에너지 지표 (자동차, 에너지 포함) |
-| `03_배출현황_지역` | GIR 기준 직접·간접·흡수원 배출량 |
-| `04_배출현황_관리권한` | 지자체 관리권한 인벤토리 |
-| `05_배출전망` | BAU 및 시나리오별 전망값 |
-| `06_감축목표` | 총괄·부문별 감축목표, 감축률 |
-| `07_비전전략` | 비전문구, 추진전략, 세부전략 |
-| `08_감축사업목록` | 감축대책 세부사업, 관리번호, 성과지표 |
-| `09_연차별이행계획` | 사업별 연도별 목표물량 및 계획 |
-| `10_정량감축량` | 감축원단위 기반 정량 감축량 산정 |
-| `11_재정투자계획` | 부문별·재원별·연도별 예산 |
-| `12_대응기반강화` | 적응/공유재산/교육/녹색성장 등 8개 영역 |
-| `13_이행관리환류` | 점검체계, 담당조직, 절차, 기한 |
-| `14_점검실적` | 연도별 이행실적, 달성여부, 사업유형 |
-| `15_변경과제_조치` | 변경사업, 미달성 사유, 조치계획 |
-| `16_시각자료목록` | 이미지·그래프 판독 결과 추적 |
-| `17_보조검수후보` | 보조 모델이 제안한 누락 후보, 값 충돌, 오염 의심 항목 (`--hybrid-review` 사용 시) |
-| `18_보조병합로그` | Gemini Pro 후보 판정, 원문 근거, 자동 병합 여부와 차단 사유 (`--hybrid-review` 사용 시) |
-| `19_검증리포트` | 감축률 산식 불일치, 부문/목표연도 누락, 단위 스케일 혼재, 재정 합계≠부분합 등 결정론적 정합성 점검 결과 (문제가 있을 때만) |
+| LLM 호출, 캐시, JSON 재시도, quota 예외 | `tests/test_llm_client.py`, `tests/test_llm_json_retry_stats.py`, `tests/test_quota_resilience.py` |
+| 병렬 실패 수집과 원장 | `tests/test_parallel.py`, `tests/test_extraction_ledger.py` |
+| 라우팅/GAP_FILL/검증리포트 | `tests/test_extractor_routing.py`, `tests/test_gap_fill_trigger.py`, `tests/test_validation_report.py` |
+| 이미지/PDF/출처페이지 | `tests/test_image_agent_fallback.py`, `tests/test_pdf_reader_rendering.py`, `tests/test_provenance.py` |
+| 정제·중복 제거 | `tests/test_organizer_dedup.py` |
+| A/B 하네스 | `tests/test_ab_validation.py` |
 
-## 현재 주요 설정
+## 검증과 운영 팁
 
-`config.py`에서 실행 시간과 정확도 균형을 조정할 수 있습니다.
+### 라우팅 최적화 검증
 
-```python
-LLM_PROVIDER = "gemini"        # 기본 백엔드 (gemini/openai/codex/claude/auto)
-LOCAL_AGENT_MODEL = ""
-LOCAL_AGENT_TIMEOUT = 900
-GEMINI_API_KEY = ""            # .env 또는 환경변수로 설정
-OPENAI_API_KEY = ""            # OpenAI 백엔드 사용 시 설정
-OPENAI_MODEL = "gpt-5.4-mini"
-OPENAI_MAX_OUTPUT_TOKENS = 32768
+라우팅 기본값을 더 공격적으로 바꾸기 전에는 정답지 기반 커버리지 검증을 먼저 통과해야 합니다.
 
-HYBRID_REVIEW_ENABLED = False  # --hybrid-review 또는 환경변수로 활성화
-HYBRID_REVIEW_PROVIDER = "gemini"
-HYBRID_REVIEW_MAX_BATCHES_PER_SHEET = 2
-HYBRID_ADJUDICATION_ENABLED = True
-HYBRID_ADJUDICATION_MODEL = "gemini-2.5-pro"
-HYBRID_ADJUDICATION_MAX_CANDIDATES = 0  # 0이면 후보 전체 판정
-HYBRID_AUTO_MERGE_ENABLED = False
-
-BATCH_SIZE = 15                # 배치당 페이지 수
-
-DOCUMENT_ROUTE_CONTEXT_PAGES = 1
-DOCUMENT_ROUTE_MIN_SCORE = 3
-
-# 토큰 최적화 (품질 무손실)
-CLAUDE_MINIMAL_SESSION = True  # claude 호출 시 MCP/스킬/설정/CLAUDE.md 등 오버헤드 차단
-ROUTE_DROP_UBIQUITOUS_WEAK = True  # 편재하는 변별력 없는 weak 키워드 점수 제외
-ROUTE_UBIQUITY_RATIO = 0.5     # 이 비율 이상 페이지에 나오는 weak 키워드는 무시(무회귀 최대치)
-
-MAX_IMAGES = None              # 기본값: triage 통과 이미지 전수 분석
-IMAGE_TRIAGE_ENABLED = True
-IMAGE_TRIAGE_MIN_SCORE = 5
-IMAGE_CHART_TABLE_EXTRACTION = True
-IMAGE_CHART_MERGE_MIN_CONFIDENCE = "medium"
+```powershell
+py scripts/verify_routing_coverage.py "서울특별시_탄소중립계획_정리.xlsx" "서울특별시_탄소중립계획.pdf"
 ```
 
-권장값:
+### A/B 비교
 
-- 최종 산출용: 기본값 그대로 `MAX_IMAGES = None`으로 이미지 전수 분석
-- 빠른 테스트: `MAX_IMAGES = 30~50` 또는 `--no-images`
-- 라우팅 누락이 의심될 때: `--full-scan` 또는 `FULL_DOCUMENT_SCAN=1`
-- JSON 파싱 실패가 잦을 때: `BATCH_SIZE = 10~15`
-- GPT-Mini 기본본을 Gemini로 보조 검수할 때: `--hybrid-review`
-- Pro 판정 결과 중 `accept`/`fix_then_merge`만 본 시트에 반영해 테스트할 때: `--hybrid-auto-merge`
+설정 변경 전후의 출력 차이를 기록하려면 A/B 하네스를 사용합니다.
 
-## 동작 방식
-
-### 문서 파싱
-
-PDF는 PyMuPDF로 텍스트, 표, 이미지 후보를 추출합니다. HWP/HWPX는 `kordoc`를 subprocess로 호출해 Markdown/JSON 결과를 읽고, 기존 `PDFContent` 구조로 변환합니다.
-
-### 가이드라인 반영
-
-가이드라인 HWP가 제공되면 `GuidelineAgent`가 본문을 시트별 키워드로 검색해 관련 지침 조각을 추출 프롬프트에 추가합니다. 파싱에 실패하거나 관련 지침이 없으면 내장 스키마만 사용합니다.
-
-### 텍스트 추출
-
-전체 문서를 그대로 LLM에 넣지 않고, 시트별로 관련성이 높은 후보 페이지를 먼저 고릅니다. 이후 후보 페이지를 `BATCH_SIZE` 단위로 묶어 선택된 LLM 백엔드에 JSON 전용 프롬프트로 전달합니다.
-
-라우팅 로그의 후보 페이지 수와 최종 추출 행 수는 다른 값입니다.
-
-```text
-문서 구조 라우팅 완료(시트별 후보 페이지 수): {'ghg': 180, ...}
-완료. 누적: {'ghg': 75, ...}
+```powershell
+py scripts/run_ab_validation.py "서울특별시_탄소중립계획.pdf" --output-dir output/ab
 ```
 
-첫 번째는 LLM에 보낼 후보 페이지 수이고, 두 번째는 실제 추출된 JSON 행 수입니다.
+### 캐시
 
-### 이미지 분석
+성공한 LLM 응답은 `.cache/llm_responses`에 저장됩니다. 같은 프롬프트·모델·이미지 조합은 재사용되므로 재실행 비용이 줄어듭니다. 실패 응답은 캐시하지 않습니다.
 
-이미지가 많은 PDF에서도 기본값은 `MAX_IMAGES=None`이므로 triage 통과 이미지를 전수 분석합니다.
-속도 때문에 일부만 확인해야 하는 경우에만 `--max-images N` 또는 `MAX_IMAGES=N`을 명시합니다.
+### 실행 시간 로그
 
-1. 로컬 triage로 차트·표 가능성이 높은 이미지 선별
-2. 같은 페이지의 embedded 이미지가 전체 페이지 렌더에 포함되면 페이지 렌더 1장으로 대표해 중복 Vision 호출을 줄임
-3. `우리나라 NDC`, `주요국`, `세계도시`, `COP`, `IPCC`, `동향`, `목차` 등 지자체 직접 데이터가 아닌 참고자료성 페이지 제외
-4. 남은 후보를 전수 분석하되, `MAX_IMAGES`가 명시된 경우에만 상위 N개로 제한
-5. 그래프는 `chart_table` 형태로 변환
-6. 변환된 표를 `이미지·그래프 판독결과` 시트에 기록
-7. 중복 행을 제거하고 연도 범위, 참고자료 여부, 값 존재 여부를 재검증
-8. 연도와 값이 명확한 표 기반 고신뢰 행만 본 데이터에 병합하고, 막대·선 그래프 추정값은 검토 후보로 보관
-9. Vision이 유효 차트로 판독하지 못한 페이지도 페이지 렌더/표 주변 텍스트에서 확인되는 수치는 검토 후보로 남김
+파이프라인 종료 시 단계별 소요 시간, LLM 호출 수, 실패 수, 재시도 수, quota 대기 누적, 캐시 hit/miss가 출력됩니다. 병목을 볼 때는 전체 시간보다 `텍스트 추출`, `이미지 분석`, `quota 대기 누적`을 먼저 확인하세요.
 
-LLM 호출이 실패하거나 타임아웃되면 설정된 재시도 횟수만큼 다시 실행합니다.
-
-### 정리·정제
-
-정제 단계는 가능한 한 LLM이 아니라 Python 규칙으로 처리합니다.
-
-- 부문명 표준화
-- 용도/차종명 정규화
-- 중복 행 병합
-- 비정상 주행거리 제거
-- 에너지 합산행 제거
-- GHG 이상치 제거
-- `25432000 → 25432` 같은 천 단위 스케일 보정
-- 요약카드 5개 항목 정리
-
-### 빈칸 보완
-
-1차 정제 후, 비었거나 값 채움률이 낮은 수치/표 중심 시트(지역여건, 배출현황 지역/관리권한, 배출전망, 감축목표, 정량감축량, 재정투자, 연차별이행)를 점검합니다. 채움률이 기준(`GAP_FILL_MIN_FILL_RATIO`, 기본 0.6) 미만이면, 해당 시트와 관련성이 높은 페이지를 다시 모아 재추출합니다.
-
-이때 라우팅 점수 임계값을 1차보다 낮춰(`GAP_FILL_REEXTRACT_MIN_SCORE`) 1차 패스가 놓친 페이지까지 다시 잡습니다(recall 우선). 추가된 행은 Organizer를 한 번 더 통과시켜 기존 정규화·중복 병합 로직으로 합치며, 프롬프트에서 "원문에 명확히 보이는 값만(추정 금지)"을 강제합니다. `GAP_FILL_ENABLED=0`으로 끌 수 있습니다.
-
-### 보조 모델 검수
-
-`--hybrid-review`를 켜면 기본 추출이 끝난 뒤 보조 모델이 아래 고위험 시트만 제한적으로 다시 봅니다.
-
-- `04_배출현황_관리권한`
-- `06_감축목표`
-- `08_감축사업목록`
-- `10_정량감축량`
-- `11_재정투자계획`
-
-보조 검수는 두 단계입니다.
-
-1. Gemini Flash가 고위험 시트의 일부 후보 페이지를 다시 읽고 `17_보조검수후보`에 `누락후보`, `값충돌`, `기본본오염의심`을 남깁니다.
-2. Gemini Pro가 후보별 원문 문맥을 다시 확인해 `accept`, `fix_then_merge`, `reject`, `needs_human`으로 판정하고 `18_보조병합로그`에 근거 문구, 위험 플래그, 병합 차단 사유를 남깁니다.
-
-후보 사유에 `표 2-31` 같은 표 번호가 있으면 목차 페이지 대신 PDF 전체에서 실제 표 본문 페이지를 찾아 판정 문맥으로 사용합니다. 기본값에서는 Pro가 `accept`해도 본 시트에 바로 병합하지 않습니다. `--hybrid-auto-merge`를 켠 경우에만 `accept` 또는 `fix_then_merge`, `high` 신뢰도, 원문 근거 존재, 참고자료/국가자료 문맥 아님, 기본본 중복 아님 조건을 모두 통과한 후보가 본 시트에 추가됩니다. 시트당 기본 2배치만 검수하므로 Gemini 전체 재실행보다 훨씬 짧게 동작합니다.
-
-### 소요 시간 및 캐시 로그
-
-실행 종료 시 병목 확인을 위해 단계별 누적 소요 시간을 출력합니다. 품질 미달로 재시도한 경우 `텍스트 추출`, `이미지 분석`, `정리·정제` 시간은 전체 시도 합산입니다.
-
-```text
-[감독관] 단계별 소요 시간
-  - 문서 파싱: 42.3초
-  - 가이드라인 로드: 0.2초
-  - 텍스트 추출: 38분 12.4초
-  - 이미지 분석: 21분 08.6초
-  - 정리·정제: 1분 14.0초
-  - 보조 모델 검수: 3분 20.0초
-  - 보조 후보 판정·병합: 4분 10.0초
-  - 엑셀 작성: 2.1초
-  - LLM 최종 검수: 18.5초
-  - 전체: 1시간 01분 37.8초
-  - LLM 캐시: hit 12, miss 84, write 84, disabled 0
-```
-
-`hit`가 높을수록 이전 실행 결과를 재사용한 비율이 높다는 뜻입니다. 첫 실행에서는 대부분 `miss`가 정상입니다.
-
-## 자주 발생하는 로그
-
-### `관련 지침 0개 반영`
-
-가이드라인 파일은 읽었지만 시트별 키워드로 선택된 보조 지침이 없다는 뜻입니다. 최근 버전에서는 kordoc의 `markdown`, `text`, `table.cells` 구조를 모두 읽도록 보완했습니다.
+## 자주 발생하는 상황
 
 ### `JSON 파싱 실패`
 
-LLM 응답이 길거나 JSON 외 설명이 섞여 구조가 깨진 경우입니다. `BATCH_SIZE`를 낮추면 완화됩니다.
+응답에 설명이 섞이거나 JSON이 깨진 경우입니다. 현재는 1회 재요청 후에도 실패하면 원장과 검증리포트에 남깁니다. 반복된다면 `BATCH_SIZE`를 낮추는 것이 안전합니다.
 
-### `LLM/로컬 에이전트 실행 실패`
+### `원장 호출실패` 또는 `원장 파싱실패`
 
-Gemini/OpenAI API 키, Codex/Claude Code CLI 설치, 로그인 상태, `LLM_PROVIDER`, `CODEX_COMMAND`, `CLAUDE_COMMAND` 값을 확인하세요. 로컬 에이전트 호출이 너무 오래 걸리면 `LOCAL_AGENT_TIMEOUT` 또는 `--agent-timeout`을 늘릴 수 있습니다.
+해당 배치가 실패했지만 파이프라인은 완주했다는 뜻입니다. `19_검증리포트`의 시트명과 페이지를 기준으로 재실행 또는 수동 검토하면 됩니다.
 
-### `Gemini 일시 과부하/서버 오류`
+### quota/세션 한도 대기
 
-Gemini가 `503 UNAVAILABLE`, `high demand`를 반환한 경우입니다. 기본값에서는 `GEMINI_MAX_RETRIES=4`까지 재시도하고, 그래도 실패하면 해당 배치만 빈 결과로 처리해 다음 배치를 계속 진행합니다. 결과 누락이 걱정되면 같은 설정으로 재실행하면 캐시된 성공 호출은 재사용하고 실패 배치만 다시 시도됩니다.
+Codex/Claude 로컬 에이전트에서 quota나 세션 한도가 감지되면 짧게 대기 후 재개합니다. 상한을 넘으면 해당 배치만 실패로 기록합니다.
 
 ### `MuPDF error: syntax error`
 
-일부 PDF 내부 객체 형식이 엄격하지 않아 PyMuPDF가 경고를 출력하는 경우입니다. 텍스트/페이지 파싱이 완료된다면 대체로 치명적 문제는 아닙니다.
+일부 PDF 내부 객체가 엄격하지 않아 PyMuPDF가 경고를 출력하는 경우입니다. 페이지 파싱이 완료되고 결과가 생성된다면 대체로 치명적 문제는 아닙니다.
 
 ## 한계
 
-- LLM 기반 추출이므로 원문 표 구조가 복잡하면 오추출이 발생할 수 있습니다.
+- LLM 기반 추출이므로 원문 표가 복잡하거나 OCR 품질이 낮으면 오추출이 생길 수 있습니다.
 - 스캔본 PDF처럼 텍스트 레이어가 약한 문서는 정확도가 낮습니다.
-- HWP 입력은 현재 텍스트·표 중심이며 이미지 추출은 지원하지 않습니다.
-- 지도형 시각화는 일반 그래프보다 수치 추출 신뢰도가 낮습니다.
-- LLM 응답 속도는 선택한 백엔드, 모델, 이미지 분석 개수, 배치 크기에 영향을 받습니다.
+- HWP/HWPX 입력은 텍스트·표 중심이며 PDF 이미지 분석과 동일한 수준의 이미지 추출을 보장하지 않습니다.
+- 지도형 시각화와 수치가 없는 그래프는 자동 판독 신뢰도가 낮습니다.
+- opt-in 최적화는 반드시 A/B 검증 후 사용해야 합니다.
 
-## 개발 환경
+## 변경 이력 요약
 
-| 항목 | 내용 |
-|---|---|
-| 언어 | Python 3.10+ |
-| LLM | Gemini API / OpenAI API / Codex CLI / Claude Code CLI |
-| PDF | PyMuPDF |
-| HWP/HWPX | kordoc(Node.js) |
-| Excel | openpyxl |
-| 이미지 처리 | Pillow |
+- v4: 부분 실패 허용 병렬 실행, 배치 원장, JSON 재시도, dedup 충돌 리포트, 커버리지 기반 GapFill, 출처페이지, 검증리포트 확장, A/B 하네스, 실행 텔레메트리 도입
+- v4.1: quota 복구 공백 해소, quota 실패 배치 격리, Supervisor 부분 결과 안전망, 스테일 summary 코드 제거, JSON 성공 판정 보정
