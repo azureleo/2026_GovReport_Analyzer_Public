@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
 import config
 from utils import llm_client
@@ -42,6 +43,16 @@ _REFERENCE_CONTEXT_KEYWORDS = [
 _CONFIDENCE_RANK = {"low": 1, "medium": 2, "high": 3}
 
 
+_PROVIDER_ALIASES = {
+    "gemini-api": "gemini",
+    "openai-api": "openai",
+    "gpt": "openai",
+    "local": "codex",
+    "local-agent": "codex",
+    "claude-code": "claude",
+}
+
+
 _TABLE_REF_RE = re.compile(r"(표|그림)\s*([0-9ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+)\s*[-–]\s*([0-9]+)")
 
 
@@ -57,6 +68,79 @@ _SIGNATURE_FIELDS = {
     "quantitative_reductions": ["지자체명", "관리번호", "사업명", "연도", "모니터링인자"],
     "financial_plan": ["지자체명", "계획구분", "부문", "사업명", "재원구분", "연도"],
 }
+
+
+def _normalise_provider(provider: str) -> str:
+    provider = str(provider or "").strip().lower()
+    return _PROVIDER_ALIASES.get(provider, provider)
+
+
+def _command_available(command: str) -> bool:
+    return bool(llm_client._command_exists(command))
+
+
+def _backend_available(provider: str) -> tuple[bool, str]:
+    provider = _normalise_provider(provider)
+    if provider == "gemini":
+        if getattr(config, "GEMINI_API_KEY", ""):
+            return True, ""
+        return False, "GEMINI_API_KEY 미설정"
+    if provider == "openai":
+        if getattr(config, "OPENAI_API_KEY", ""):
+            return True, ""
+        return False, "OPENAI_API_KEY 미설정"
+    if provider == "codex":
+        command = getattr(config, "CODEX_COMMAND", "codex")
+        if _command_available(command):
+            return True, ""
+        return False, f"Codex CLI를 찾을 수 없음: CODEX_COMMAND={command}"
+    if provider == "claude":
+        command = getattr(config, "CLAUDE_COMMAND", "claude")
+        if _command_available(command):
+            return True, ""
+        return False, f"Claude Code CLI를 찾을 수 없음: CLAUDE_COMMAND={command}"
+    if provider == "auto":
+        for candidate in ("codex", "claude", "gemini", "openai"):
+            ok, _ = _backend_available(candidate)
+            if ok:
+                return True, ""
+        return False, "auto 백엔드에서 사용 가능한 provider 없음"
+    return False, f"지원하지 않는 보조 검수 백엔드: {provider}"
+
+
+def _effective_backend_model(provider: str, model: str) -> str:
+    provider = _normalise_provider(provider)
+    model = str(model or "").strip()
+    looks_like_gemini_default = model.startswith("gemini-") or model.startswith("models/gemini")
+    if provider == "openai" and looks_like_gemini_default:
+        return getattr(config, "OPENAI_MODEL", "")
+    if provider in {"codex", "claude", "auto"} and looks_like_gemini_default:
+        return getattr(config, "LOCAL_AGENT_MODEL", "")
+    return model
+
+
+@contextmanager
+def _temporary_backend(provider: str, model: str | None = None) -> Iterator[None]:
+    saved = {
+        "LLM_PROVIDER": getattr(config, "LLM_PROVIDER", ""),
+        "MODEL": getattr(config, "MODEL", ""),
+        "OPENAI_MODEL": getattr(config, "OPENAI_MODEL", ""),
+        "LOCAL_AGENT_MODEL": getattr(config, "LOCAL_AGENT_MODEL", ""),
+    }
+    normalised_provider = _normalise_provider(provider)
+    try:
+        config.LLM_PROVIDER = normalised_provider
+        if model:
+            if normalised_provider == "gemini":
+                config.MODEL = model
+            elif normalised_provider == "openai":
+                config.OPENAI_MODEL = model
+            else:
+                config.LOCAL_AGENT_MODEL = model
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(config, name, value)
 
 
 def _compact(text: str, limit: int = 22000) -> str:
@@ -353,19 +437,11 @@ class HybridReviewAgent:
         }
 
     def _provider_available(self) -> bool:
-        provider = str(getattr(config, "HYBRID_REVIEW_PROVIDER", "gemini")).strip().lower()
-        if provider in {"gemini", "gemini-api"}:
-            if not getattr(config, "GEMINI_API_KEY", ""):
-                self._stats["skipped"] = "GEMINI_API_KEY 미설정"
-                return False
-        elif provider in {"openai", "openai-api", "gpt"}:
-            if not getattr(config, "OPENAI_API_KEY", ""):
-                self._stats["skipped"] = "OPENAI_API_KEY 미설정"
-                return False
-        else:
-            self._stats["skipped"] = f"지원하지 않는 보조 검수 백엔드: {provider}"
-            return False
-        return True
+        provider = getattr(config, "HYBRID_REVIEW_PROVIDER", "gemini")
+        ok, message = _backend_available(provider)
+        if not ok:
+            self._stats["skipped"] = message
+        return ok
 
     def _base_rows_text(self, final_data: dict, sheet_key: str) -> str:
         rows = final_data.get(sheet_key, [])
@@ -440,14 +516,14 @@ class HybridReviewAgent:
             guideline_prompt=extraction_prompts.get(sheet_key, ""),
         )
         provider = getattr(config, "HYBRID_REVIEW_PROVIDER", "gemini")
-        model = getattr(config, "HYBRID_REVIEW_MODEL", "")
+        model = _effective_backend_model(provider, getattr(config, "HYBRID_REVIEW_MODEL", ""))
         try:
-            with llm_client.temporary_backend(provider, model or None):
+            with _temporary_backend(provider, model or None):
                 resp = llm_client.call_text(prompt, system=HYBRID_REVIEW_SYSTEM)
         except llm_client.LLMQuotaExceededError as exc:
             self._stats["skipped"] = f"quota/한도 초과: {exc}"
             raise
-        except llm_client.LLMCallError as exc:
+        except (llm_client.LLMCallError, RuntimeError) as exc:
             logger.warning("하이브리드 검수 호출 실패(%s): %s", sheet_key, exc)
             return []
 
@@ -529,12 +605,11 @@ class HybridReviewAgent:
         return self._candidates
 
     def _adjudication_provider_available(self) -> bool:
-        provider = str(getattr(config, "HYBRID_ADJUDICATION_PROVIDER", "gemini")).strip().lower()
-        if provider in {"gemini", "gemini-api"}:
-            return bool(getattr(config, "GEMINI_API_KEY", ""))
-        if provider in {"openai", "openai-api", "gpt"}:
-            return bool(getattr(config, "OPENAI_API_KEY", ""))
-        return False
+        provider = getattr(config, "HYBRID_ADJUDICATION_PROVIDER", "gemini")
+        ok, message = _backend_available(provider)
+        if not ok:
+            self._stats["adjudication"]["skipped"] = message
+        return ok
 
     def _adjudication_prompt(
         self,
@@ -604,13 +679,13 @@ class HybridReviewAgent:
             existing_rows=final_data.get(sheet_key, []) if isinstance(final_data.get(sheet_key), list) else [],
         )
         provider = getattr(config, "HYBRID_ADJUDICATION_PROVIDER", "gemini")
-        model = getattr(config, "HYBRID_ADJUDICATION_MODEL", "")
+        model = _effective_backend_model(provider, getattr(config, "HYBRID_ADJUDICATION_MODEL", ""))
         try:
-            with llm_client.temporary_backend(provider, model or None):
+            with _temporary_backend(provider, model or None):
                 resp = llm_client.call_text(prompt, system=HYBRID_ADJUDICATION_SYSTEM)
         except llm_client.LLMQuotaExceededError:
             raise
-        except llm_client.LLMCallError as exc:
+        except (llm_client.LLMCallError, RuntimeError) as exc:
             logger.warning("하이브리드 후보 판정 실패(%s): %s", sheet_key, exc)
             return {
                 "decision": "needs_human",
@@ -673,7 +748,6 @@ class HybridReviewAgent:
         if not candidates or not getattr(config, "HYBRID_ADJUDICATION_ENABLED", True):
             return final_data, []
         if not self._adjudication_provider_available():
-            self._stats["adjudication"]["skipped"] = "판정 백엔드 키 미설정"
             return final_data, []
 
         municipality = final_data.get("municipality_name", "알 수 없음")
