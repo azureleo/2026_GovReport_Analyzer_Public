@@ -35,6 +35,7 @@ _TIMING_ORDER = [
     "이미지 분석",
     "정리·정제",
     "빈칸 보완",
+    "시트 단위 보조검수·병합",
     "보조 모델 검수",
     "보조 후보 판정·병합",
     "엑셀 작성",
@@ -319,43 +320,67 @@ class Supervisor:
                     self._log(f"[감독관] 빈칸 보완 후 재정제 완료: {elapsed:.1f}초")
 
             if getattr(config, "HYBRID_REVIEW_ENABLED", False):
-                self._log("\n[감독관] STEP 3c: 보조 모델 타깃 검수 실행...")
                 hybrid_agent = HybridReviewAgent()
-                t0 = time.time()
-                try:
-                    review_candidates = hybrid_agent.review(
-                        pages=pdf_content.pages,
-                        final_data=final_data,
-                        extraction_prompts=extraction_prompts,
-                    )
-                except llm_client.LLMQuotaExceededError as exc:
-                    review_candidates = []
-                    logger.warning("보조 모델 검수 quota/한도 문제로 건너뜀: %s", exc)
-                elapsed = time.time() - t0
-                self._add_timing("보조 모델 검수", elapsed)
-                if review_candidates:
-                    final_data["hybrid_review_candidates"] = review_candidates
-                self._log(hybrid_agent.report())
-                self._log(f"[감독관] 보조 모델 검수 완료: {elapsed:.1f}초")
-
-                if review_candidates and getattr(config, "HYBRID_ADJUDICATION_ENABLED", True):
-                    self._log("\n[감독관] STEP 3d: 보조 후보 판정·병합 실행...")
+                if getattr(config, "HYBRID_SHEETWISE_FLOW_ENABLED", True):
+                    self._log("\n[감독관] STEP 3c/3d: 시트 단위 보조검수·병합 실행...")
                     t0 = time.time()
                     try:
-                        final_data, merge_log = hybrid_agent.adjudicate_and_merge(
-                            candidates=review_candidates,
-                            final_data=final_data,
+                        final_data, review_candidates, merge_log = hybrid_agent.review_and_adjudicate_by_sheet(
                             pages=pdf_content.pages,
+                            final_data=final_data,
+                            extraction_prompts=extraction_prompts,
+                            progress=self._log,
                         )
                     except llm_client.LLMQuotaExceededError as exc:
+                        review_candidates = []
                         merge_log = []
-                        logger.warning("보조 후보 판정 quota/한도 문제로 건너뜀: %s", exc)
+                        logger.warning("시트 단위 보조검수·병합 quota/한도 문제로 건너뜀: %s", exc)
                     elapsed = time.time() - t0
-                    self._add_timing("보조 후보 판정·병합", elapsed)
+                    self._add_timing("시트 단위 보조검수·병합", elapsed)
+                    if review_candidates:
+                        final_data["hybrid_review_candidates"] = review_candidates
                     if merge_log:
                         final_data["hybrid_merge_log"] = merge_log
+                    self._log(hybrid_agent.report())
                     self._log(hybrid_agent.adjudication_report())
-                    self._log(f"[감독관] 보조 후보 판정·병합 완료: {elapsed:.1f}초")
+                    self._log(f"[감독관] 시트 단위 보조검수·병합 완료: {elapsed:.1f}초")
+                else:
+                    self._log("\n[감독관] STEP 3c: 보조 모델 타깃 검수 실행...")
+                    t0 = time.time()
+                    try:
+                        review_candidates = hybrid_agent.review(
+                            pages=pdf_content.pages,
+                            final_data=final_data,
+                            extraction_prompts=extraction_prompts,
+                        )
+                    except llm_client.LLMQuotaExceededError as exc:
+                        review_candidates = []
+                        logger.warning("보조 모델 검수 quota/한도 문제로 건너뜀: %s", exc)
+                    elapsed = time.time() - t0
+                    self._add_timing("보조 모델 검수", elapsed)
+                    if review_candidates:
+                        final_data["hybrid_review_candidates"] = review_candidates
+                    self._log(hybrid_agent.report())
+                    self._log(f"[감독관] 보조 모델 검수 완료: {elapsed:.1f}초")
+
+                    if review_candidates and getattr(config, "HYBRID_ADJUDICATION_ENABLED", True):
+                        self._log("\n[감독관] STEP 3d: 보조 후보 판정·병합 실행...")
+                        t0 = time.time()
+                        try:
+                            final_data, merge_log = hybrid_agent.adjudicate_and_merge(
+                                candidates=review_candidates,
+                                final_data=final_data,
+                                pages=pdf_content.pages,
+                            )
+                        except llm_client.LLMQuotaExceededError as exc:
+                            merge_log = []
+                            logger.warning("보조 후보 판정 quota/한도 문제로 건너뜀: %s", exc)
+                        elapsed = time.time() - t0
+                        self._add_timing("보조 후보 판정·병합", elapsed)
+                        if merge_log:
+                            final_data["hybrid_merge_log"] = merge_log
+                        self._log(hybrid_agent.adjudication_report())
+                        self._log(f"[감독관] 보조 후보 판정·병합 완료: {elapsed:.1f}초")
 
             score, issues = _quality_score(final_data)
             self._log(f"\n[감독관] 품질 점수: {score:.1f}/100")

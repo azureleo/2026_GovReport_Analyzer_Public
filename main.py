@@ -150,6 +150,17 @@ def main():
         help="Pro 판정 후보 최대 개수 (기본값: 0=전체)",
     )
     parser.add_argument(
+        "--hybrid-adjudication-batch-size",
+        type=int,
+        default=None,
+        help="시트 단위 후보판정 시 한 번에 묶어 판정할 후보 수 (기본값: 6)",
+    )
+    parser.add_argument(
+        "--legacy-hybrid-flow",
+        action="store_true",
+        help="시트 단위 검수·묶음 판정 대신 기존 전체 후보 수집 후 판정 방식 사용",
+    )
+    parser.add_argument(
         "--no-hybrid-adjudication",
         action="store_true",
         help="보조 검수 후보의 Pro 판정 단계를 건너뜀",
@@ -191,6 +202,10 @@ def main():
         os.environ["HYBRID_ADJUDICATION_MODEL"] = args.hybrid_adjudication_model
     if args.hybrid_adjudication_max_candidates is not None:
         os.environ["HYBRID_ADJUDICATION_MAX_CANDIDATES"] = str(args.hybrid_adjudication_max_candidates)
+    if args.hybrid_adjudication_batch_size is not None:
+        os.environ["HYBRID_ADJUDICATION_BATCH_SIZE"] = str(args.hybrid_adjudication_batch_size)
+    if args.legacy_hybrid_flow:
+        os.environ["HYBRID_SHEETWISE_FLOW_ENABLED"] = "0"
     if args.no_hybrid_adjudication:
         os.environ["HYBRID_ADJUDICATION_ENABLED"] = "0"
     if args.hybrid_auto_merge:
@@ -304,6 +319,7 @@ def main():
     if config.HYBRID_REVIEW_ENABLED:
         print(f"  보조 검수 백엔드: {config.HYBRID_REVIEW_PROVIDER}")
         print(f"  보조 검수 모델: {config.HYBRID_REVIEW_MODEL or '백엔드 기본값'}")
+        print(f"  보조 검수 방식: {'시트 단위 탐색·묶음 판정' if config.HYBRID_SHEETWISE_FLOW_ENABLED else '전체 후보 수집 후 판정'}")
         print(f"  보조 검수 시트당 배치: {config.HYBRID_REVIEW_MAX_BATCHES_PER_SHEET}")
         print(f"  보조 후보 Pro 판정: {'활성' if config.HYBRID_ADJUDICATION_ENABLED else '비활성'}")
         if config.HYBRID_ADJUDICATION_ENABLED:
@@ -313,6 +329,7 @@ def main():
                 else str(config.HYBRID_ADJUDICATION_MAX_CANDIDATES)
             )
             print(f"  보조 후보 판정 상한: {adjudication_limit}")
+            print(f"  보조 후보 판정 묶음 크기: {config.HYBRID_ADJUDICATION_BATCH_SIZE}")
             print(f"  보조 후보 자동 병합: {'활성' if config.HYBRID_AUTO_MERGE_ENABLED else '비활성'}")
     if provider == "gemini":
         print(f"  Gemini 최대 재시도: {config.GEMINI_MAX_RETRIES}")

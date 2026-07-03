@@ -412,6 +412,23 @@ def _confidence_at_least(value: str, minimum: str) -> bool:
     return _CONFIDENCE_RANK.get((value or "").strip().lower(), 0) >= _CONFIDENCE_RANK.get(minimum, 3)
 
 
+def _default_adjudication(reason: str, flag: str = "판정실패") -> dict:
+    return {
+        "decision": "needs_human",
+        "confidence": "low",
+        "reason": reason,
+        "risk_flags": [flag],
+    }
+
+
+def _risk_flags(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in re.split(r"[,|/]", value) if item.strip()]
+    return []
+
+
 class HybridReviewAgent:
     """Gemini 등 보조 모델을 이용한 타깃 검수."""
 
@@ -662,6 +679,204 @@ class HybridReviewAgent:
 - 기본본오염의심 후보는 자동 병합 대상이 아니므로 accept보다 needs_human/reject를 우선 고려하세요.
 - evidence_text는 반드시 원문 문맥에서 확인 가능한 근거여야 합니다."""
 
+    def _adjudication_batch_prompt(
+        self,
+        *,
+        municipality: str,
+        sheet_key: str,
+        prepared_candidates: list[dict],
+        final_data: dict,
+    ) -> str:
+        sheet_name = config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key)
+        existing_rows = final_data.get(sheet_key, []) if isinstance(final_data.get(sheet_key), list) else []
+        sampled_existing = _sample_evenly([row for row in existing_rows if isinstance(row, dict)], 30)
+        candidate_payload = []
+        for prepared in prepared_candidates:
+            candidate = prepared["candidate_for_judgment"]
+            candidate_payload.append({
+                "candidate_id": prepared["candidate_id"],
+                "후보유형": candidate.get("후보유형", ""),
+                "근거페이지": candidate.get("근거페이지", ""),
+                "후보사유": candidate.get("검수사유", ""),
+                "후보행": _parse_json_cell(candidate.get("후보행JSON")),
+                "기본본유사행": _parse_json_cell(candidate.get("기본본유사행JSON")),
+                "원문문맥": prepared.get("page_context", ""),
+            })
+
+        return f"""지자체명: {municipality}
+판정 대상 시트: {sheet_name} ({sheet_key})
+
+[기본본 일부]
+{json.dumps(sampled_existing, ensure_ascii=False)}
+
+[판정 후보 목록]
+{json.dumps(candidate_payload, ensure_ascii=False)}
+
+아래 JSON 형식으로만 반환하세요:
+{{
+  "adjudications": [
+    {{
+      "candidate_id": "후보목록의 candidate_id 값을 그대로 복사",
+      "decision": "accept|fix_then_merge|reject|needs_human",
+      "confidence": "low|medium|high",
+      "evidence_page": "p123",
+      "evidence_text": "원문 근거 문구를 짧게 인용 또는 요약",
+      "normalized_row": {{}},
+      "reason": "판정 사유",
+      "risk_flags": ["국가자료혼입", "해외사례", "참고자료", "단위불명확", "중복의심", "근거부족"]
+    }}
+  ]
+}}
+
+판정 기준:
+- 모든 candidate_id를 빠짐없이 한 번씩 판정하고, candidate_id는 [판정 후보 목록]의 값을 그대로 복사하세요.
+- accept: 후보 행의 핵심 값이 원문 문맥에서 직접 확인되고, 지자체 자체 데이터이며, 기본본에 없는 누락 항목일 때만 선택하세요.
+- fix_then_merge: 후보의 핵심 값은 맞지만 시트명, 부문명, 직간접구분, 단위 표기처럼 정규화가 필요한 경우 선택하세요. 이때 normalized_row에 수정된 행을 넣으세요.
+- reject: 원문 근거가 없거나, 국가/해외/참고자료/목차/일반 설명을 지자체 데이터로 오해한 후보라면 선택하세요.
+- needs_human: 원문 근거는 있으나 단위, 부문, 연도, 사업명 매칭이 모호하면 선택하세요.
+- normalized_row는 {sheet_name} 시트 헤더에 맞춘 최종 후보 행입니다. 원문에 없는 값은 채우지 마세요.
+- 기본본오염의심 후보는 자동 병합 대상이 아니므로 accept보다 needs_human/reject를 우선 고려하세요.
+- evidence_text는 반드시 각 후보의 원문 문맥에서 확인 가능한 근거여야 합니다."""
+
+    def _normalise_batch_adjudications(self, parsed: Any, candidate_ids: list[str]) -> dict[str, dict]:
+        if isinstance(parsed, dict):
+            rows = parsed.get("adjudications") or parsed.get("results") or parsed.get("decisions") or []
+        elif isinstance(parsed, list):
+            rows = parsed
+        else:
+            rows = []
+
+        if not isinstance(rows, list):
+            rows = []
+        position_fallback = len(rows) == len(candidate_ids) and all(
+            isinstance(item, dict)
+            and not (item.get("candidate_id") or item.get("후보ID") or item.get("id"))
+            for item in rows
+        )
+        result: dict[str, dict] = {}
+        for idx, item in enumerate(rows):
+            if not isinstance(item, dict):
+                continue
+            raw_candidate_id = item.get("candidate_id") or item.get("후보ID") or item.get("id")
+            if raw_candidate_id:
+                candidate_id = str(raw_candidate_id)
+                if candidate_id in candidate_ids:
+                    result[candidate_id] = item
+                continue
+            if position_fallback and idx < len(candidate_ids):
+                result[candidate_ids[idx]] = item
+        return result
+
+    def _prepare_candidate_for_adjudication(
+        self,
+        *,
+        candidate: dict,
+        candidate_id: str,
+        pages_by_num: dict[int, PageContent],
+        table_index: dict[str, list[int]],
+    ) -> dict | None:
+        sheet_key = _sheet_key_from_name(candidate.get("대상시트", ""))
+        if not sheet_key or sheet_key not in config.SHEET_KEY_TO_NAME:
+            return None
+        corrected_page_ref, correction_note = _correct_candidate_page_ref(
+            candidate=candidate,
+            pages_by_num=pages_by_num,
+            table_index=table_index,
+        )
+        if correction_note:
+            self._stats["adjudication"]["page_corrected"] += 1
+        candidate_for_judgment = dict(candidate)
+        if corrected_page_ref:
+            candidate_for_judgment["근거페이지"] = corrected_page_ref
+        if correction_note:
+            candidate_for_judgment["검수사유"] = (
+                f"{candidate_for_judgment.get('검수사유', '')}\n{correction_note}"
+            ).strip()
+        context_limit = int(getattr(config, "HYBRID_ADJUDICATION_CONTEXT_CHARS", 8000))
+        page_context = _page_context(
+            pages_by_num,
+            corrected_page_ref or candidate.get("근거페이지", ""),
+            limit=context_limit,
+        )
+        return {
+            "candidate_id": candidate_id,
+            "sheet_key": sheet_key,
+            "candidate": candidate,
+            "candidate_for_judgment": candidate_for_judgment,
+            "corrected_page_ref": corrected_page_ref,
+            "correction_note": correction_note,
+            "page_context": page_context,
+            "raw_candidate_row": _parse_json_cell(candidate.get("후보행JSON")),
+        }
+
+    def _record_adjudication_stats(self, adjudication: dict, reflected: str) -> None:
+        decision = adjudication.get("decision", "needs_human")
+        if decision == "accept":
+            self._stats["adjudication"]["accepted"] += 1
+        elif decision == "fix_then_merge":
+            self._stats["adjudication"]["fixed"] += 1
+        elif decision == "reject":
+            self._stats["adjudication"]["rejected"] += 1
+        elif decision == "needs_human":
+            self._stats["adjudication"]["needs_human"] += 1
+        self._stats["adjudication"]["checked"] += 1
+        if reflected == "반영":
+            self._stats["adjudication"]["merged"] += 1
+
+    def _apply_adjudication(
+        self,
+        *,
+        municipality: str,
+        prepared: dict,
+        adjudication: dict,
+        final_data: dict,
+    ) -> dict:
+        candidate = prepared["candidate"]
+        sheet_key = prepared["sheet_key"]
+        normalized_source = adjudication.get("normalized_row")
+        if not isinstance(normalized_source, dict) or not normalized_source:
+            normalized_source = prepared.get("raw_candidate_row", {})
+        normalized_row = _clean_candidate_row(normalized_source, sheet_key, municipality)
+        blockers = self._merge_blockers(
+            candidate=candidate,
+            adjudication=adjudication,
+            sheet_key=sheet_key,
+            normalized_row=normalized_row,
+            page_context=prepared.get("page_context", ""),
+            final_data=final_data,
+        )
+
+        reflected = "보류"
+        if not blockers and normalized_row:
+            final_data.setdefault(sheet_key, []).append(normalized_row)
+            reflected = "반영"
+
+        self._record_adjudication_stats(adjudication, reflected)
+
+        reason = adjudication.get("reason", "")
+        correction_note = prepared.get("correction_note", "")
+        if correction_note:
+            reason = f"{reason} / {correction_note}".strip(" /")
+
+        return {
+            "지자체명": municipality,
+            "대상시트": config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key),
+            "판정": adjudication.get("decision", "needs_human"),
+            "신뢰도": adjudication.get("confidence", ""),
+            "최종반영여부": reflected,
+            "근거페이지": (
+                adjudication.get("evidence_page")
+                or prepared.get("corrected_page_ref")
+                or candidate.get("근거페이지", "")
+            ),
+            "근거문구": adjudication.get("evidence_text", ""),
+            "위험플래그": ", ".join(_risk_flags(adjudication.get("risk_flags"))),
+            "후보행JSON": candidate.get("후보행JSON", ""),
+            "정규화행JSON": _json_cell(normalized_row),
+            "판정사유": reason,
+            "병합차단사유": ", ".join(blockers),
+        }
+
     def _adjudicate_candidate(
         self,
         *,
@@ -701,6 +916,38 @@ class HybridReviewAgent:
             "risk_flags": ["판정파싱실패"],
         }
 
+    def _adjudicate_candidate_batch(
+        self,
+        *,
+        municipality: str,
+        sheet_key: str,
+        prepared_candidates: list[dict],
+        final_data: dict,
+    ) -> dict[str, dict]:
+        if not prepared_candidates:
+            return {}
+        prompt = self._adjudication_batch_prompt(
+            municipality=municipality,
+            sheet_key=sheet_key,
+            prepared_candidates=prepared_candidates,
+            final_data=final_data,
+        )
+        provider = getattr(config, "HYBRID_ADJUDICATION_PROVIDER", "gemini")
+        model = _effective_backend_model(provider, getattr(config, "HYBRID_ADJUDICATION_MODEL", ""))
+        candidate_ids = [str(item["candidate_id"]) for item in prepared_candidates]
+        try:
+            with _temporary_backend(provider, model or None):
+                resp = llm_client.call_text(prompt, system=HYBRID_ADJUDICATION_SYSTEM)
+        except llm_client.LLMQuotaExceededError:
+            raise
+        except (llm_client.LLMCallError, RuntimeError) as exc:
+            logger.warning("하이브리드 후보 묶음 판정 실패(%s): %s", sheet_key, exc)
+            return {
+                candidate_id: _default_adjudication(f"묶음 판정 호출 실패: {exc}", "판정호출실패")
+                for candidate_id in candidate_ids
+            }
+        return self._normalise_batch_adjudications(llm_client.parse_json(resp), candidate_ids)
+
     def _merge_blockers(
         self,
         *,
@@ -723,7 +970,7 @@ class HybridReviewAgent:
             blockers.append(f"신뢰도<{minimum}")
         if not adjudication.get("evidence_page") or not adjudication.get("evidence_text"):
             blockers.append("근거부족")
-        risk_flags = adjudication.get("risk_flags") or []
+        risk_flags = _risk_flags(adjudication.get("risk_flags"))
         risky = {"국가자료혼입", "해외사례", "참고자료", "단위불명확", "중복의심", "근거부족"}
         if any(flag in risky for flag in risk_flags):
             blockers.append("위험플래그")
@@ -760,89 +1007,221 @@ class HybridReviewAgent:
         for candidate in target_candidates:
             if not isinstance(candidate, dict):
                 continue
-            sheet_key = _sheet_key_from_name(candidate.get("대상시트", ""))
-            if not sheet_key or sheet_key not in config.SHEET_KEY_TO_NAME:
-                continue
-            corrected_page_ref, correction_note = _correct_candidate_page_ref(
+            prepared = self._prepare_candidate_for_adjudication(
                 candidate=candidate,
+                candidate_id=f"c{self._stats['adjudication']['checked'] + 1}",
                 pages_by_num=pages_by_num,
                 table_index=table_index,
             )
-            if correction_note:
-                self._stats["adjudication"]["page_corrected"] += 1
-            candidate_for_judgment = dict(candidate)
-            if corrected_page_ref:
-                candidate_for_judgment["근거페이지"] = corrected_page_ref
-            if correction_note:
-                candidate_for_judgment["검수사유"] = (
-                    f"{candidate_for_judgment.get('검수사유', '')}\n{correction_note}"
-                ).strip()
-            page_context = _page_context(pages_by_num, corrected_page_ref or candidate.get("근거페이지", ""))
-            raw_candidate_row = _parse_json_cell(candidate.get("후보행JSON"))
+            if not prepared:
+                continue
             adjudication = self._adjudicate_candidate(
                 municipality=municipality,
-                candidate=candidate_for_judgment,
-                sheet_key=sheet_key,
-                page_context=page_context,
+                candidate=prepared["candidate_for_judgment"],
+                sheet_key=prepared["sheet_key"],
+                page_context=prepared["page_context"],
                 final_data=final_data,
             )
-            normalized_source = adjudication.get("normalized_row")
-            if not isinstance(normalized_source, dict) or not normalized_source:
-                normalized_source = raw_candidate_row
-            normalized_row = _clean_candidate_row(normalized_source, sheet_key, municipality)
-            blockers = self._merge_blockers(
-                candidate=candidate,
+            merge_log.append(self._apply_adjudication(
+                municipality=municipality,
+                prepared=prepared,
                 adjudication=adjudication,
-                sheet_key=sheet_key,
-                normalized_row=normalized_row,
-                page_context=page_context,
                 final_data=final_data,
-            )
-
-            reflected = "보류"
-            if not blockers and normalized_row:
-                final_data.setdefault(sheet_key, []).append(normalized_row)
-                reflected = "반영"
-                self._stats["adjudication"]["merged"] += 1
-
-            decision = adjudication.get("decision", "needs_human")
-            if decision == "accept":
-                self._stats["adjudication"]["accepted"] += 1
-            elif decision == "fix_then_merge":
-                self._stats["adjudication"]["fixed"] += 1
-            elif decision == "reject":
-                self._stats["adjudication"]["rejected"] += 1
-            elif decision == "needs_human":
-                self._stats["adjudication"]["needs_human"] += 1
-            self._stats["adjudication"]["checked"] += 1
-
-            reason = adjudication.get("reason", "")
-            if correction_note:
-                reason = f"{reason} / {correction_note}".strip(" /")
-
-            merge_log.append({
-                "지자체명": municipality,
-                "대상시트": config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key),
-                "판정": decision,
-                "신뢰도": adjudication.get("confidence", ""),
-                "최종반영여부": reflected,
-                "근거페이지": adjudication.get("evidence_page") or corrected_page_ref or candidate.get("근거페이지", ""),
-                "근거문구": adjudication.get("evidence_text", ""),
-                "위험플래그": ", ".join(adjudication.get("risk_flags") or []),
-                "후보행JSON": candidate.get("후보행JSON", ""),
-                "정규화행JSON": _json_cell(normalized_row),
-                "판정사유": reason,
-                "병합차단사유": ", ".join(blockers),
-            })
+            ))
 
         return final_data, merge_log
+
+    def review_and_adjudicate_by_sheet(
+        self,
+        *,
+        pages: list[PageContent],
+        final_data: dict,
+        extraction_prompts: dict[str, str],
+        progress: Callable[[str], None] | None = None,
+        target_sheets: list[str] | None = None,
+        routed_pages: dict[str, list[PageContent]] | None = None,
+    ) -> tuple[dict, list[dict], list[dict]]:
+        def emit(message: str) -> None:
+            if progress and getattr(config, "HYBRID_PROGRESS_LOG_ENABLED", True):
+                progress(message)
+
+        if not getattr(config, "HYBRID_REVIEW_ENABLED", False):
+            self._stats["skipped"] = "비활성"
+            return final_data, [], []
+        if not self._provider_available():
+            return final_data, [], []
+
+        municipality = final_data.get("municipality_name", "알 수 없음")
+        routed = routed_pages or _route_pages_by_sheet(pages)
+        configured_sheets = target_sheets or getattr(config, "HYBRID_REVIEW_SHEETS", [])
+        target_sheets = [
+            sheet for sheet in configured_sheets
+            if sheet in config.SHEET_KEY_TO_NAME
+        ]
+        batch_size = getattr(config, "HYBRID_REVIEW_BATCH_SIZE", 8)
+        max_batches = getattr(config, "HYBRID_REVIEW_MAX_BATCHES_PER_SHEET", 2)
+        adjudication_enabled = getattr(config, "HYBRID_ADJUDICATION_ENABLED", True)
+        adjudication_available = self._adjudication_provider_available() if adjudication_enabled else False
+        adjudication_batch_size = max(1, int(getattr(config, "HYBRID_ADJUDICATION_BATCH_SIZE", 6)))
+        max_candidates = max(0, getattr(config, "HYBRID_ADJUDICATION_MAX_CANDIDATES", 0))
+
+        pages_by_num = {page.page_number: page for page in pages}
+        table_index = _build_table_page_index(pages)
+        review_candidates: list[dict] = []
+        merge_log: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        adjudicated_total = 0
+
+        emit(
+            "[에이전트3c 보조검수] 시트 단위 검수 시작 "
+            f"({len(target_sheets)}개 시트, 판정묶음 {adjudication_batch_size}건)"
+        )
+
+        for sheet_index, sheet_key in enumerate(target_sheets, start=1):
+            sheet_name = config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key)
+            sheet_pages = routed.get(sheet_key, [])
+            if not sheet_pages:
+                self._stats["sheets"][sheet_key] = {"batches": 0, "candidates": 0, "adjudicated": 0, "merged": 0}
+                emit(f"[에이전트3c 보조검수] ({sheet_index}/{len(target_sheets)}) {sheet_name}: 후보 페이지 없음")
+                continue
+
+            batches = _select_evenly(_chunks(sheet_pages, batch_size), max_batches)
+            emit(
+                f"[에이전트3c 보조검수] ({sheet_index}/{len(target_sheets)}) {sheet_name}: "
+                f"{len(sheet_pages)}페이지, {len(batches)}배치 후보탐색"
+            )
+
+            sheet_candidates: list[dict] = []
+            for batch_num, batch in enumerate(batches, start=1):
+                page_nums = [page.page_number for page in batch]
+                page_range = f"p{page_nums[0]}~{page_nums[-1]}" if len(page_nums) > 1 else f"p{page_nums[0]}"
+                batch_items = self._review_batch(
+                    municipality=municipality,
+                    sheet_key=sheet_key,
+                    batch=batch,
+                    final_data=final_data,
+                    extraction_prompts=extraction_prompts,
+                )
+                added = 0
+                for item in batch_items:
+                    if not isinstance(item, dict):
+                        continue
+                    row = self._normalize_candidate(item, municipality, sheet_key, page_range)
+                    dedup_key = (row["대상시트"], row["후보유형"], row["후보행JSON"])
+                    if dedup_key in seen:
+                        continue
+                    seen.add(dedup_key)
+                    self._candidates.append(row)
+                    review_candidates.append(row)
+                    sheet_candidates.append(row)
+                    added += 1
+                emit(
+                    f"  - {sheet_name} 후보탐색 {batch_num}/{len(batches)} "
+                    f"({page_range}): 신규 {added}건"
+                )
+
+            sheet_merged_before = self._stats["adjudication"]["merged"]
+            sheet_checked_before = self._stats["adjudication"]["checked"]
+            self._stats["sheets"][sheet_key] = {
+                "batches": len(batches),
+                "candidates": len(sheet_candidates),
+                "adjudicated": 0,
+                "merged": 0,
+            }
+
+            if not sheet_candidates:
+                emit(f"[에이전트3d 후보판정] {sheet_name}: 후보 없음")
+                continue
+            if not adjudication_enabled:
+                emit(f"[에이전트3d 후보판정] {sheet_name}: 후보판정 비활성, {len(sheet_candidates)}건 로그만 기록")
+                continue
+            if not adjudication_available:
+                skipped = self._stats["adjudication"].get("skipped", "판정 백엔드 사용 불가")
+                emit(f"[에이전트3d 후보판정] {sheet_name}: {skipped}")
+                continue
+
+            remaining_allowed = None if max_candidates <= 0 else max_candidates - adjudicated_total
+            if remaining_allowed is not None and remaining_allowed <= 0:
+                emit(f"[에이전트3d 후보판정] {sheet_name}: 전역 판정 상한 {max_candidates}건 도달")
+                continue
+            target_candidates_for_sheet = (
+                sheet_candidates
+                if remaining_allowed is None
+                else sheet_candidates[:remaining_allowed]
+            )
+            prepared_candidates = [
+                prepared for idx, candidate in enumerate(target_candidates_for_sheet, start=1)
+                if (prepared := self._prepare_candidate_for_adjudication(
+                    candidate=candidate,
+                    candidate_id=f"{sheet_key}-{idx}",
+                    pages_by_num=pages_by_num,
+                    table_index=table_index,
+                ))
+            ]
+
+            adjudication_chunks = _chunks(prepared_candidates, adjudication_batch_size)
+            emit(
+                f"[에이전트3d 후보판정] {sheet_name}: 후보 {len(prepared_candidates)}건, "
+                f"{len(adjudication_chunks)}묶음 판정"
+            )
+            for chunk_num, prepared_chunk in enumerate(adjudication_chunks, start=1):
+                before = dict(self._stats["adjudication"])
+                adjudications = self._adjudicate_candidate_batch(
+                    municipality=municipality,
+                    sheet_key=sheet_key,
+                    prepared_candidates=prepared_chunk,
+                    final_data=final_data,
+                )
+                for prepared in prepared_chunk:
+                    candidate_id = str(prepared["candidate_id"])
+                    adjudication = adjudications.get(candidate_id) or _default_adjudication(
+                        "묶음 판정 결과에서 candidate_id를 찾지 못했습니다.",
+                        "판정누락",
+                    )
+                    merge_log.append(self._apply_adjudication(
+                        municipality=municipality,
+                        prepared=prepared,
+                        adjudication=adjudication,
+                        final_data=final_data,
+                    ))
+                adjudicated_total += len(prepared_chunk)
+                after = self._stats["adjudication"]
+                emit(
+                    f"  - {sheet_name} 후보판정 {chunk_num}/{len(adjudication_chunks)}: "
+                    f"checked +{after['checked'] - before.get('checked', 0)}, "
+                    f"accept +{after['accepted'] - before.get('accepted', 0)}, "
+                    f"fix +{after['fixed'] - before.get('fixed', 0)}, "
+                    f"reject +{after['rejected'] - before.get('rejected', 0)}, "
+                    f"needs_human +{after['needs_human'] - before.get('needs_human', 0)}, "
+                    f"merge +{after['merged'] - before.get('merged', 0)}"
+                )
+
+            self._stats["sheets"][sheet_key]["adjudicated"] = (
+                self._stats["adjudication"]["checked"] - sheet_checked_before
+            )
+            self._stats["sheets"][sheet_key]["merged"] = (
+                self._stats["adjudication"]["merged"] - sheet_merged_before
+            )
+            emit(
+                f"[에이전트3c 보조검수] {sheet_name} 완료: "
+                f"후보 {len(sheet_candidates)}건, "
+                f"판정 {self._stats['sheets'][sheet_key]['adjudicated']}건, "
+                f"병합 {self._stats['sheets'][sheet_key]['merged']}건"
+            )
+
+        return final_data, review_candidates, merge_log
 
     def report(self) -> str:
         if self._stats.get("skipped"):
             return f"[에이전트3c 보조검수] 건너뜀: {self._stats['skipped']}"
         sheet_bits = []
         for sheet_key, stat in self._stats.get("sheets", {}).items():
-            sheet_bits.append(f"{sheet_key}: {stat.get('batches', 0)}배치/{stat.get('candidates', 0)}후보")
+            extra = ""
+            if "adjudicated" in stat or "merged" in stat:
+                extra = f"/{stat.get('adjudicated', 0)}판정/{stat.get('merged', 0)}병합"
+            sheet_bits.append(
+                f"{sheet_key}: {stat.get('batches', 0)}배치/{stat.get('candidates', 0)}후보{extra}"
+            )
         return (
             "[에이전트3c 보조검수] 완료\n"
             f"  - 백엔드: {self._stats.get('provider')} ({self._stats.get('model') or '기본 모델'})\n"
