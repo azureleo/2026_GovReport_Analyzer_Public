@@ -207,7 +207,7 @@ py main.py "서울특별시_탄소중립계획.pdf" --full-scan -o "서울_결�
 
 ### 보조 모델 검수
 
-기본 추출본을 만든 뒤 고위험 시트만 보조 모델로 다시 검수합니다. 기본값에서는 후보를 본 시트에 자동 병합하지 않고 `17_보조검수후보`, `18_보조병합로그`에 남깁니다.
+기본 추출본을 만든 뒤 고위험 시트만 보조 모델로 다시 검수합니다. 기본값에서는 시트마다 `후보 탐색 → 묶음 판정 → 즉시 병합 로그 기록`을 끝내고 다음 시트로 넘어가므로, 장시간 실행 중에도 시트/배치별 진행 상황을 바로 볼 수 있습니다. 후보는 본 시트에 자동 병합하지 않고 `17_보조검수후보`, `18_보조병합로그`에 남깁니다.
 
 ```powershell
 py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model gpt-5.4-mini --hybrid-review -o "서울_결과.xlsx"
@@ -218,6 +218,8 @@ py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model
 ```powershell
 py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model gpt-5.4-mini --hybrid-review --hybrid-auto-merge -o "서울_결과.xlsx"
 ```
+
+기존처럼 전체 후보를 먼저 모은 뒤 단건 판정하려면 회귀 확인용으로 `--legacy-hybrid-flow`를 사용합니다. 하이브리드 검수·판정 백엔드는 `gemini` 외에 설치된 `codex`, `claude`, `auto`도 지정할 수 있습니다.
 
 ## 주요 옵션
 
@@ -239,6 +241,8 @@ py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model
 | `--hybrid-review-max-batches` | 보조 검수 시 시트당 최대 배치 수 |
 | `--hybrid-adjudication-model` | 보조 후보 판정 모델 |
 | `--hybrid-adjudication-max-candidates` | 판정 후보 최대 개수. `0`이면 전체 |
+| `--hybrid-adjudication-batch-size` | 시트 단위 후보판정 묶음 크기 |
+| `--legacy-hybrid-flow` | 기존 전체 후보 수집 후 판정 방식 사용 |
 | `--no-hybrid-adjudication` | 후보 판정 생략 |
 | `--hybrid-auto-merge` | 안전 조건을 통과한 후보를 본 시트에 자동 병합 |
 
@@ -261,6 +265,10 @@ py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model
 | `PROVENANCE_ENABLED` | `True` | 본문 시트에 `출처페이지` 컬럼 추가 |
 | `MAX_IMAGES` | `None` | 기본은 triage 통과 이미지 전수 분석 |
 | `HYBRID_REVIEW_ENABLED` | `False` | 보조 모델 검수 기본 비활성 |
+| `HYBRID_SHEETWISE_FLOW_ENABLED` | `True` | 시트 단위 후보 탐색·묶음 판정 흐름 |
+| `HYBRID_PROGRESS_LOG_ENABLED` | `True` | 시트/배치별 하이브리드 진행 로그 출력 |
+| `HYBRID_ADJUDICATION_BATCH_SIZE` | `6` | 후보판정 1회 호출에 묶을 후보 수 |
+| `HYBRID_ADJUDICATION_CONTEXT_CHARS` | `8000` | 묶음 판정 후보당 원문 문맥 길이 |
 | `HYBRID_AUTO_MERGE_ENABLED` | `False` | 보조 후보 자동 병합 기본 비활성 |
 | `EXTRACTION_SHEET_CLUSTERING` | `False` | 시트 클러스터링 추출 opt-in |
 | `ROUTE_DROP_UBIQUITOUS_STRONG` | `False` | strong 키워드 라우팅 샤프닝 opt-in |
