@@ -353,6 +353,31 @@ class LLMClientTests(unittest.TestCase):
         self.assertEqual(result, '{"ok": true}')
         self.assertEqual(calls, {"run": 1, "sleep": 0})
 
+    def test_run_command_decodes_subprocess_output_with_utf8_replacement(self):
+        captured = {}
+
+        class Completed:
+            returncode = 0
+            stdout = '{"ok": true}'
+            stderr = ""
+
+        original_run = llm_client.subprocess.run
+
+        def fake_run(command, **kwargs):
+            captured.update(kwargs)
+            return Completed()
+
+        try:
+            llm_client.subprocess.run = fake_run
+
+            result = llm_client._run_command(["fake"], "프롬프트", cwd=Path("."), timeout=5)
+        finally:
+            llm_client.subprocess.run = original_run
+
+        self.assertEqual(result, '{"ok": true}')
+        self.assertEqual(captured["encoding"], "utf-8")
+        self.assertEqual(captured["errors"], "replace")
+
     def test_gemini_vision_batch_uses_batch_call(self):
         calls = []
         original = llm_client._call_gemini_vision_batch

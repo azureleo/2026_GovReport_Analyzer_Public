@@ -60,6 +60,23 @@ def check_dependencies():
         sys.exit(1)
 
 
+def _configure_stdio_errors() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(errors="replace")
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("1 이상이어야 합니다") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("1 이상이어야 합니다")
+    return parsed
+
+
 def _verify_output_path_writable(output_path: Path) -> bool:
     probe_path: Path | None = None
     try:
@@ -88,6 +105,8 @@ def _verify_output_path_writable(output_path: Path) -> bool:
 
 
 def main():
+    _configure_stdio_errors()
+
     parser = argparse.ArgumentParser(
         description="지자체 탄소중립 기본계획 문서(PDF/HWP/HWPX) → 엑셀 정보 추출 시스템",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -122,7 +141,7 @@ def main():
         "--agent-timeout",
         type=int,
         default=None,
-        help="로컬 에이전트 1회 호출 제한 시간(초, 기본값: 900)",
+        help="로컬 에이전트 1회 호출 제한 시간(초, 기본값: 300)",
     )
     parser.add_argument(
         "--api-key", "-k",
@@ -131,7 +150,7 @@ def main():
     )
     parser.add_argument(
         "--retries", "-r",
-        type=int,
+        type=_positive_int,
         default=2,
         help="품질 미달 시 재시도 횟수 (기본값: 2)",
     )

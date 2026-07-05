@@ -220,41 +220,44 @@ def extract_pdf(
     """
     pdf_path = Path(pdf_path)
     doc = fitz.open(str(pdf_path))
+    try:
+        if doc.needs_pass:
+            raise RuntimeError("암호로 보호된 PDF입니다. 암호를 해제한 사본으로 다시 실행하세요")
 
-    pages: list[PageContent] = []
-    all_texts: list[str] = []
+        pages: list[PageContent] = []
+        all_texts: list[str] = []
 
-    for page_num in range(len(doc)):
-        page = doc[page_num]
+        for page_num in range(len(doc)):
+            page = doc[page_num]
 
-        # 텍스트 추출
-        text = page.get_text("text", sort=True)
-        all_texts.append(f"[페이지 {page_num + 1}]\n{text}")
+            # 텍스트 추출
+            text = page.get_text("text", sort=True)
+            all_texts.append(f"[페이지 {page_num + 1}]\n{text}")
 
-        # 표 추출
-        tables = _extract_tables_from_page(page)
+            # 표 추출
+            tables = _extract_tables_from_page(page)
 
-        # 이미지 추출 (embedded images)
-        images = _extract_images_from_page(page, doc)
+            # 이미지 추출 (embedded images)
+            images = _extract_images_from_page(page, doc)
 
-        # 그래프가 있을 법한 페이지는 전체 렌더링 추가.
-        # (1) 텍스트에 그래프/차트 키워드가 있거나, (2) 표·임베드이미지가 없는데 벡터 path가
-        # 많아 벡터 차트로 추정되는 페이지(키워드가 없어 누락되던 케이스)를 잡는다.
-        if render_graph_pages and (
-            _has_graph_keywords(text) or _is_vector_chart_page(page, tables, images)
-        ):
-            rendered = _render_page_as_image(page)
-            # 이미 embedded image가 없거나, rendered 페이지가 더 풍부한 경우 추가
-            images.append(rendered)
+            # 그래프가 있을 법한 페이지는 전체 렌더링 추가.
+            # (1) 텍스트에 그래프/차트 키워드가 있거나, (2) 표·임베드이미지가 없는데 벡터 path가
+            # 많아 벡터 차트로 추정되는 페이지(키워드가 없어 누락되던 케이스)를 잡는다.
+            if render_graph_pages and (
+                _has_graph_keywords(text) or _is_vector_chart_page(page, tables, images)
+            ):
+                rendered = _render_page_as_image(page)
+                # 이미 embedded image가 없거나, rendered 페이지가 더 풍부한 경우 추가
+                images.append(rendered)
 
-        pages.append(PageContent(
-            page_number=page_num + 1,
-            text=text,
-            tables=tables,
-            images=images,
-        ))
-
-    doc.close()
+            pages.append(PageContent(
+                page_number=page_num + 1,
+                text=text,
+                tables=tables,
+                images=images,
+            ))
+    finally:
+        doc.close()
 
     return PDFContent(
         total_pages=len(pages),

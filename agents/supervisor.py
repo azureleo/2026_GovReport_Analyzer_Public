@@ -103,6 +103,10 @@ def _quality_score(final_data: dict) -> tuple[float, list[str]]:
     return max(0.0, score), issues
 
 
+def _document_text_chars(pdf_content: PDFContent) -> int:
+    return len("".join(page.text or "" for page in pdf_content.pages).strip())
+
+
 class Supervisor:
     """에이전트 5: 감독·검수 에이전트"""
 
@@ -118,6 +122,22 @@ class Supervisor:
 
     def _add_timing(self, label: str, elapsed: float):
         self._timings[label] = self._timings.get(label, 0.0) + elapsed
+
+    def _append_text_layer_warning(self, final_data: dict) -> None:
+        report = final_data.setdefault("validation_report", [])
+        if not isinstance(report, list):
+            return
+        if any(isinstance(row, dict) and row.get("항목") == "텍스트 레이어 부족" for row in report):
+            return
+        municipality = final_data.get("municipality_name", "알 수 없음")
+        report.append({
+            "지자체명": municipality,
+            "심각도": "정보",
+            "영역": "문서파싱",
+            "항목": "텍스트 레이어 부족",
+            "문제내용": "텍스트 레이어가 거의 없습니다 — 스캔본 PDF일 수 있으며 추출 결과가 비어 있을 수 있습니다",
+            "권장조치": "OCR 또는 텍스트 레이어가 있는 PDF로 다시 실행 후 결과를 비교",
+        })
 
     def _log_timing_summary(self, total_elapsed: float):
         self._log("\n[감독관] 단계별 소요 시간")
@@ -318,6 +338,9 @@ class Supervisor:
         elapsed = time.time() - t0
         self._add_timing("문서 파싱", elapsed)
         self._log(f"[감독관] {file_type} 파싱 완료: {pdf_content.total_pages}페이지 ({elapsed:.1f}초)")
+        text_layer_warning = _document_text_chars(pdf_content) < int(getattr(config, "MIN_DOCUMENT_TEXT_CHARS", 500))
+        if text_layer_warning:
+            self._log("[감독관] 경고: 텍스트 레이어가 거의 없습니다 — 스캔본 PDF일 수 있으며 추출 결과가 비어 있을 수 있습니다")
         prior_plan_pages = detect_prior_plan_pages(pdf_content.pages)
         if prior_plan_pages:
             self._log(
@@ -441,6 +464,9 @@ class Supervisor:
                     self._add_timing("정리·정제", elapsed)
                     self._log(f"[감독관] 빈칸 보완 후 재정제 완료: {elapsed:.1f}초")
 
+            if text_layer_warning:
+                self._append_text_layer_warning(final_data)
+
             if closed_loop_candidates:
                 final_data.setdefault("hybrid_review_candidates", []).extend(closed_loop_candidates)
             if closed_loop_merge_log:
@@ -563,14 +589,21 @@ class Supervisor:
         # LLM 최종 검수
         self._log("\n[감독관] LLM 최종 품질 검수 중...")
         t0 = time.time()
-        review = self._llm_quality_review(final_data)
-        elapsed = time.time() - t0
-        self._add_timing("LLM 최종 검수", elapsed)
-        self._log(f"[감독관] 검수 결과: {review.get('quality_level', '?')}")
-        self._log(f"  평가: {review.get('assessment', '')}")
-        if review.get("key_issues"):
-            self._log(f"  주요 이슈: {', '.join(review.get('key_issues', []))}")
-        self._log(f"[감독관] LLM 최종 검수 완료: {elapsed:.1f}초")
+        try:
+            review = self._llm_quality_review(final_data)
+        except llm_client.LLMQuotaExceededError as exc:
+            elapsed = time.time() - t0
+            self._add_timing("LLM 최종 검수", elapsed)
+            logger.warning("저장 후 LLM 최종 검수 quota/한도 문제로 생략: %s", exc)
+            self._log(f"한도 초과로 최종 검수는 생략했습니다. 결과 파일은 저장되어 있습니다: {result_path}")
+        else:
+            elapsed = time.time() - t0
+            self._add_timing("LLM 최종 검수", elapsed)
+            self._log(f"[감독관] 검수 결과: {review.get('quality_level', '?')}")
+            self._log(f"  평가: {review.get('assessment', '')}")
+            if review.get("key_issues"):
+                self._log(f"  주요 이슈: {', '.join(review.get('key_issues', []))}")
+            self._log(f"[감독관] LLM 최종 검수 완료: {elapsed:.1f}초")
 
         self._log("\n" + "=" * 60)
         self._log("[감독관] 파이프라인 완료")

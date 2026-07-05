@@ -288,6 +288,8 @@ def _run_command(command: Sequence[str], prompt: str, *, cwd: Path, timeout: int
         list(command),
         input=prompt,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         cwd=str(cwd),
         timeout=timeout,
@@ -313,7 +315,7 @@ def _run_codex(
     cwd: Path,
     model: str | None = None,
 ) -> str:
-    timeout = int(getattr(config, "LOCAL_AGENT_TIMEOUT", 900))
+    timeout = int(getattr(config, "LOCAL_AGENT_TIMEOUT", 300))
     command = _split_command(getattr(config, "CODEX_COMMAND", "codex"))
 
     with tempfile.TemporaryDirectory(prefix="carbon-codex-") as tmpdir:
@@ -384,7 +386,7 @@ def _run_claude(
 ) -> str:
     # Claude Code는 버전별 CLI 옵션 차이가 있어 가장 보편적인 print 모드를 사용한다.
     # 이미지가 있으면 prompt에 cwd 내부 임시 파일 경로가 포함되어 Claude가 읽을 수 있다.
-    timeout = int(getattr(config, "LOCAL_AGENT_TIMEOUT", 900))
+    timeout = int(getattr(config, "LOCAL_AGENT_TIMEOUT", 300))
     base_command = _split_command(getattr(config, "CLAUDE_COMMAND", "claude"))
     paths = list(image_paths or [])
     command = [*base_command, "-p", "--output-format", "text"]
