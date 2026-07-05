@@ -20,6 +20,7 @@ import argparse
 import logging
 import os
 import sys
+import tempfile
 from pathlib import Path
 from datetime import datetime
 
@@ -57,6 +58,33 @@ def check_dependencies():
         print(f"[오류] 필수 패키지가 설치되지 않았습니다: {', '.join(missing)}")
         print(f"  설치 방법: pip install {' '.join(missing)}")
         sys.exit(1)
+
+
+def _verify_output_path_writable(output_path: Path) -> bool:
+    probe_path: Path | None = None
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            dir=output_path.parent,
+            delete=False,
+        ) as probe:
+            probe.write("")
+            probe_path = Path(probe.name)
+        probe_path.unlink(missing_ok=True)
+        return True
+    except OSError as exc:
+        if probe_path is not None:
+            try:
+                probe_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        print(f"[오류] 출력 경로를 쓸 수 없습니다: {output_path}")
+        print(f"  상세: {exc}")
+        return False
 
 
 def main():
@@ -292,6 +320,9 @@ def main():
     else:
         date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = input_path.parent / f"탄소중립_추출결과_{date_str}.xlsx"
+
+    if not _verify_output_path_writable(output_path):
+        return 1
 
     # 이미지 분석 설정 override
     if args.no_images:

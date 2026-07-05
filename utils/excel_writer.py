@@ -4,6 +4,7 @@
 carbon_guideline.md 기반 16개 시트 구조의 Excel 파일을 생성합니다.
 """
 
+from datetime import datetime
 from pathlib import Path
 
 import openpyxl
@@ -71,6 +72,12 @@ def _auto_column_widths(ws, min_width: float = 10, max_width: float = 45):
             except Exception:
                 pass
         ws.column_dimensions[col_letter].width = max(min(max_len * 1.3 + 2, max_width), min_width)
+
+
+def _fallback_output_path(output_path: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = output_path.suffix or ".xlsx"
+    return output_path.with_name(f"{output_path.stem}_{timestamp}{suffix}")
 
 
 def _write_generic_sheet(ws, headers: list[str], data: list[dict]):
@@ -141,5 +148,11 @@ def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
         ws = wb.create_sheet(sheet_name)
         _write_generic_sheet(ws, _headers_for_output(sheet_name, headers), data)
 
-    wb.save(str(output_path))
-    return output_path
+    try:
+        wb.save(str(output_path))
+        return output_path
+    except (PermissionError, OSError):
+        fallback_path = _fallback_output_path(output_path)
+        wb.save(str(fallback_path))
+        print(f"원본 경로가 잠겨 있어 대체 경로에 저장했습니다: {fallback_path}")
+        return fallback_path
