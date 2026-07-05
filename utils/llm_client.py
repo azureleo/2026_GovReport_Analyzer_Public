@@ -419,7 +419,9 @@ def _call_local_agent(
     images = list(images_b64 or ([] if image_b64 is None else [image_b64]))
     # 호출마다 깨끗한 작업 디렉터리를 쓴다. 프로젝트 CLAUDE.md/AGENTS.md 자동 로드를
     # 막고, 이미지는 이 디렉터리 안에 기록해 에이전트가 cwd 내부에서 읽게 한다.
-    with tempfile.TemporaryDirectory(prefix="carbon-agent-") as workdir_name:
+    # Codex/Claude 종료 직후 훅이 .omx 같은 상태 디렉터리를 늦게 쓸 수 있어,
+    # 정리 경합은 성공 응답을 버리는 호출 실패로 취급하지 않는다.
+    with tempfile.TemporaryDirectory(prefix="carbon-agent-", ignore_cleanup_errors=True) as workdir_name:
         workdir = Path(workdir_name)
         image_paths: list[Path] = []
         for idx, image in enumerate(images, start=1):

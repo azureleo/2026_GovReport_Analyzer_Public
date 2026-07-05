@@ -311,6 +311,48 @@ class LLMClientTests(unittest.TestCase):
             with self.assertRaises(llm_client.LLMQuotaExceededError):
                 llm_client.call_text('{"answer": true}', system="system", max_retries=3)
 
+    def test_local_agent_cleanup_race_keeps_successful_response_without_retry(self):
+        calls = {"run": 0, "sleep": 0}
+
+        class RacingTemporaryDirectory:
+            def __init__(self, prefix="", ignore_cleanup_errors=False):
+                self.ignore_cleanup_errors = ignore_cleanup_errors
+                self.path = Path(tempfile.mkdtemp(prefix=prefix))
+
+            def __enter__(self):
+                return str(self.path)
+
+            def __exit__(self, exc_type, exc, traceback):
+                if self.ignore_cleanup_errors:
+                    return False
+                raise OSError("Directory not empty")
+
+        original_tempdir = llm_client.tempfile.TemporaryDirectory
+        original_run_codex = llm_client._run_codex
+        original_sleep = llm_client.time.sleep
+
+        def fake_run_codex(prompt, *, image_paths=None, cwd, model=None):
+            calls["run"] += 1
+            return '{"ok": true}'
+
+        try:
+            llm_client.tempfile.TemporaryDirectory = RacingTemporaryDirectory
+            llm_client._run_codex = fake_run_codex
+            llm_client.time.sleep = lambda seconds: calls.__setitem__("sleep", calls["sleep"] + 1)
+
+            result = llm_client._retry_local_call(
+                lambda: llm_client._call_local_agent('{"answer": true}', "", provider="codex"),
+                max_retries=3,
+                label="codex",
+            )
+        finally:
+            llm_client.tempfile.TemporaryDirectory = original_tempdir
+            llm_client._run_codex = original_run_codex
+            llm_client.time.sleep = original_sleep
+
+        self.assertEqual(result, '{"ok": true}')
+        self.assertEqual(calls, {"run": 1, "sleep": 0})
+
     def test_gemini_vision_batch_uses_batch_call(self):
         calls = []
         original = llm_client._call_gemini_vision_batch
