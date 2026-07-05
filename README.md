@@ -85,7 +85,21 @@ v4.1에서는 불필요한 재호출을 줄이기 위해 다음 응답도 정상
 - **하이브리드 백엔드 확장**: 검수·판정 백엔드로 `gemini`/`openai` 외에 로컬 `codex`/`claude` CLI와 `auto`를 지정할 수 있습니다. provider와 모델명이 어긋나면(예: codex에 Gemini 모델명) provider 기본 모델로 자동 보정합니다.
 - **버그 수정**: 검수 경로가 존재하지 않는 백엔드 전환 함수를 참조해 `--hybrid-review` 활성 시 실행이 중단되던 문제를 함께 고쳤습니다.
 
-서울 소형 PDF 스모크로 시트 단위 경로와 `--legacy-hybrid-flow` 경로가 같은 판정 결과를 내는 것을 확인했습니다. 시트 폐루프(추출까지 시트 단위로 닫는 실행 경로)는 v5에서 도입 예정입니다(`docs/specs/v5_구현명세서.md` WP8).
+서울 소형 PDF 스모크로 시트 단위 경로와 `--legacy-hybrid-flow` 경로가 같은 판정 결과를 내는 것을 확인했습니다.
+
+## v5에서 달라진 핵심
+
+v5는 가이드라인 충실도와 검수 비용을 함께 다루기 위해 구조적 주입, 단계별 백엔드, 참조 사전, 데이터상태, 장 문맥, 폐루프 실행 경로를 추가했습니다.
+
+- **구조적 가이드라인 주입**: `carbon_guideline.md`의 시트 앵커와 표를 보존해 시트별 프롬프트에 넣습니다. `GUIDELINE_STRUCTURED_INJECTION=0`으로 기존 스니펫 fallback을 비교할 수 있습니다.
+- **단계별 백엔드 오버라이드**: `STAGE_PROVIDER_EXTRACTION`, `STAGE_PROVIDER_VISION`, `STAGE_PROVIDER_GAP_FILL`, `STAGE_PROVIDER_REVIEW`로 추출·비전·보완·검수 백엔드를 분리할 수 있습니다.
+- **타깃 보조검수**: 검증리포트 경고, `conflicting` 행, 선택 시 원장 실패 페이지 인접 행만 검수 대상으로 좁힙니다. `HYBRID_REVIEW_ENABLED` 기본값은 여전히 `False`입니다.
+- **부록 참조 사전과 코드북**: 부록3 감축원단위, 부록4 사업목록 매칭 근거를 본문 행과 `90_코드북`에 남깁니다.
+- **행 단위 데이터상태**: `reported`, `visual_only`, `gap_fill`, `calculated`, `conflicting`으로 사람이 우선 확인할 행을 구분합니다.
+- **장 문맥 프로비넌스**: 기존계획 평가 장에서 온 08/09/10/11 행을 내부적으로 표시해 본계획 사업과 섞이는 위험을 검증리포트에 남깁니다.
+- **시트 폐루프 도입 완료**: 추출까지 시트 단위로 닫는 실행 경로를 v5에서 추가했습니다. 기본 비활성이며 `--sheet-closed-loop`로만 켭니다.
+
+폐루프의 알려진 한계: 이미지 분석과 GapFill 보완은 폐루프 이후 실행되므로, 보조검수가 본 기준본과 이미지·빈칸 보완 이후 최종본이 다를 수 있습니다. 최종 `OrganizerAgent` 검증 패스가 최종본 기준 정합성을 다시 점검하지만, 폐루프 후보·병합 로그를 해석할 때는 이 시점 차이를 감안해야 합니다.
 
 ## 무거운 기능은 기본으로 켜지지 않습니다
 
@@ -96,6 +110,7 @@ v4.1에서는 불필요한 재호출을 줄이기 위해 다음 응답도 정상
 | `EXTRACTION_SHEET_CLUSTERING` | `False` | 여러 시트를 한 번에 추출해 호출 수를 줄이는 opt-in 최적화 |
 | `ROUTE_DROP_UBIQUITOUS_STRONG` | `False` | 문서 전반에 반복되는 strong 키워드까지 라우팅 점수에서 제외하는 실험적 최적화 |
 | `HYBRID_REVIEW_ENABLED` | `False` | 기본 추출 후 보조 모델로 누락/충돌 후보를 검수하는 선택 기능 |
+| `SHEET_CLOSED_LOOP_ENABLED` | `False` | 추출까지 시트 단위로 닫는 v5 폐루프 실행 경로 |
 
 테스트 파일이 늘어난 것은 런타임을 무겁게 만들기 위해서가 아니라, 위 안정성 계약을 깨지 못하게 막기 위한 회귀 테스트입니다. 일반 실행 시 `tests/`는 실행되지 않습니다.
 
@@ -233,6 +248,14 @@ py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model
 
 기존처럼 전체 후보를 먼저 모은 뒤 단건 판정하려면 회귀 확인용으로 `--legacy-hybrid-flow`를 사용합니다. 하이브리드 검수·판정 백엔드는 `gemini` 외에 설치된 `codex`, `claude`, `auto`도 지정할 수 있습니다.
 
+### 시트 폐루프 실행
+
+추출까지 시트 단위로 닫는 v5 폐루프는 실험 경로라 기본값에서는 꺼져 있습니다. 시트별로 `추출 → 정제 → 보조검수·판정`을 완료한 뒤 다음 시트로 넘어가려면 명시적으로 켭니다.
+
+```powershell
+py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid-review -o "서울_폐루프.xlsx"
+```
+
 ## 주요 옵션
 
 | 옵션 | 설명 |
@@ -250,6 +273,7 @@ py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model
 | `--max-images` | Vision 분석 이미지 수를 명시적으로 제한 |
 | `--full-scan` | 시트 라우팅 대신 전체 페이지를 스캔 |
 | `--hybrid-review` | 보조 모델 후보 검수 활성화 |
+| `--sheet-closed-loop` | v5 시트별 추출→정제→검수 폐루프 활성화(기본 비활성) |
 | `--hybrid-review-max-batches` | 보조 검수 시 시트당 최대 배치 수 |
 | `--hybrid-adjudication-model` | 보조 후보 판정 모델 |
 | `--hybrid-adjudication-max-candidates` | 판정 후보 최대 개수. `0`이면 전체 |
@@ -277,6 +301,7 @@ py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model
 | `PROVENANCE_ENABLED` | `True` | 본문 시트에 `출처페이지` 컬럼 추가 |
 | `MAX_IMAGES` | `None` | 기본은 triage 통과 이미지 전수 분석 |
 | `HYBRID_REVIEW_ENABLED` | `False` | 보조 모델 검수 기본 비활성 |
+| `SHEET_CLOSED_LOOP_ENABLED` | `False` | 시트별 추출→정제→검수 폐루프 기본 비활성 |
 | `HYBRID_SHEETWISE_FLOW_ENABLED` | `True` | 시트 단위 후보 탐색·묶음 판정 흐름 |
 | `HYBRID_PROGRESS_LOG_ENABLED` | `True` | 시트/배치별 하이브리드 진행 로그 출력 |
 | `HYBRID_ADJUDICATION_BATCH_SIZE` | `6` | 후보판정 1회 호출에 묶을 후보 수 |
@@ -391,6 +416,7 @@ Codex/Claude 로컬 에이전트에서 quota나 세션 한도가 감지되면 �
 - v4: 부분 실패 허용 병렬 실행, 배치 원장, JSON 재시도, dedup 충돌 리포트, 커버리지 기반 GapFill, 출처페이지, 검증리포트 확장, A/B 하네스, 실행 텔레메트리 도입
 - v4.1: quota 복구 공백 해소, quota 실패 배치 격리, Supervisor 부분 결과 안전망, 스테일 summary 코드 제거, JSON 성공 판정 보정
 - 2026-07-04: 시트 단위 보조검수·묶음 판정 도입(진행 가시성 개선, v3 팀원 개선의 v4 포팅), 하이브리드 백엔드 codex/claude/auto 지원, 검수 경로 백엔드 전환 버그 수정, `--legacy-hybrid-flow` 회귀 경로 추가
+- v5: 구조적 가이드라인 주입, 단계별 백엔드, 타깃 검수, 부록 참조 사전, 데이터상태, 장 문맥 프로비넌스, 시트 폐루프 opt-in 경로 추가
 
 <details>
 <summary><b>이전 버전 업데이트 기록 전문</b> (내용 보존용)</summary>

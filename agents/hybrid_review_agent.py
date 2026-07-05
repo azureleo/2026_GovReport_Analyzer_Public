@@ -651,6 +651,8 @@ class HybridReviewAgent:
 
     def __init__(self):
         self._candidates: list[dict] = []
+        self._last_review_candidates: list[dict] = []
+        self._last_merge_log: list[dict] = []
         self._stats: dict[str, Any] = {
             "enabled": bool(getattr(config, "HYBRID_REVIEW_ENABLED", False)),
             "provider": getattr(config, "HYBRID_REVIEW_PROVIDER", "gemini"),
@@ -1367,6 +1369,7 @@ class HybridReviewAgent:
         progress: Callable[[str], None] | None = None,
         target_sheets: list[str] | None = None,
         routed_pages: dict[str, list[PageContent]] | None = None,
+        max_candidates_override: int | None = None,
     ) -> tuple[dict, list[dict], list[dict]]:
         def emit(message: str) -> None:
             if progress and getattr(config, "HYBRID_PROGRESS_LOG_ENABLED", True):
@@ -1390,12 +1393,19 @@ class HybridReviewAgent:
         adjudication_enabled = getattr(config, "HYBRID_ADJUDICATION_ENABLED", True)
         adjudication_available = self._adjudication_provider_available() if adjudication_enabled else False
         adjudication_batch_size = max(1, int(getattr(config, "HYBRID_ADJUDICATION_BATCH_SIZE", 6)))
-        max_candidates = max(0, getattr(config, "HYBRID_ADJUDICATION_MAX_CANDIDATES", 0))
+        max_candidates_source = (
+            max_candidates_override
+            if max_candidates_override is not None
+            else getattr(config, "HYBRID_ADJUDICATION_MAX_CANDIDATES", 0)
+        )
+        max_candidates = max(0, max_candidates_source)
 
         pages_by_num = {page.page_number: page for page in pages}
         table_index = _build_table_page_index(pages)
         review_candidates: list[dict] = []
         merge_log: list[dict] = []
+        self._last_review_candidates = review_candidates
+        self._last_merge_log = merge_log
         seen: set[tuple[str, str, str]] = set()
         adjudicated_total = 0
 

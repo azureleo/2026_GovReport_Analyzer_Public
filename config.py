@@ -137,6 +137,7 @@ STAGE_MODELS = {
 # 기본값은 비용/시간 보호를 위해 비활성이고, 테스트 시 --hybrid-review 또는
 # HYBRID_REVIEW_ENABLED=1로 켠다. 검수 결과는 자동 병합하지 않고 별도 후보 시트에 남긴다.
 HYBRID_REVIEW_ENABLED = _env_bool("HYBRID_REVIEW_ENABLED", False)
+SHEET_CLOSED_LOOP_ENABLED = _env_bool("SHEET_CLOSED_LOOP_ENABLED", False)
 HYBRID_REVIEW_PROVIDER = os.environ.get("HYBRID_REVIEW_PROVIDER", "gemini").strip().lower()
 HYBRID_REVIEW_MODEL = os.environ.get("HYBRID_REVIEW_MODEL", MODEL).strip()
 HYBRID_REVIEW_TARGETED = _env_bool("HYBRID_REVIEW_TARGETED", True)

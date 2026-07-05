@@ -4,6 +4,7 @@
 carbon_guideline.md 기반 16개 시트 구조에 맞춰 문서를 추출합니다.
 시트별로 관련 페이지를 라우팅하고, 배치 단위로 LLM에 전달합니다.
 """
+# noqa: SIZE_OK — 16개 시트 추출 프롬프트·라우팅 계약을 보존하는 기존 모놀리식 extractor. WP8은 공개 래퍼만 추가.
 
 import logging
 import re
@@ -931,6 +932,74 @@ class ExtractorAgent:
                 f"  [{label}] 배치 {task['batch_num']:>2}/{task['batch_total']} "
                 f"({task['page_range']}): {status}"
             )
+
+    def route_pages(self, pages: list[PageContent]) -> dict[str, list[PageContent]]:
+        if getattr(config, "FULL_DOCUMENT_SCAN", False):
+            routed = {key: list(pages) for key in _SHEET_CONFIGS}
+        else:
+            routed = _route_pages_by_sheet(pages)
+        self.routed_page_nums = {
+            key: {page.page_number for page in value}
+            for key, value in routed.items()
+            if value
+        }
+        return routed
+
+    def extract_sheet_pages(
+        self,
+        sheet_key: str,
+        sheet_pages: list[PageContent],
+        municipality: str,
+        extraction_prompts: dict[str, str],
+        batch_size: int = config.BATCH_SIZE,
+    ) -> list[dict]:
+        """
+        한 시트의 라우팅 페이지를 배치 단위로 병렬 추출한다.
+
+        기존 extract()의 (시트, 배치) 태스크 의미론을 시트 하나로 좁힌 공개 메서드이며,
+        성공·파싱실패 원장은 _extract_sheet, 호출실패 원장은 이 메서드가 기록한다.
+        기존 extract()는 이 메서드를 재사용하지 않고 병렬 전체 추출 경로로 분리 유지한다.
+        """
+        if not sheet_pages:
+            return []
+        batches = _build_semantic_batches(sheet_pages, batch_size)
+        tasks: list[dict] = []
+        for batch_num, batch in enumerate(batches, start=1):
+            page_nums = [page.page_number for page in batch]
+            tasks.append({
+                "sheet_key": sheet_key,
+                "batch_text": _build_page_text(batch),
+                "guideline_prompt": extraction_prompts.get(sheet_key, ""),
+                "batch_num": batch_num,
+                "batch_total": len(batches),
+                "page_range": _page_range_label(page_nums),
+                "page_nums": page_nums,
+            })
+
+        rows_for_sheet: list[dict] = []
+        results = parallel_map_collect(
+            lambda task: self._extract_sheet(
+                task["sheet_key"],
+                task["batch_text"],
+                municipality,
+                task["guideline_prompt"],
+            ),
+            tasks,
+            workers=getattr(config, "TEXT_WORKERS", 4),
+        )
+        for task, (items, err) in zip(tasks, results):
+            if err is not None:
+                self._record_call_failure(task, err)
+                continue
+            rows = [row for row in (items or []) if isinstance(row, dict)]
+            rows_for_sheet.extend(rows)
+            self._raw_results[sheet_key].extend(rows)
+            status = f"{len(rows)}건" if rows else "추출 없음"
+            print(
+                f"  [{sheet_key}] 배치 {task['batch_num']:>2}/{task['batch_total']} "
+                f"({task['page_range']}): {status}"
+            )
+        return rows_for_sheet
 
     def extract(
         self,

@@ -14,6 +14,7 @@ LLM 기반 지자체 탄소중립 계획 정보 추출 시스템
     python main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model gpt-5.4-mini
     python main.py "서울특별시_탄소중립계획.pdf" --agent claude
 """
+# noqa: SIZE_OK — CLI 옵션·환경 오버라이드·실행 헤더를 한 진입점에 유지하는 기존 main.
 
 import argparse
 import logging
@@ -133,6 +134,11 @@ def main():
         help="기본 추출 후 보조 모델(Gemini 기본값)로 고위험 시트 누락 후보를 별도 검수",
     )
     parser.add_argument(
+        "--sheet-closed-loop",
+        action="store_true",
+        help="시트별 추출→정제→검수 폐루프 실행 경로 사용 (실험적, 기본 비활성)",
+    )
+    parser.add_argument(
         "--hybrid-review-max-batches",
         type=int,
         default=None,
@@ -196,6 +202,8 @@ def main():
         os.environ.setdefault("MAX_IMAGES", "0")
     if args.hybrid_review:
         os.environ["HYBRID_REVIEW_ENABLED"] = "1"
+    if args.sheet_closed_loop:
+        os.environ["SHEET_CLOSED_LOOP_ENABLED"] = "1"
     if args.hybrid_review_max_batches is not None:
         os.environ["HYBRID_REVIEW_MAX_BATCHES_PER_SHEET"] = str(args.hybrid_review_max_batches)
     if args.hybrid_adjudication_model:
@@ -315,6 +323,7 @@ def main():
         print(f"  이미지 배치 크기: {config.IMAGE_ANALYSIS_BATCH_SIZE}")
     print(f"  LLM 캐시: {'활성' if config.LLM_CACHE_ENABLED else '비활성'}")
     print(f"  라우팅 샤프닝: {'활성' if config.ROUTE_DROP_UBIQUITOUS_WEAK else '비활성'}")
+    print(f"  시트별 폐루프: {'활성' if config.SHEET_CLOSED_LOOP_ENABLED else '비활성'}")
     print(f"  보조 모델 검수: {'활성' if config.HYBRID_REVIEW_ENABLED else '비활성'}")
     if config.HYBRID_REVIEW_ENABLED:
         print(f"  보조 검수 백엔드: {config.HYBRID_REVIEW_PROVIDER}")

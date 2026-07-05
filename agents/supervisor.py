@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 import config
-from utils.pdf_reader import extract_pdf, PDFContent
+from utils.pdf_reader import extract_pdf, PDFContent, PageContent
 from utils.hwp_reader import extract_hwp, is_hwp_file
 from utils import llm_cache, llm_client
 from agents.guideline_agent import GuidelineAgent
@@ -180,6 +180,105 @@ class Supervisor:
             }
         return llm_client.parse_json(resp)
 
+    def _run_sheet_closed_loop(
+        self,
+        *,
+        pages: list[PageContent],
+        full_text: str,
+        extraction_prompts: dict[str, str],
+    ) -> tuple[dict, ExtractorAgent, list[dict], list[dict]]:
+        """
+        시트별 추출·정제·검수 폐루프.
+
+        이미지 분석과 빈칸 보완은 이 폐루프 이후 실행되므로 보조검수가 본 기준본과
+        최종본은 다를 수 있다. 최종 organize 검증 패스가 최종본 기준 정합성을 다시 점검한다.
+        """
+        extractor = ExtractorAgent()
+        organizer = OrganizerAgent()
+        hybrid_agent = HybridReviewAgent() if getattr(config, "HYBRID_REVIEW_ENABLED", False) else None
+        municipality = extractor._extract_municipality_name(full_text)
+        raw_data: dict = {"municipality_name": municipality}
+        review_candidates: list[dict] = []
+        merge_log: list[dict] = []
+
+        self._log(f"[감독관] 시트별 폐루프 지자체명: {municipality}")
+        routed_pages = extractor.route_pages(pages)
+        route_summary = {key: len(value) for key, value in routed_pages.items() if value}
+        self._log(f"[감독관] 시트별 폐루프 라우팅 완료: {route_summary}")
+
+        review_sheets = set(getattr(config, "HYBRID_REVIEW_SHEETS", []))
+        review_enabled = bool(hybrid_agent)
+        adjudication_limit = max(0, getattr(config, "HYBRID_ADJUDICATION_MAX_CANDIDATES", 0))
+        remaining_candidates: int | None = None if adjudication_limit <= 0 else adjudication_limit
+
+        for sheet_key in config.EXTRACTION_SHEETS:
+            sheet_pages = routed_pages.get(sheet_key, [])
+            if not sheet_pages:
+                continue
+            sheet_name = config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key)
+            self._log(f"[감독관] 폐루프 {sheet_name}: 추출→정제 시작")
+            try:
+                rows = extractor.extract_sheet_pages(
+                    sheet_key,
+                    sheet_pages,
+                    municipality,
+                    extraction_prompts,
+                )
+            except llm_client.LLMQuotaExceededError as exc:
+                logger.warning("시트별 폐루프 추출 quota/한도 문제로 부분 결과를 보존하고 종료: %s", exc)
+                self._log(f"[감독관] 폐루프 {sheet_name}: 추출 quota 발생, 완료 시트만 보존")
+                break
+            raw_data[sheet_key] = organizer.organize_sheet(sheet_key, rows, municipality)
+
+            if not review_enabled or sheet_key not in review_sheets:
+                continue
+            if remaining_candidates is not None and remaining_candidates <= 0:
+                self._log(f"[감독관] 폐루프 {sheet_name}: 전역 판정 상한 도달로 검수 건너뜀")
+                continue
+
+            sheet_basis = {
+                "municipality_name": municipality,
+                sheet_key: [dict(row) for row in raw_data.get(sheet_key, []) if isinstance(row, dict)],
+            }
+            try:
+                reviewed_data, sheet_candidates, sheet_merge_log = hybrid_agent.review_and_adjudicate_by_sheet(
+                    pages=pages,
+                    final_data=sheet_basis,
+                    extraction_prompts=extraction_prompts,
+                    progress=self._log,
+                    target_sheets=[sheet_key],
+                    routed_pages={sheet_key: sheet_pages},
+                    max_candidates_override=remaining_candidates,
+                )
+            except llm_client.LLMQuotaExceededError as exc:
+                sheet_candidates = list(getattr(hybrid_agent, "_last_review_candidates", []))
+                sheet_merge_log = list(getattr(hybrid_agent, "_last_merge_log", []))
+                review_candidates.extend(sheet_candidates)
+                merge_log.extend(sheet_merge_log)
+                if isinstance(sheet_basis.get(sheet_key), list):
+                    raw_data[sheet_key] = sheet_basis[sheet_key]
+                review_enabled = False
+                logger.warning("시트별 폐루프 검수 quota/한도 문제로 남은 시트 검수 건너뜀: %s", exc)
+                self._log(f"[감독관] 폐루프 {sheet_name}: quota 발생, 남은 시트 검수 비활성")
+                continue
+
+            review_candidates.extend(sheet_candidates)
+            merge_log.extend(sheet_merge_log)
+            if remaining_candidates is not None:
+                remaining_candidates = max(0, remaining_candidates - len(sheet_merge_log))
+
+            sheet_rows = reviewed_data.get(sheet_key, [])
+            if isinstance(sheet_rows, list):
+                raw_data[sheet_key] = [dict(row) for row in sheet_rows if isinstance(row, dict)]
+            if any(row.get("최종반영여부") == "반영" for row in sheet_merge_log):
+                raw_data[sheet_key] = organizer.organize_sheet(sheet_key, raw_data[sheet_key], municipality)
+                reconcile_reflected_merge_log(
+                    {"municipality_name": municipality, sheet_key: raw_data[sheet_key]},
+                    sheet_merge_log,
+                )
+
+        return raw_data, extractor, review_candidates, merge_log
+
     def run(
         self,
         input_path: str | Path = None,
@@ -241,17 +340,31 @@ class Supervisor:
         for attempt in range(1, max_pipeline_retries + 1):
             self._log(f"\n[감독관] STEP 2~3: 추출·정제 시도 {attempt}/{max_pipeline_retries}")
 
-            extractor = ExtractorAgent()
+            closed_loop_candidates: list[dict] = []
+            closed_loop_merge_log: list[dict] = []
             t0 = time.time()
-            try:
-                raw_data = extractor.extract(
-                    pages=pdf_content.pages,
-                    full_text=pdf_content.full_text,
-                    extraction_prompts=extraction_prompts,
-                )
-            except llm_client.LLMQuotaExceededError as exc:
-                raw_data = extractor.partial_results()
-                logger.warning("텍스트 추출 quota/한도 문제로 부분 결과로 계속 진행: %s", exc)
+            if getattr(config, "SHEET_CLOSED_LOOP_ENABLED", False):
+                try:
+                    raw_data, extractor, closed_loop_candidates, closed_loop_merge_log = self._run_sheet_closed_loop(
+                        pages=pdf_content.pages,
+                        full_text=pdf_content.full_text,
+                        extraction_prompts=extraction_prompts,
+                    )
+                except llm_client.LLMQuotaExceededError as exc:
+                    extractor = ExtractorAgent()
+                    raw_data = extractor.partial_results()
+                    logger.warning("시트별 폐루프 추출 quota/한도 문제로 부분 결과로 계속 진행: %s", exc)
+            else:
+                extractor = ExtractorAgent()
+                try:
+                    raw_data = extractor.extract(
+                        pages=pdf_content.pages,
+                        full_text=pdf_content.full_text,
+                        extraction_prompts=extraction_prompts,
+                    )
+                except llm_client.LLMQuotaExceededError as exc:
+                    raw_data = extractor.partial_results()
+                    logger.warning("텍스트 추출 quota/한도 문제로 부분 결과로 계속 진행: %s", exc)
             elapsed = time.time() - t0
             self._add_timing("텍스트 추출", elapsed)
             self._log(extractor.report())
@@ -328,6 +441,12 @@ class Supervisor:
                     self._add_timing("정리·정제", elapsed)
                     self._log(f"[감독관] 빈칸 보완 후 재정제 완료: {elapsed:.1f}초")
 
+            if closed_loop_candidates:
+                final_data.setdefault("hybrid_review_candidates", []).extend(closed_loop_candidates)
+            if closed_loop_merge_log:
+                reconcile_reflected_merge_log(final_data, closed_loop_merge_log)
+                final_data.setdefault("hybrid_merge_log", []).extend(closed_loop_merge_log)
+
             if getattr(config, "HYBRID_REVIEW_ENABLED", False):
                 hybrid_agent = HybridReviewAgent()
                 if getattr(config, "HYBRID_REVIEW_TARGETED", True):
@@ -345,9 +464,11 @@ class Supervisor:
                     elapsed = time.time() - t0
                     self._add_timing("타깃 보조검수", elapsed)
                     if review_candidates:
-                        final_data["hybrid_review_candidates"] = review_candidates
+                        final_data.setdefault("hybrid_review_candidates", []).extend(review_candidates)
                     self._log(hybrid_agent.report())
                     self._log(f"[감독관] 타깃 보조검수 완료: {elapsed:.1f}초")
+                elif getattr(config, "SHEET_CLOSED_LOOP_ENABLED", False):
+                    self._log("\n[감독관] STEP 3c/3d: 시트별 폐루프에서 보조검수·병합을 이미 수행해 재실행하지 않음")
                 elif getattr(config, "HYBRID_SHEETWISE_FLOW_ENABLED", True):
                     self._log("\n[감독관] STEP 3c/3d: 시트 단위 보조검수·병합 실행...")
                     t0 = time.time()
@@ -365,9 +486,10 @@ class Supervisor:
                     elapsed = time.time() - t0
                     self._add_timing("시트 단위 보조검수·병합", elapsed)
                     if review_candidates:
-                        final_data["hybrid_review_candidates"] = review_candidates
+                        final_data.setdefault("hybrid_review_candidates", []).extend(review_candidates)
                     if merge_log:
-                        final_data["hybrid_merge_log"] = reconcile_reflected_merge_log(final_data, merge_log)
+                        reconcile_reflected_merge_log(final_data, merge_log)
+                        final_data.setdefault("hybrid_merge_log", []).extend(merge_log)
                     self._log(hybrid_agent.report())
                     self._log(hybrid_agent.adjudication_report())
                     self._log(f"[감독관] 시트 단위 보조검수·병합 완료: {elapsed:.1f}초")
@@ -386,7 +508,7 @@ class Supervisor:
                     elapsed = time.time() - t0
                     self._add_timing("보조 모델 검수", elapsed)
                     if review_candidates:
-                        final_data["hybrid_review_candidates"] = review_candidates
+                        final_data.setdefault("hybrid_review_candidates", []).extend(review_candidates)
                     self._log(hybrid_agent.report())
                     self._log(f"[감독관] 보조 모델 검수 완료: {elapsed:.1f}초")
 
@@ -405,7 +527,8 @@ class Supervisor:
                         elapsed = time.time() - t0
                         self._add_timing("보조 후보 판정·병합", elapsed)
                         if merge_log:
-                            final_data["hybrid_merge_log"] = reconcile_reflected_merge_log(final_data, merge_log)
+                            reconcile_reflected_merge_log(final_data, merge_log)
+                            final_data.setdefault("hybrid_merge_log", []).extend(merge_log)
                         self._log(hybrid_agent.adjudication_report())
                         self._log(f"[감독관] 보조 후보 판정·병합 완료: {elapsed:.1f}초")
 
