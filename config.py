@@ -2,6 +2,7 @@
 프로젝트 전역 설정
 """
 # noqa: SIZE_OK — 엑셀 헤더·시트 계약과 환경변수 기본값을 한 곳에 고정하는 순수 설정 파일.
+import json
 import os
 from dotenv import load_dotenv
 
@@ -55,6 +56,22 @@ def _env_list(name: str, default: list[str]) -> list[str]:
     if value is None or value.strip() == "":
         return list(default)
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _env_pattern_list(name: str, default: list[str]) -> list[str]:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return list(default)
+    stripped = value.strip()
+    if stripped.startswith("["):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return list(default)
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+        return list(default)
+    return [item.strip() for item in stripped.split(";;") if item.strip()]
 
 
 # LLM/로컬 에이전트 실행 설정
@@ -327,6 +344,15 @@ DOCUMENT_ROUTE_CONTEXT_PAGES = 1
 # FULL_DOCUMENT_SCAN=1이면 모든 페이지를 후보로 넘긴다(느리지만 누락 방지).
 FULL_DOCUMENT_SCAN = _env_bool("FULL_DOCUMENT_SCAN", False)
 DOCUMENT_ROUTE_MIN_SCORE = _env_int("DOCUMENT_ROUTE_MIN_SCORE", -9999 if FULL_DOCUMENT_SCAN else 3)
+# 정규식은 "{0,6}"처럼 콤마를 포함할 수 있으므로 이 키는 ";;" 구분 또는 JSON 배열만 쓴다.
+PRIOR_PLAN_HEADING_PATTERNS = _env_pattern_list(
+    "PRIOR_PLAN_HEADING_PATTERNS",
+    [
+        r"기존\s*계획.{0,6}(평가|분석)",
+        r"기존\s*(시책|사업).{0,6}평가",
+        r"이전\s*계획.{0,6}평가",
+    ],
+)
 # 시트별 라우팅 후보 페이지 상한. 기본값은 없음.
 # 테스트/최적화가 필요할 때만 DOCUMENT_ROUTE_MAX_PAGES_* 환경변수로 명시적으로 샘플링한다.
 _DOCUMENT_ROUTE_DEFAULT_MAX_PAGES: dict[str, int | None] = {}

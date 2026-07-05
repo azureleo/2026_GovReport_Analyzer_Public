@@ -147,12 +147,63 @@ def _normalize_sector(val: str) -> str:
     return v
 
 
+def _chapter_id(text: str) -> str:
+    head = (text or "")[:200]
+    match = re.search(r"제\s*(\d+)\s*장", head)
+    if match is not None:
+        return match.group(1)
+    match = re.search(r"^\s*(\d+)\s*[장.]\s+", head)
+    return match.group(1) if match is not None else ""
+
+
+def _has_chapter_heading(text: str) -> bool:
+    head = (text or "")[:200]
+    return bool(re.search(r"제\s*\d+\s*장|^\s*\d+\s*[장.]\s+", head))
+
+
+def _is_prior_plan_heading(text: str) -> bool:
+    head = (text or "")[:200]
+    return any(re.search(pattern, head) for pattern in getattr(config, "PRIOR_PLAN_HEADING_PATTERNS", []))
+
+
+def detect_prior_plan_pages(pages: list) -> set[int]:
+    sorted_pages = sorted(pages, key=lambda page: getattr(page, "page_number", 0))
+    start_page = None
+    start_chapter = ""
+    for page in sorted_pages:
+        text = getattr(page, "text", "")
+        if not _is_prior_plan_heading(text):
+            continue
+        start_page = int(getattr(page, "page_number", 0))
+        start_chapter = _chapter_id(text)
+        break
+    if start_page is None:
+        return set()
+
+    detected: set[int] = set()
+    active = False
+    for page in sorted_pages:
+        page_number = int(getattr(page, "page_number", 0))
+        text = getattr(page, "text", "")
+        if page_number == start_page:
+            active = True
+        if not active:
+            continue
+        current_chapter = _chapter_id(text)
+        if page_number != start_page and _has_chapter_heading(text):
+            if not start_chapter or (current_chapter and current_chapter != start_chapter):
+                break
+        detected.add(page_number)
+    return detected
+
+
 _DEDUP_CONFLICTS: list[dict] = []
 _RECORDED_VALIDATION_ISSUES: list[dict] = []
 _NUMERIC_CONFLICT_FIELDS = {
     "배출량", "전망값", "예산액", "예상감축량", "목표배출량", "목표감축량",
     "기준배출량", "배출전망", "값", "활동량", "목표물량", "감축률",
 }
+_PLAN_CONTEXT_FIELD = "계획구분출처"
 
 
 def _normalize_provenance_pages(value: Any) -> str:
@@ -200,6 +251,13 @@ def _normalize_row_provenance(row: dict) -> dict:
     return row
 
 
+def _row_source_pages(row: dict) -> set[int]:
+    normalized = _normalize_provenance_pages(row.get("출처페이지"))
+    if not normalized:
+        return set()
+    return {int(part) for part in normalized.split(",") if part.isdigit()}
+
+
 def _dedup_key_text(val: Any) -> str:
     """dedup 키 생성 전용 텍스트 정규화. 원본 셀 값은 바꾸지 않는다."""
     if val is None:
@@ -210,12 +268,54 @@ def _dedup_key_text(val: Any) -> str:
     return text.replace(" ", "")
 
 
+def _normalize_project_id(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip().upper()
+    if not text:
+        return ""
+    parts = re.split(r"([-_])", text)
+    normalized: list[str] = []
+    for part in parts:
+        if part in {"-", "_"}:
+            normalized.append("-")
+            continue
+        match = re.fullmatch(r"([A-Z]+)(0*\d+)", part)
+        if match is not None:
+            normalized.append(f"{match.group(1)}{int(match.group(2))}")
+            continue
+        if re.fullmatch(r"0*\d+", part):
+            normalized.append(str(int(part)))
+            continue
+        normalized.append(part)
+    return "".join(normalized)
+
+
 def _has_cell_value(value: Any) -> bool:
     return value is not None and str(value).strip() != ""
 
 
-def _remember_validation_issue(municipality: str, severity: str, area: str, item: str, detail: str, action: str) -> None:
-    _RECORDED_VALIDATION_ISSUES.append(_issue(municipality, severity, area, item, detail, action))
+def _remember_validation_issue(
+    municipality: str,
+    severity: str,
+    area: str,
+    item: str,
+    detail: str,
+    action: str,
+    *,
+    target_sheet_key: str | None = None,
+    target_row_number: int | None = None,
+) -> None:
+    _RECORDED_VALIDATION_ISSUES.append(
+        _issue(
+            municipality,
+            severity,
+            area,
+            item,
+            detail,
+            action,
+            target_sheet_key=target_sheet_key,
+            target_row_number=target_row_number,
+        )
+    )
 
 
 def _normalise_sector_with_raw(row: dict, field: str, raw_field: str) -> str:
@@ -620,8 +720,18 @@ def _build_visual_inventory(observations: list[dict], municipality: str) -> list
     return inventory
 
 
-def _issue(municipality: str, severity: str, area: str, item: str, detail: str, action: str) -> dict:
-    return {
+def _issue(
+    municipality: str,
+    severity: str,
+    area: str,
+    item: str,
+    detail: str,
+    action: str,
+    *,
+    target_sheet_key: str | None = None,
+    target_row_number: int | None = None,
+) -> dict:
+    issue = {
         "지자체명": municipality,
         "심각도": severity,
         "영역": area,
@@ -629,6 +739,11 @@ def _issue(municipality: str, severity: str, area: str, item: str, detail: str, 
         "문제내용": detail,
         "권장조치": action,
     }
+    if target_sheet_key:
+        issue["대상시트키"] = target_sheet_key
+    if target_row_number is not None:
+        issue["대상행번호"] = target_row_number
+    return issue
 
 
 def _recompute_reduction_rate(rows: list[dict], municipality: str) -> list[dict]:
@@ -641,7 +756,7 @@ def _recompute_reduction_rate(rows: list[dict], municipality: str) -> list[dict]
      값 자체는 막지 않고, 0~100 범위를 벗어나면 점검 항목으로만 표시한다.)
     """
     issues: list[dict] = []
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         base = row.get("기준배출량")
         target = row.get("목표배출량")
         rate = row.get("감축률")
@@ -655,6 +770,8 @@ def _recompute_reduction_rate(rows: list[dict], municipality: str) -> list[dict]
                     municipality, "경고", "감축목표", f"감축률 불일치({sector} {row.get('목표연도')})",
                     f"보고값 {rate} vs 산식 계산값 {computed}",
                     "산식 계산값으로 교정함. 기준/목표 배출량 원문 재확인 권장",
+                    target_sheet_key="reduction_targets",
+                    target_row_number=index,
                 ))
                 row["감축률"] = computed
         # 산식과 무관하게 비정상 범위는 점검 항목으로만 표시(흡수원 음수는 정상 가능).
@@ -664,6 +781,8 @@ def _recompute_reduction_rate(rows: list[dict], municipality: str) -> list[dict]
                 municipality, "경고", "감축목표", f"감축률 범위 의심({row.get('부문')} {row.get('목표연도')})",
                 f"감축률 {final_rate}%는 통상 범위(0~100%)를 벗어남",
                 "흡수원/증가 시나리오가 아니면 원문 수치 재확인",
+                target_sheet_key="reduction_targets",
+                target_row_number=index,
             ))
     return issues
 
@@ -672,6 +791,102 @@ def _recompute_reduction_rate(rows: list[dict], municipality: str) -> list[dict]
 
 def _sheet_area(sheet_key: str) -> str:
     return getattr(config, "SHEET_KEY_TO_NAME", {}).get(sheet_key, sheet_key)
+
+
+def _tag_prior_plan_rows(cleaned: dict, municipality: str, prior_plan_pages: set[int]) -> None:
+    if not prior_plan_pages:
+        return
+    for sheet_key in ("mitigation_projects", "annual_implementation", "quantitative_reductions", "financial_plan"):
+        rows = cleaned.get(sheet_key, [])
+        if not isinstance(rows, list):
+            continue
+        tagged_count = 0
+        for index, row in enumerate(rows, start=1):
+            pages = _row_source_pages(row)
+            if not pages:
+                continue
+            if pages <= prior_plan_pages:
+                row[_PLAN_CONTEXT_FIELD] = "기존계획"
+                tagged_count += 1
+                _remember_validation_issue(
+                    municipality,
+                    "경고",
+                    _sheet_area(sheet_key),
+                    f"{_sheet_area(sheet_key)} 행 {index}: 기존계획 평가 장 유래",
+                    f"기존계획 평가 장({','.join(f'p{page}' for page in sorted(pages))}) 유래 — 본계획 사업 목록과 관리번호 충돌 가능",
+                    "본계획 사업목록·사업카드 기준으로 원문 확인",
+                    target_sheet_key=sheet_key,
+                    target_row_number=index,
+                )
+            else:
+                row[_PLAN_CONTEXT_FIELD] = "본계획"
+        if tagged_count:
+            _remember_validation_issue(
+                municipality,
+                "정보",
+                _sheet_area(sheet_key),
+                f"기존계획 평가 장 유래 {tagged_count}건",
+                f"{_sheet_area(sheet_key)}에서 기존계획 평가 장 유래 행 {tagged_count}건 태깅",
+                "자동 이동·삭제하지 않고 타깃 검수 대상으로 넘김",
+            )
+
+
+def _project_name_key(row: dict) -> str:
+    return _dedup_key_text(row.get("사업명") or row.get("과제명") or "")
+
+
+def _append_project_id_consistency_issues(issues: list[dict], cleaned: dict, municipality: str) -> None:
+    registry: dict[str, set[str]] = {}
+    for row in cleaned.get("mitigation_projects", []):
+        if row.get(_PLAN_CONTEXT_FIELD) == "기존계획":
+            continue
+        project_id = _normalize_project_id(row.get("관리번호"))
+        project_name = _project_name_key(row)
+        if not project_id or not project_name:
+            continue
+        registry.setdefault(project_id, set()).add(project_name)
+
+    for project_id, names in registry.items():
+        if len(names) > 1:
+            issues.append(_issue(
+                municipality,
+                "경고",
+                _sheet_area("mitigation_projects"),
+                f"관리번호 {project_id}에 사업명 {len(names)}종",
+                f"정규화 사업명: {sorted(names)}",
+                "본계획 사업목록·사업카드에서 관리번호 기준 사업명을 확인",
+            ))
+
+    for sheet_key in ("annual_implementation", "quantitative_reductions", "financial_plan"):
+        for row in cleaned.get(sheet_key, []):
+            if row.get(_PLAN_CONTEXT_FIELD) == "기존계획":
+                continue
+            raw_id = str(row.get("관리번호", "") or "").strip()
+            project_id = _normalize_project_id(raw_id)
+            if not project_id:
+                continue
+            if raw_id and project_id != raw_id.upper():
+                issues.append(_issue(
+                    municipality,
+                    "정보",
+                    _sheet_area(sheet_key),
+                    f"관리번호 표기 정규화({raw_id}→{project_id})",
+                    f"{raw_id} 표기를 {project_id}로 흡수해 08 시트 레지스트리와 비교",
+                    "원문 표기 차이인지 별도 과제인지 확인",
+                ))
+            project_name = _project_name_key(row)
+            registered = registry.get(project_id)
+            if registered is None or not project_name:
+                continue
+            if project_name not in registered:
+                issues.append(_issue(
+                    municipality,
+                    "정보",
+                    _sheet_area(sheet_key),
+                    f"관리번호-사업명 불일치({project_id})",
+                    f"{_sheet_area(sheet_key)} 사업명 '{row.get('사업명')}'이 08 시트 등록명과 다름",
+                    "본계획 사업목록 기준으로 관리번호·사업명 매칭 확인",
+                ))
 
 
 def _record_attr(record, name: str, default=None):
@@ -830,6 +1045,7 @@ def _validate_final_data(
     ledger: list | None = None,
     raw_counts: dict | None = None,
     routed_page_nums: dict[str, set[int]] | None = None,
+    prior_plan_pages: set[int] | None = None,
 ) -> list[dict]:
     """정제된 16시트 데이터의 완성도·정합성을 결정론적으로 점검해 리포트를 만든다."""
     issues: list[dict] = []
@@ -908,6 +1124,8 @@ def _validate_final_data(
 
     _append_dedup_conflict_issues(issues, municipality)
     issues.extend(_RECORDED_VALIDATION_ISSUES)
+    if prior_plan_pages:
+        _append_project_id_consistency_issues(issues, cleaned, municipality)
     _append_cross_sheet_issues(issues, cleaned, municipality)
     _append_gap_fill_summary(issues, cleaned, municipality)
     _append_ledger_issues(issues, municipality, ledger, raw_counts, routed_page_nums, cleaned)
@@ -929,6 +1147,7 @@ class OrganizerAgent:
         *,
         ledger: list | None = None,
         routed_page_nums: dict[str, set[int]] | None = None,
+        prior_plan_pages: set[int] | None = None,
     ) -> dict:
         print("[에이전트3 정리] 정제 시작...")
         municipality = raw_data.get("municipality_name", "알 수 없음")
@@ -953,6 +1172,7 @@ class OrganizerAgent:
             observations = []
         cleaned["chart_observations"] = observations
         cleaned["visual_inventory"] = _build_visual_inventory(observations, municipality)
+        _tag_prior_plan_rows(cleaned, municipality, prior_plan_pages or set())
 
         # 결정론적 검증·정합성 점검(감축률 재계산은 reduction_targets를 인플레이스 교정).
         self._validation_report = _validate_final_data(
@@ -961,6 +1181,7 @@ class OrganizerAgent:
             ledger=ledger,
             raw_counts=raw_counts,
             routed_page_nums=routed_page_nums,
+            prior_plan_pages=prior_plan_pages or set(),
         )
         cleaned["validation_report"] = self._validation_report
 

@@ -4,6 +4,7 @@
 전체 파이프라인을 조율하고 결과의 품질을 검수합니다.
 carbon_guideline.md 기반 16개 시트 구조에 맞춰 동작합니다.
 """
+# noqa: SIZE_OK — 파이프라인 단계 조율을 한 파일에 유지하는 기존 supervisor.
 
 import json
 import logging
@@ -17,7 +18,7 @@ from utils import llm_cache, llm_client
 from agents.guideline_agent import GuidelineAgent
 from agents.extractor_agent import ExtractorAgent
 from agents.image_agent import ImageAgent
-from agents.organizer_agent import OrganizerAgent
+from agents.organizer_agent import OrganizerAgent, detect_prior_plan_pages
 from agents.gap_fill_agent import GapFillAgent
 from agents.hybrid_review_agent import HybridReviewAgent
 from agents.excel_agent import ExcelAgent
@@ -218,6 +219,12 @@ class Supervisor:
         elapsed = time.time() - t0
         self._add_timing("문서 파싱", elapsed)
         self._log(f"[감독관] {file_type} 파싱 완료: {pdf_content.total_pages}페이지 ({elapsed:.1f}초)")
+        prior_plan_pages = detect_prior_plan_pages(pdf_content.pages)
+        if prior_plan_pages:
+            self._log(
+                "[감독관] 기존계획 평가 장 감지: "
+                f"p{min(prior_plan_pages)}~p{max(prior_plan_pages)}"
+            )
 
         # STEP 1: 가이드라인 (carbon_guideline.md 우선, HWP fallback)
         self._log("\n[감독관] STEP 1: 가이드라인 에이전트 실행...")
@@ -278,6 +285,7 @@ class Supervisor:
                 raw_data,
                 ledger=ledger_records,
                 routed_page_nums=getattr(extractor, "routed_page_nums", None),
+                prior_plan_pages=prior_plan_pages,
             )
             elapsed = time.time() - t0
             self._add_timing("정리·정제", elapsed)
@@ -314,6 +322,7 @@ class Supervisor:
                         raw_data,
                         ledger=ledger_records,
                         routed_page_nums=getattr(extractor, "routed_page_nums", None),
+                        prior_plan_pages=prior_plan_pages,
                     )
                     elapsed = time.time() - t0
                     self._add_timing("정리·정제", elapsed)
