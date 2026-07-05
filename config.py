@@ -1,6 +1,7 @@
 """
 프로젝트 전역 설정
 """
+# noqa: SIZE_OK — 엑셀 헤더·시트 계약과 환경변수 기본값을 한 곳에 고정하는 순수 설정 파일.
 import os
 from dotenv import load_dotenv
 
@@ -67,7 +68,8 @@ LOCAL_AGENT_MODEL = os.environ.get("LOCAL_AGENT_MODEL", "").strip()
 LOCAL_AGENT_TIMEOUT = _env_int("LOCAL_AGENT_TIMEOUT", 300)
 CODEX_COMMAND = os.environ.get("CODEX_COMMAND", "codex").strip()
 CLAUDE_COMMAND = os.environ.get("CLAUDE_COMMAND", "claude").strip()
-GUIDELINE_AGENT_SPEC_ENABLED = _env_bool("GUIDELINE_AGENT_SPEC_ENABLED", True)
+GUIDELINE_STRUCTURED_INJECTION = _env_bool("GUIDELINE_STRUCTURED_INJECTION", True)
+GUIDELINE_PROMPT_MAX_CHARS = _env_int("GUIDELINE_PROMPT_MAX_CHARS", 3000)
 
 # 추출은 단발 JSON 작업이라 레포 파일·MCP 서버·스킬·프로젝트 메모리(CLAUDE.md)가 불필요하다.
 # True이면 claude/codex를 중립 임시 디렉터리에서 실행하고, claude는 MCP/스킬/설정/동적

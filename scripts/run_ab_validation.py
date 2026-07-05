@@ -6,12 +6,12 @@
 # .venv/bin/python scripts/run_ab_validation.py <source.pdf> [--golden 정답.xlsx]
 # .venv/bin/python scripts/run_ab_validation.py <source.pdf> --command ".venv/bin/python main.py"
 """
-v4 A/B 검증 하네스.
+v5 가이드라인 주입 A/B 검증 하네스.
 
-기본 per-sheet 실행과 EXTRACTION_SHEET_CLUSTERING=1 실행을 서로 다른 LLM 캐시 디렉터리로
-분리해 순차 수행하고, 기존 compare_extraction_modes.py 결과를 markdown 리포트로 저장한다.
-ROUTE_DROP_UBIQUITOUS_STRONG 검증은 정답 xlsx가 제공된 경우 verify_routing_coverage.py로만
-실행하며, 어떤 플래그도 기본값으로 활성화하지 않는다.
+스니펫 주입(GUIDELINE_STRUCTURED_INJECTION=0)과 구조 주입(=1)을 서로 다른 LLM 캐시
+디렉터리로 분리해 순차 수행하고, compare_extraction_modes.py 결과를 markdown 리포트로
+저장한다. ROUTE_DROP_UBIQUITOUS_STRONG 검증은 정답 xlsx가 제공된 경우
+verify_routing_coverage.py로만 실행하며, 라우팅 관련 opt-in 플래그 기본값은 건드리지 않는다.
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def _section(title: str, body: str) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="기본/클러스터링 추출 A/B 검증 리포트 생성")
+    parser = argparse.ArgumentParser(description="스니펫/구조 가이드라인 주입 A/B 검증 리포트 생성")
     parser.add_argument("source", help="검증할 PDF/HWP/HWPX 경로")
     parser.add_argument("--golden", help="선택: 라우팅 커버리지 검증용 정답 xlsx")
     parser.add_argument("--command", default=f"{sys.executable} main.py", help="추출 실행 명령")
@@ -58,8 +58,8 @@ def main() -> int:
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = _timestamp()
-    base_xlsx = output_dir / f"ab_base_{stamp}.xlsx"
-    cluster_xlsx = output_dir / f"ab_cluster_{stamp}.xlsx"
+    snippet_xlsx = output_dir / f"ab_guideline_snippet_{stamp}.xlsx"
+    structured_xlsx = output_dir / f"ab_guideline_structured_{stamp}.xlsx"
     report_path = output_dir / f"ab_report_{stamp}.md"
 
     report = [
@@ -69,39 +69,39 @@ def main() -> int:
         "- 판정 주체: 이 리포트는 근거를 만들 뿐, 플래그 활성화 결정은 사람이 한다.\n\n",
     ]
 
-    base = _run_command(
+    snippet = _run_command(
         args.command,
         source,
-        base_xlsx,
+        snippet_xlsx,
         {
-            "EXTRACTION_SHEET_CLUSTERING": "0",
-            "LLM_CACHE_DIR": str(output_dir / f"cache_base_{stamp}"),
+            "GUIDELINE_STRUCTURED_INJECTION": "0",
+            "LLM_CACHE_DIR": str(output_dir / f"cache_guideline_snippet_{stamp}"),
         },
     )
-    report.append(_section("기본 설정 실행", base.stdout + "\n" + base.stderr))
-    if base.returncode != 0:
-        report.append(f"기본 실행 실패(exit={base.returncode})\n")
+    report.append(_section("스니펫 주입 실행", snippet.stdout + "\n" + snippet.stderr))
+    if snippet.returncode != 0:
+        report.append(f"스니펫 주입 실행 실패(exit={snippet.returncode})\n")
         report_path.write_text("".join(report), encoding="utf-8")
         print(report_path)
-        return base.returncode
+        return snippet.returncode
 
-    cluster = _run_command(
+    structured = _run_command(
         args.command,
         source,
-        cluster_xlsx,
+        structured_xlsx,
         {
-            "EXTRACTION_SHEET_CLUSTERING": "1",
-            "LLM_CACHE_DIR": str(output_dir / f"cache_cluster_{stamp}"),
+            "GUIDELINE_STRUCTURED_INJECTION": "1",
+            "LLM_CACHE_DIR": str(output_dir / f"cache_guideline_structured_{stamp}"),
         },
     )
-    report.append(_section("클러스터링 실행", cluster.stdout + "\n" + cluster.stderr))
-    if cluster.returncode != 0:
-        report.append(f"클러스터링 실행 실패(exit={cluster.returncode})\n")
+    report.append(_section("구조 주입 실행", structured.stdout + "\n" + structured.stderr))
+    if structured.returncode != 0:
+        report.append(f"구조 주입 실행 실패(exit={structured.returncode})\n")
         report_path.write_text("".join(report), encoding="utf-8")
         print(report_path)
-        return cluster.returncode
+        return structured.returncode
 
-    compare = _run_tool([sys.executable, "scripts/compare_extraction_modes.py", str(base_xlsx), str(cluster_xlsx)])
+    compare = _run_tool([sys.executable, "scripts/compare_extraction_modes.py", str(snippet_xlsx), str(structured_xlsx)])
     report.append(_section("시트별 행 수·값 비교", compare.stdout + "\n" + compare.stderr))
 
     if args.golden:
@@ -112,9 +112,10 @@ def main() -> int:
         "## 판정 체크리스트\n\n"
         "- [ ] 시트별 행 수 무회귀 여부 확인\n"
         "- [ ] 핵심 수치 시트 값/숫자 셀 무회귀 여부 확인\n"
-        "- [ ] 호출 수·소요 시간 절감율 확인\n"
+        "- [ ] 검증리포트 경고 수 증가 여부 확인\n"
+        "- [ ] 구조 주입으로 늘어난 입력 토큰 대비 품질 개선 여부 확인\n"
         "- [ ] 정답 xlsx가 있으면 라우팅 커버리지 무회귀 확인\n"
-        "- [ ] 위 조건을 사람이 확인하기 전까지 opt-in 플래그 기본값 유지\n"
+        "- [ ] 문제가 관찰되면 GUIDELINE_STRUCTURED_INJECTION=0으로 되돌릴 수 있음\n"
     )
     report_path.write_text("".join(report), encoding="utf-8")
     print(report_path)
