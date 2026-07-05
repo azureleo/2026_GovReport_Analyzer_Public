@@ -157,11 +157,18 @@ py -m pip install -r requirements.txt
 npm install
 ```
 
+macOS/Linux에서는 `py` 대신 `python3`를 사용합니다.
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 main.py "서울특별시_탄소중립계획.pdf" -o "서울_결과.xlsx"
+```
+
 PDF만 처리한다면 Node.js는 필수가 아닙니다. HWP/HWPX 입력이나 kordoc 기반 파싱을 사용하려면 Node.js 18 이상과 `npm install`이 필요합니다.
 
 ### API 키 설정
 
-기본 백엔드는 Gemini입니다.
+기본 백엔드는 Gemini입니다. `load_dotenv()`가 프로젝트 루트 `.env`를 읽으므로, 먼저 `.env.example`을 `.env`로 복사한 뒤 필요한 키만 채웁니다.
 
 ```env
 GEMINI_API_KEY=
@@ -398,6 +405,14 @@ py scripts/run_ab_validation.py "서울특별시_탄소중립계획.pdf" --outpu
 ### quota/세션 한도 대기
 
 Codex/Claude 로컬 에이전트에서 quota나 세션 한도가 감지되면 짧게 대기 후 재개합니다. 상한을 넘으면 해당 배치만 실패로 기록합니다.
+
+### 출력 파일이 열려 있거나 잠긴 경우
+
+원본 경로 저장이 실패하면 같은 디렉터리에 `{파일명}_YYYYMMDD_HHMMSS.xlsx`로 한 번 대체 저장하고, 실제 저장 경로를 출력합니다. 출력 부모 디렉터리는 실행 시작 시 미리 만들고 쓰기 가능성을 확인합니다.
+
+### 스캔본 PDF 의심 경고
+
+문서 텍스트 레이어가 거의 없으면 경고를 출력하고 `19_검증리포트`에 정보 항목을 남긴 뒤 실행은 계속합니다. 결과가 비어 있으면 OCR 또는 텍스트 레이어가 있는 사본으로 재실행하세요.
 
 ### `MuPDF error: syntax error`
 
