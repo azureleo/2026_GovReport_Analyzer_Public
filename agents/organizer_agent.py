@@ -5,6 +5,7 @@
 가이드라인(carbon_guideline.md) 기준 표준 코드에 맞춰 정규화하고,
 중복 제거, 이상치 처리, 단위 검증을 수행합니다.
 """
+# noqa: SIZE_OK — 16개 시트 정제 계약을 보존하는 기존 모놀리식 cleaner. WP별로만 국소 수정.
 
 import logging
 import re
@@ -67,8 +68,12 @@ _FORECAST_METHOD_MAP = {
     "회귀분석": "stat_regression", "회귀": "stat_regression",
     "증가율": "stat_growth_rate", "증가율분석": "stat_growth_rate",
     "LEAP": "bottom_up_accounting_LEAP",
+    "MARKAL-MACRO": "bottom_up_hybrid_MARKAL_MACRO",
     "MARKAL": "bottom_up_optimization_MARKAL",
+    "ENPEP": "bottom_up_simulation_ENPEP",
 }
+
+_MANAGEMENT_ENERGY_SOURCE_TERMS = {"전력", "열", "에너지"}
 
 
 def _to_float(val: Any) -> float | None:
@@ -143,6 +148,7 @@ def _normalize_sector(val: str) -> str:
 
 
 _DEDUP_CONFLICTS: list[dict] = []
+_RECORDED_VALIDATION_ISSUES: list[dict] = []
 _NUMERIC_CONFLICT_FIELDS = {
     "배출량", "전망값", "예산액", "예상감축량", "목표배출량", "목표감축량",
     "기준배출량", "배출전망", "값", "활동량", "목표물량", "감축률",
@@ -206,6 +212,82 @@ def _dedup_key_text(val: Any) -> str:
 
 def _has_cell_value(value: Any) -> bool:
     return value is not None and str(value).strip() != ""
+
+
+def _remember_validation_issue(municipality: str, severity: str, area: str, item: str, detail: str, action: str) -> None:
+    _RECORDED_VALIDATION_ISSUES.append(_issue(municipality, severity, area, item, detail, action))
+
+
+def _normalise_sector_with_raw(row: dict, field: str, raw_field: str) -> str:
+    raw = row.get(field, "")
+    normalized = _normalize_sector(raw)
+    raw_text = str(raw).strip() if raw is not None else ""
+    if raw_text and normalized and normalized != raw_text:
+        row[raw_field] = raw_text
+    return normalized
+
+
+def _merge_target_year_values(values: list[Any]) -> str:
+    years: set[int] = set()
+    for value in values:
+        if isinstance(value, int):
+            years.add(value)
+            continue
+        for year in re.findall(r"\d{4}", str(value)):
+            years.add(int(year))
+    if years:
+        return ",".join(str(year) for year in sorted(years))
+    return max((str(value).strip() for value in values), key=len)
+
+
+def _most_frequent_value(values: list[Any]) -> Any:
+    counts: dict[str, int] = {}
+    first_by_key: dict[str, Any] = {}
+    for value in values:
+        key = str(value).strip()
+        counts[key] = counts.get(key, 0) + 1
+        first_by_key.setdefault(key, value)
+    winner = max(counts, key=lambda key: (counts[key], len(key)))
+    return first_by_key[winner]
+
+
+def _choose_document_meta_value(field: str, values: list[Any]) -> Any:
+    if field == "목표연도":
+        return _merge_target_year_values(values)
+    if all(isinstance(value, (int, float)) for value in values):
+        return _most_frequent_value(values)
+    text_values = [str(value).strip() for value in values]
+    return max(text_values, key=len)
+
+
+def _merge_document_meta_rows(rows: list[dict], municipality: str) -> list[dict]:
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get("지자체명") or municipality), []).append(row)
+
+    merged_rows: list[dict] = []
+    for group_municipality, group_rows in grouped.items():
+        merged: dict = {"지자체명": group_municipality}
+        fields = sorted({field for row in group_rows for field in row})
+        for field in fields:
+            if field == "지자체명":
+                continue
+            values = [row.get(field) for row in group_rows if _has_cell_value(row.get(field))]
+            if not values:
+                continue
+            distinct = {str(value).strip() for value in values}
+            merged[field] = _choose_document_meta_value(field, values)
+            if len(distinct) > 1 and field != "목표연도":
+                _remember_validation_issue(
+                    group_municipality,
+                    "정보",
+                    "문서메타",
+                    f"문서메타 병합({field})",
+                    f"{field} 후보 {sorted(distinct)} 중 '{merged[field]}' 채택",
+                    "원문 표지·개요의 문서 메타를 확인",
+                )
+        merged_rows.append(merged)
+    return merged_rows
 
 
 def _values_conflict(left: Any, right: Any) -> bool:
@@ -314,7 +396,7 @@ def _clean_document_meta(rows: list[dict], municipality: str) -> list[dict]:
         row["계획시작연도"] = _to_int(row.get("계획시작연도"))
         row["계획종료연도"] = _to_int(row.get("계획종료연도"))
         row["기준연도"] = _to_int(row.get("기준연도"))
-    return _deduplicate_rows(rows, ["지자체명", "계획명"])
+    return _merge_document_meta_rows(rows, municipality)
 
 
 def _clean_plan_overview(rows: list[dict], municipality: str) -> list[dict]:
@@ -347,7 +429,23 @@ def _clean_emissions_regional(rows: list[dict], municipality: str) -> list[dict]
 def _clean_emissions_management(rows: list[dict], municipality: str) -> list[dict]:
     for row in rows:
         row["지자체명"] = row.get("지자체명") or municipality
-        row["관리부문"] = _normalize_sector(row.get("관리부문", ""))
+        raw_sector = str(row.get("관리부문", "") or "").strip()
+        normalized_sector = _normalise_sector_with_raw(row, "관리부문", "관리부문원문")
+        if normalized_sector == "전환" and raw_sector in _MANAGEMENT_ENERGY_SOURCE_TERMS:
+            row["관리부문"] = raw_sector
+            row["관리부문원문"] = raw_sector
+            if not _has_cell_value(row.get("직간접구분")):
+                row["직간접구분"] = "간접"
+            _remember_validation_issue(
+                municipality,
+                "정보",
+                "배출현황_관리권한",
+                f"관리부문에 에너지원 표기 '{raw_sector}'",
+                f"관리권한 인벤토리의 '{raw_sector}' 표기는 전환 부문으로 자동 변환하지 않음",
+                "세부부문·직간접구분 원문 확인",
+            )
+        else:
+            row["관리부문"] = normalized_sector
         row["연도"] = _to_int(row.get("연도"))
         row["배출량"] = _to_float(row.get("배출량"))
         row["단위"] = _normalize_co2_unit(row.get("단위", ""))
@@ -364,7 +462,7 @@ def _clean_emissions_forecast(rows: list[dict], municipality: str) -> list[dict]
         row["단위"] = _normalize_co2_unit(row.get("단위", ""))
         method_raw = row.get("전망방법원문", "")
         if not row.get("전망방법코드") and method_raw:
-            for keyword, code in _FORECAST_METHOD_MAP.items():
+            for keyword, code in sorted(_FORECAST_METHOD_MAP.items(), key=lambda item: len(item[0]), reverse=True):
                 if keyword in method_raw:
                     row["전망방법코드"] = code
                     break
@@ -375,7 +473,7 @@ def _clean_emissions_forecast(rows: list[dict], municipality: str) -> list[dict]
 def _clean_reduction_targets(rows: list[dict], municipality: str) -> list[dict]:
     for row in rows:
         row["지자체명"] = row.get("지자체명") or municipality
-        row["부문"] = _normalize_sector(row.get("부문", "") or "")
+        row["부문"] = _normalise_sector_with_raw(row, "부문", "부문원문")
         row["기준연도"] = _to_int(row.get("기준연도"))
         row["목표연도"] = _to_int(row.get("목표연도"))
         row["기준배출량"] = _to_float(row.get("기준배출량"))
@@ -383,7 +481,7 @@ def _clean_reduction_targets(rows: list[dict], municipality: str) -> list[dict]:
         row["목표감축량"] = _to_float(row.get("목표감축량"))
         row["목표배출량"] = _to_float(row.get("목표배출량"))
         row["감축률"] = _to_float(row.get("감축률"))
-    return _deduplicate_rows(rows, ["지자체명", "목표수준", "부문", "목표연도"])
+    return _deduplicate_rows(rows, ["지자체명", "목표수준", "목표범위", "부문", "목표연도"])
 
 
 def _clean_vision_strategy(rows: list[dict], municipality: str) -> list[dict]:
@@ -395,7 +493,7 @@ def _clean_vision_strategy(rows: list[dict], municipality: str) -> list[dict]:
 def _clean_mitigation_projects(rows: list[dict], municipality: str) -> list[dict]:
     for row in rows:
         row["지자체명"] = row.get("지자체명") or municipality
-        row["부문"] = _normalize_sector(row.get("부문", ""))
+        row["부문"] = _normalise_sector_with_raw(row, "부문", "부문원문")
     return _filter_empty_rows(rows, ["사업명"])
 
 
@@ -809,6 +907,7 @@ def _validate_final_data(
                 ))
 
     _append_dedup_conflict_issues(issues, municipality)
+    issues.extend(_RECORDED_VALIDATION_ISSUES)
     _append_cross_sheet_issues(issues, cleaned, municipality)
     _append_gap_fill_summary(issues, cleaned, municipality)
     _append_ledger_issues(issues, municipality, ledger, raw_counts, routed_page_nums, cleaned)
@@ -835,6 +934,7 @@ class OrganizerAgent:
         municipality = raw_data.get("municipality_name", "알 수 없음")
 
         _DEDUP_CONFLICTS.clear()
+        _RECORDED_VALIDATION_ISSUES.clear()
         raw_counts: dict[str, int] = {}
         cleaned: dict = {"municipality_name": municipality}
         for sheet_key, cleaner in _CLEANERS.items():
