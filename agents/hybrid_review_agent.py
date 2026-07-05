@@ -6,6 +6,8 @@
 검수 결과는 자동 병합하지 않고 별도 Excel 시트에 기록합니다.
 """
 
+# noqa: SIZE_OK — 보조검수 후보 생성·판정 계약을 보존하는 기존 단일 파일.
+
 from __future__ import annotations
 
 import json
@@ -18,6 +20,7 @@ import config
 from utils import llm_client
 from utils.pdf_reader import PageContent
 from agents.extractor_agent import _build_page_text, _route_pages_by_sheet
+from agents.organizer_agent import OrganizerAgent, _dedup_key_text
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +120,41 @@ def _effective_backend_model(provider: str, model: str) -> str:
     if provider in {"codex", "claude", "auto"} and looks_like_gemini_default:
         return getattr(config, "LOCAL_AGENT_MODEL", "")
     return model
+
+
+def _default_model_for_provider(provider: str) -> str:
+    provider = _normalise_provider(provider)
+    if provider == "gemini":
+        return getattr(config, "MODEL", "")
+    if provider == "openai":
+        return getattr(config, "OPENAI_MODEL", "")
+    if provider in {"codex", "claude", "auto"}:
+        return getattr(config, "LOCAL_AGENT_MODEL", "")
+    return ""
+
+
+def _review_stage_provider(default_provider: str) -> str:
+    stage_providers = getattr(config, "STAGE_PROVIDERS", {}) or {}
+    if isinstance(stage_providers, dict):
+        provider = str(stage_providers.get("review", "") or "").strip().lower()
+        if provider:
+            return provider
+    return default_provider
+
+
+def _review_stage_backend(default_provider: str, default_model: str) -> tuple[str, str]:
+    stage_provider = _review_stage_provider(default_provider)
+    stage_models = getattr(config, "STAGE_MODELS", {}) or {}
+    stage_model = ""
+    if isinstance(stage_models, dict):
+        stage_model = str(stage_models.get("review", "") or "").strip()
+    if stage_model:
+        model = stage_model
+    elif _normalise_provider(stage_provider) != _normalise_provider(default_provider):
+        model = _default_model_for_provider(stage_provider)
+    else:
+        model = default_model
+    return stage_provider, _effective_backend_model(stage_provider, model)
 
 
 @contextmanager
@@ -397,7 +435,10 @@ def _clean_candidate_row(candidate_row: dict, sheet_key: str, municipality: str)
         value for key, value in cleaned.items()
         if key != "지자체명" and value not in (None, "")
     ]
-    return cleaned if meaningful else None
+    if not meaningful:
+        return None
+    rows = OrganizerAgent().organize_sheet(sheet_key, [cleaned], municipality)
+    return rows[0] if rows else None
 
 
 def _row_signature(row: dict, sheet_key: str) -> tuple:
@@ -405,7 +446,58 @@ def _row_signature(row: dict, sheet_key: str) -> tuple:
     if not fields:
         sheet_name = config.SHEET_KEY_TO_NAME.get(sheet_key, "")
         fields = config.EXCEL_HEADERS.get(sheet_name, [])[:5]
-    return tuple(str(row.get(field, "") or "").strip().casefold() for field in fields)
+    return tuple(_dedup_key_text(row.get(field)) for field in fields)
+
+
+def _is_missing_candidate(candidate: dict) -> bool:
+    return "누락" in str(candidate.get("후보유형", "") or "")
+
+
+def _candidate_duplicates_existing(candidate: dict, final_data: dict) -> bool:
+    if not _is_missing_candidate(candidate):
+        return False
+    sheet_key = _sheet_key_from_name(candidate.get("대상시트", ""))
+    if not sheet_key:
+        return False
+    municipality = final_data.get("municipality_name", "알 수 없음")
+    candidate_row = _clean_candidate_row(_parse_json_cell(candidate.get("후보행JSON")), sheet_key, municipality)
+    if not candidate_row:
+        return False
+    existing_rows = final_data.get(sheet_key, []) if isinstance(final_data.get(sheet_key), list) else []
+    signatures = {_row_signature(row, sheet_key) for row in existing_rows if isinstance(row, dict)}
+    return _row_signature(candidate_row, sheet_key) in signatures
+
+
+def _row_contains_log_values(existing: dict, normalized_row: dict, sheet_key: str) -> bool:
+    if _row_signature(existing, sheet_key) != _row_signature(normalized_row, sheet_key):
+        return False
+    for key, value in normalized_row.items():
+        if value in (None, ""):
+            continue
+        if _dedup_key_text(existing.get(key)) != _dedup_key_text(value):
+            return False
+    return True
+
+
+def reconcile_reflected_merge_log(final_data: dict, merge_log: list[dict]) -> list[dict]:
+    for row in merge_log:
+        if not isinstance(row, dict) or row.get("최종반영여부") != "반영":
+            continue
+        sheet_key = _sheet_key_from_name(row.get("대상시트", ""))
+        normalized_row = _parse_json_cell(row.get("정규화행JSON"))
+        if not sheet_key or not normalized_row:
+            continue
+        existing_rows = final_data.get(sheet_key, []) if isinstance(final_data.get(sheet_key), list) else []
+        if any(
+            _row_contains_log_values(item, normalized_row, sheet_key)
+            for item in existing_rows
+            if isinstance(item, dict)
+        ):
+            continue
+        row["최종반영여부"] = "보류(병합후중복제거)"
+        blocker = str(row.get("병합차단사유", "") or "").strip()
+        row["병합차단사유"] = ", ".join(part for part in [blocker, "병합후중복제거"] if part)
+    return merge_log
 
 
 def _confidence_at_least(value: str, minimum: str) -> bool:
@@ -427,6 +519,131 @@ def _risk_flags(value: Any) -> list[str]:
     if isinstance(value, str):
         return [item.strip() for item in re.split(r"[,|/]", value) if item.strip()]
     return []
+
+
+def _sheet_key_from_issue_area(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    direct = _sheet_key_from_name(text)
+    if direct:
+        return direct
+    for sheet_key, sheet_name in config.SHEET_KEY_TO_NAME.items():
+        label = re.sub(r"^\d+_", "", sheet_name)
+        if text == sheet_key or text in sheet_name or label in text or text in label:
+            return sheet_key
+    return None
+
+
+def _issue_row_index(issue: dict) -> int | None:
+    direct = issue.get("대상행번호")
+    if direct is not None:
+        try:
+            return int(direct)
+        except (TypeError, ValueError):
+            return None
+    text = " ".join(str(issue.get(field, "") or "") for field in ("항목", "문제내용"))
+    match = re.search(r"행\s*(\d+)", text)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _target_pages_from_row(row: dict) -> list[int]:
+    return _extract_page_numbers(str(row.get("출처페이지", "") or ""))
+
+
+def _target_key(sheet_key: str, row_index: int, reason: str) -> tuple[str, int, str]:
+    return sheet_key, row_index, reason[:120]
+
+
+def _is_ledger_failure_issue(issue: dict) -> bool:
+    item = str(issue.get("항목", "") or "")
+    return "원장 호출실패" in item or "원장 파싱실패" in item
+
+
+def select_targeted_review_rows(final_data: dict) -> list[dict]:
+    """검증리포트 경고와 conflicting 행에서 타깃 검수 대상을 결정론적으로 고른다."""
+    targets: list[dict] = []
+    seen: set[tuple[str, int, str]] = set()
+    max_rows = max(1, int(getattr(config, "HYBRID_REVIEW_TARGET_MAX_ROWS", 50)))
+
+    def add_target(sheet_key: str, row_index: int, row: dict, reason: str, issue: dict | None = None) -> None:
+        if len(targets) >= max_rows:
+            return
+        key = _target_key(sheet_key, row_index, reason)
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append({
+            "sheet_key": sheet_key,
+            "sheet_name": config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key),
+            "row_index": row_index,
+            "row": dict(row),
+            "reason": reason,
+            "issue": dict(issue or {}),
+            "pages": _target_pages_from_row(row),
+        })
+
+    def add_failed_page_targets() -> None:
+        if not getattr(config, "HYBRID_REVIEW_INCLUDE_FAILED_PAGES", False):
+            return
+        for issue in final_data.get("validation_report", []):
+            if not isinstance(issue, dict):
+                continue
+            if not _is_ledger_failure_issue(issue):
+                continue
+            sheet_key = _sheet_key_from_issue_area(issue.get("영역"))
+            if not sheet_key:
+                continue
+            failed_pages = set(_extract_page_numbers(str(issue.get("문제내용", "") or "")))
+            if not failed_pages:
+                continue
+            rows = final_data.get(sheet_key, [])
+            if not isinstance(rows, list):
+                continue
+            for index, row in enumerate(rows, start=1):
+                if not isinstance(row, dict):
+                    continue
+                if failed_pages & set(_target_pages_from_row(row)):
+                    add_target(sheet_key, index, row, "원장 실패 페이지 인접 행", issue)
+
+    for issue in final_data.get("validation_report", []):
+        if not isinstance(issue, dict) or issue.get("심각도") != "경고":
+            continue
+        if _is_ledger_failure_issue(issue):
+            continue
+        sheet_key = str(issue.get("대상시트키") or "").strip()
+        if sheet_key not in config.SHEET_KEY_TO_NAME:
+            sheet_key = _sheet_key_from_issue_area(issue.get("영역")) or _sheet_key_from_issue_area(issue.get("항목"))
+        if not sheet_key:
+            continue
+        rows = final_data.get(sheet_key, [])
+        if not isinstance(rows, list) or not rows:
+            continue
+        row_index = _issue_row_index(issue)
+        if row_index is None and len(rows) == 1:
+            row_index = 1
+        if row_index is None or row_index < 1 or row_index > len(rows):
+            continue
+        row = rows[row_index - 1]
+        if isinstance(row, dict):
+            add_target(sheet_key, row_index, row, issue.get("문제내용") or issue.get("항목") or "검증리포트 경고", issue)
+
+    add_failed_page_targets()
+
+    for sheet_key in getattr(config, "EXTRACTION_SHEETS", []):
+        rows = final_data.get(sheet_key, [])
+        if not isinstance(rows, list):
+            continue
+        for index, row in enumerate(rows, start=1):
+            if isinstance(row, dict) and row.get("데이터상태") == "conflicting":
+                add_target(sheet_key, index, row, "데이터상태=conflicting", None)
+
+    return targets
 
 
 class HybridReviewAgent:
@@ -454,7 +671,7 @@ class HybridReviewAgent:
         }
 
     def _provider_available(self) -> bool:
-        provider = getattr(config, "HYBRID_REVIEW_PROVIDER", "gemini")
+        provider = _review_stage_provider(getattr(config, "HYBRID_REVIEW_PROVIDER", "gemini"))
         ok, message = _backend_available(provider)
         if not ok:
             self._stats["skipped"] = message
@@ -532,11 +749,13 @@ class HybridReviewAgent:
             base_rows_json=base_rows_json,
             guideline_prompt=extraction_prompts.get(sheet_key, ""),
         )
-        provider = getattr(config, "HYBRID_REVIEW_PROVIDER", "gemini")
-        model = _effective_backend_model(provider, getattr(config, "HYBRID_REVIEW_MODEL", ""))
+        provider, model = _review_stage_backend(
+            getattr(config, "HYBRID_REVIEW_PROVIDER", "gemini"),
+            getattr(config, "HYBRID_REVIEW_MODEL", ""),
+        )
         try:
             with _temporary_backend(provider, model or None):
-                resp = llm_client.call_text(prompt, system=HYBRID_REVIEW_SYSTEM)
+                resp = llm_client.call_text(prompt, system=HYBRID_REVIEW_SYSTEM, stage="review")
         except llm_client.LLMQuotaExceededError as exc:
             self._stats["skipped"] = f"quota/한도 초과: {exc}"
             raise
@@ -549,6 +768,106 @@ class HybridReviewAgent:
             return []
         rows = parsed.get("hybrid_review_candidates", [])
         return rows if isinstance(rows, list) else []
+
+    def _target_page_context(self, target: dict, pages_by_num: dict[int, PageContent], limit: int = 12000) -> str:
+        page_nums = set(target.get("pages") or [])
+        expanded = sorted({num + delta for num in page_nums for delta in (-1, 0, 1) if num + delta in pages_by_num})
+        if not expanded:
+            return ""
+        return _compact(_build_page_text([pages_by_num[num] for num in expanded]), limit)
+
+    def _targeted_prompt(self, *, municipality: str, target: dict, page_context: str) -> str:
+        return f"""지자체명: {municipality}
+대상시트: {target['sheet_name']} ({target['sheet_key']})
+대상행번호: {target['row_index']}
+검수사유: {target['reason']}
+
+[현재 행]
+{json.dumps(target['row'], ensure_ascii=False)}
+
+[검증리포트 항목]
+{json.dumps(target.get('issue', {}), ensure_ascii=False)}
+
+[원문 발췌]
+{page_context}
+
+기존 계획 평가 장에 실린 과제번호·사업목록은 이전 계획의 것으로, 본계획 관리번호와 다른 사업을 가리킬 수 있습니다.
+본계획 사업 식별 기준은 본계획의 사업목록 표와 사업카드입니다.
+
+아래 JSON 형식으로만 반환하세요:
+{{
+  "hybrid_review_candidates": [
+    {{
+      "candidate_type": "유지|수정안|판단불가",
+      "confidence": "low|medium|high",
+      "candidate_row": {{}},
+      "base_similar_row": {{}},
+      "reason": "원문 근거 기반 판단 사유",
+      "merge_recommendation": "자동병합금지"
+    }}
+  ]
+}}
+
+규칙:
+- 원문 발췌에서 직접 확인되지 않는 값은 만들지 마세요.
+- 자동 병합을 전제로 답하지 말고, 후보 시트에 남길 검수 결과만 제안하세요.
+- 판단이 어려우면 candidate_type은 판단불가로 두고 candidate_row는 현재 행을 그대로 반환하세요."""
+
+    def _review_target(self, *, municipality: str, target: dict, pages_by_num: dict[int, PageContent]) -> list[dict]:
+        page_context = self._target_page_context(target, pages_by_num)
+        prompt = self._targeted_prompt(municipality=municipality, target=target, page_context=page_context)
+        provider, model = _review_stage_backend(
+            getattr(config, "HYBRID_REVIEW_PROVIDER", "gemini"),
+            getattr(config, "HYBRID_REVIEW_MODEL", ""),
+        )
+        try:
+            with _temporary_backend(provider, model or None):
+                parsed, parse_ok = llm_client.call_text_json(prompt, system=HYBRID_REVIEW_SYSTEM, stage="review")
+        except llm_client.LLMQuotaExceededError:
+            raise
+        except (llm_client.LLMCallError, RuntimeError) as exc:
+            logger.warning("타깃 보조검수 호출 실패(%s 행 %s): %s", target["sheet_key"], target["row_index"], exc)
+            return []
+        if not parse_ok or not isinstance(parsed, dict):
+            return []
+        candidates = parsed.get("hybrid_review_candidates", [])
+        return candidates if isinstance(candidates, list) else []
+
+    def review_targeted(
+        self,
+        *,
+        pages: list[PageContent],
+        final_data: dict,
+        extraction_prompts: dict[str, str] | None = None,
+    ) -> list[dict]:
+        if not getattr(config, "HYBRID_REVIEW_ENABLED", False):
+            self._stats["skipped"] = "비활성"
+            return []
+        if not self._provider_available():
+            return []
+        municipality = final_data.get("municipality_name", "알 수 없음")
+        pages_by_num = {page.page_number: page for page in pages}
+        targets = select_targeted_review_rows(final_data)
+        self._stats["targeted"] = {"targets": len(targets), "candidates": 0}
+        seen: set[tuple[str, str, str]] = set()
+        for target in targets:
+            page_range = ",".join(f"p{num}" for num in target.get("pages", [])) or "p?"
+            for item in self._review_target(municipality=municipality, target=target, pages_by_num=pages_by_num):
+                if not isinstance(item, dict):
+                    continue
+                row = self._normalize_candidate(item, municipality, target["sheet_key"], page_range)
+                row["검수상태"] = "타깃검수"
+                if not row.get("검수사유"):
+                    row["검수사유"] = target["reason"]
+                if _candidate_duplicates_existing(row, final_data):
+                    continue
+                dedup_key = (row["대상시트"], row["후보유형"], row["후보행JSON"])
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                self._candidates.append(row)
+        self._stats["targeted"]["candidates"] = len(self._candidates)
+        return self._candidates
 
     def _normalize_candidate(self, item: dict, municipality: str, sheet_key: str, page_range: str) -> dict:
         sheet_name = config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key)
@@ -577,6 +896,8 @@ class HybridReviewAgent:
         if not getattr(config, "HYBRID_REVIEW_ENABLED", False):
             self._stats["skipped"] = "비활성"
             return []
+        if getattr(config, "HYBRID_REVIEW_TARGETED", True):
+            return self.review_targeted(pages=pages, final_data=final_data, extraction_prompts=extraction_prompts)
         if not self._provider_available():
             return []
 
@@ -611,6 +932,8 @@ class HybridReviewAgent:
                     if not isinstance(item, dict):
                         continue
                     row = self._normalize_candidate(item, municipality, sheet_key, page_range)
+                    if _candidate_duplicates_existing(row, final_data):
+                        continue
                     dedup_key = (row["대상시트"], row["후보유형"], row["후보행JSON"])
                     if dedup_key in seen:
                         continue
@@ -622,7 +945,7 @@ class HybridReviewAgent:
         return self._candidates
 
     def _adjudication_provider_available(self) -> bool:
-        provider = getattr(config, "HYBRID_ADJUDICATION_PROVIDER", "gemini")
+        provider = _review_stage_provider(getattr(config, "HYBRID_ADJUDICATION_PROVIDER", "gemini"))
         ok, message = _backend_available(provider)
         if not ok:
             self._stats["adjudication"]["skipped"] = message
@@ -893,11 +1216,13 @@ class HybridReviewAgent:
             page_context=page_context,
             existing_rows=final_data.get(sheet_key, []) if isinstance(final_data.get(sheet_key), list) else [],
         )
-        provider = getattr(config, "HYBRID_ADJUDICATION_PROVIDER", "gemini")
-        model = _effective_backend_model(provider, getattr(config, "HYBRID_ADJUDICATION_MODEL", ""))
+        provider, model = _review_stage_backend(
+            getattr(config, "HYBRID_ADJUDICATION_PROVIDER", "gemini"),
+            getattr(config, "HYBRID_ADJUDICATION_MODEL", ""),
+        )
         try:
             with _temporary_backend(provider, model or None):
-                resp = llm_client.call_text(prompt, system=HYBRID_ADJUDICATION_SYSTEM)
+                resp = llm_client.call_text(prompt, system=HYBRID_ADJUDICATION_SYSTEM, stage="review")
         except llm_client.LLMQuotaExceededError:
             raise
         except (llm_client.LLMCallError, RuntimeError) as exc:
@@ -932,12 +1257,14 @@ class HybridReviewAgent:
             prepared_candidates=prepared_candidates,
             final_data=final_data,
         )
-        provider = getattr(config, "HYBRID_ADJUDICATION_PROVIDER", "gemini")
-        model = _effective_backend_model(provider, getattr(config, "HYBRID_ADJUDICATION_MODEL", ""))
+        provider, model = _review_stage_backend(
+            getattr(config, "HYBRID_ADJUDICATION_PROVIDER", "gemini"),
+            getattr(config, "HYBRID_ADJUDICATION_MODEL", ""),
+        )
         candidate_ids = [str(item["candidate_id"]) for item in prepared_candidates]
         try:
             with _temporary_backend(provider, model or None):
-                resp = llm_client.call_text(prompt, system=HYBRID_ADJUDICATION_SYSTEM)
+                resp = llm_client.call_text(prompt, system=HYBRID_ADJUDICATION_SYSTEM, stage="review")
         except llm_client.LLMQuotaExceededError:
             raise
         except (llm_client.LLMCallError, RuntimeError) as exc:
@@ -1107,6 +1434,8 @@ class HybridReviewAgent:
                     if not isinstance(item, dict):
                         continue
                     row = self._normalize_candidate(item, municipality, sheet_key, page_range)
+                    if _candidate_duplicates_existing(row, final_data):
+                        continue
                     dedup_key = (row["대상시트"], row["후보유형"], row["후보행JSON"])
                     if dedup_key in seen:
                         continue

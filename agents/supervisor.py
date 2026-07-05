@@ -20,7 +20,7 @@ from agents.extractor_agent import ExtractorAgent
 from agents.image_agent import ImageAgent
 from agents.organizer_agent import OrganizerAgent, detect_prior_plan_pages
 from agents.gap_fill_agent import GapFillAgent
-from agents.hybrid_review_agent import HybridReviewAgent
+from agents.hybrid_review_agent import HybridReviewAgent, reconcile_reflected_merge_log
 from agents.excel_agent import ExcelAgent
 
 logger = logging.getLogger(__name__)
@@ -330,7 +330,25 @@ class Supervisor:
 
             if getattr(config, "HYBRID_REVIEW_ENABLED", False):
                 hybrid_agent = HybridReviewAgent()
-                if getattr(config, "HYBRID_SHEETWISE_FLOW_ENABLED", True):
+                if getattr(config, "HYBRID_REVIEW_TARGETED", True):
+                    self._log("\n[감독관] STEP 3c: 검증리포트 기반 타깃 보조검수 실행...")
+                    t0 = time.time()
+                    try:
+                        review_candidates = hybrid_agent.review_targeted(
+                            pages=pdf_content.pages,
+                            final_data=final_data,
+                            extraction_prompts=extraction_prompts,
+                        )
+                    except llm_client.LLMQuotaExceededError as exc:
+                        review_candidates = []
+                        logger.warning("타깃 보조검수 quota/한도 문제로 건너뜀: %s", exc)
+                    elapsed = time.time() - t0
+                    self._add_timing("타깃 보조검수", elapsed)
+                    if review_candidates:
+                        final_data["hybrid_review_candidates"] = review_candidates
+                    self._log(hybrid_agent.report())
+                    self._log(f"[감독관] 타깃 보조검수 완료: {elapsed:.1f}초")
+                elif getattr(config, "HYBRID_SHEETWISE_FLOW_ENABLED", True):
                     self._log("\n[감독관] STEP 3c/3d: 시트 단위 보조검수·병합 실행...")
                     t0 = time.time()
                     try:
@@ -349,7 +367,7 @@ class Supervisor:
                     if review_candidates:
                         final_data["hybrid_review_candidates"] = review_candidates
                     if merge_log:
-                        final_data["hybrid_merge_log"] = merge_log
+                        final_data["hybrid_merge_log"] = reconcile_reflected_merge_log(final_data, merge_log)
                     self._log(hybrid_agent.report())
                     self._log(hybrid_agent.adjudication_report())
                     self._log(f"[감독관] 시트 단위 보조검수·병합 완료: {elapsed:.1f}초")
@@ -387,7 +405,7 @@ class Supervisor:
                         elapsed = time.time() - t0
                         self._add_timing("보조 후보 판정·병합", elapsed)
                         if merge_log:
-                            final_data["hybrid_merge_log"] = merge_log
+                            final_data["hybrid_merge_log"] = reconcile_reflected_merge_log(final_data, merge_log)
                         self._log(hybrid_agent.adjudication_report())
                         self._log(f"[감독관] 보조 후보 판정·병합 완료: {elapsed:.1f}초")
 

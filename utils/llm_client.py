@@ -141,8 +141,18 @@ def _command_exists(command: str) -> bool:
     return shutil.which(executable) is not None
 
 
-def _resolve_provider() -> str:
-    provider = (getattr(config, "LLM_PROVIDER", "codex") or "codex").strip().lower()
+def _stage_config_value(mapping_name: str, stage: str | None) -> str:
+    if not stage:
+        return ""
+    mapping = getattr(config, mapping_name, {}) or {}
+    if not isinstance(mapping, dict):
+        return ""
+    return str(mapping.get(stage, "") or "").strip()
+
+
+def _resolve_provider(stage: str | None = None) -> str:
+    stage_provider = _stage_config_value("STAGE_PROVIDERS", stage).lower()
+    provider = stage_provider or (getattr(config, "LLM_PROVIDER", "codex") or "codex").strip().lower()
     aliases = {
         "local": "codex",
         "local-agent": "codex",
@@ -205,20 +215,25 @@ def _is_quota_error_message(message: str) -> bool:
     return any(marker in normalized for marker in _QUOTA_ERROR_MARKERS)
 
 
-def _model_identity(provider: str) -> str:
+def _stage_model(stage: str | None) -> str:
+    return _stage_config_value("STAGE_MODELS", stage)
+
+
+def _model_identity(provider: str, stage: str | None = None) -> str:
+    stage_model = _stage_model(stage)
     if provider == "gemini":
-        return str(getattr(config, "MODEL", ""))
+        return stage_model or str(getattr(config, "MODEL", ""))
     if provider == "codex":
         return ":".join([
             str(getattr(config, "CODEX_COMMAND", "codex")),
-            str(getattr(config, "LOCAL_AGENT_MODEL", "")),
+            stage_model or str(getattr(config, "LOCAL_AGENT_MODEL", "")),
         ])
     if provider == "claude":
         return ":".join([
             str(getattr(config, "CLAUDE_COMMAND", "claude")),
-            str(getattr(config, "LOCAL_AGENT_MODEL", "")),
+            stage_model or str(getattr(config, "LOCAL_AGENT_MODEL", "")),
         ])
-    return str(getattr(config, "LOCAL_AGENT_MODEL", ""))
+    return stage_model or str(getattr(config, "LOCAL_AGENT_MODEL", ""))
 
 
 def _run_command(command: Sequence[str], prompt: str, *, cwd: Path, timeout: int) -> str:
@@ -251,6 +266,7 @@ def _run_codex(
     *,
     image_paths: Sequence[Path] | None = None,
     cwd: Path,
+    model: str | None = None,
 ) -> str:
     timeout = int(getattr(config, "LOCAL_AGENT_TIMEOUT", 900))
     command = _split_command(getattr(config, "CODEX_COMMAND", "codex"))
@@ -274,9 +290,9 @@ def _run_codex(
             "--output-last-message",
             str(output_path),
         ]
-        model = getattr(config, "LOCAL_AGENT_MODEL", "")
-        if model:
-            command += ["--model", model]
+        effective_model = model if model is not None else getattr(config, "LOCAL_AGENT_MODEL", "")
+        if effective_model:
+            command += ["--model", effective_model]
         for path in list(image_paths or []):
             command += ["--image", str(path)]
         command.append("-")
@@ -319,6 +335,7 @@ def _run_claude(
     *,
     image_paths: Sequence[Path] | None = None,
     cwd: Path,
+    model: str | None = None,
 ) -> str:
     # Claude Code는 버전별 CLI 옵션 차이가 있어 가장 보편적인 print 모드를 사용한다.
     # 이미지가 있으면 prompt에 cwd 내부 임시 파일 경로가 포함되어 Claude가 읽을 수 있다.
@@ -326,9 +343,9 @@ def _run_claude(
     base_command = _split_command(getattr(config, "CLAUDE_COMMAND", "claude"))
     paths = list(image_paths or [])
     command = [*base_command, "-p", "--output-format", "text"]
-    model = getattr(config, "LOCAL_AGENT_MODEL", "")
-    if model:
-        command += ["--model", model]
+    effective_model = model if model is not None else getattr(config, "LOCAL_AGENT_MODEL", "")
+    if effective_model:
+        command += ["--model", effective_model]
     command += _claude_minimal_flags(paths)
     try:
         return _run_command(command, prompt, cwd=cwd, timeout=timeout)
@@ -351,6 +368,7 @@ def _call_local_agent(
     image_b64: str | None = None,
     images_b64: Sequence[str] | None = None,
     provider: str | None = None,
+    model: str | None = None,
 ) -> str:
     provider = provider or _resolve_provider()
     images = list(images_b64 or ([] if image_b64 is None else [image_b64]))
@@ -367,9 +385,9 @@ def _call_local_agent(
 
         prepared = _agent_prompt(prompt, system, image_path=image_path, image_paths=image_paths)
         if provider == "codex":
-            return _run_codex(prepared, image_paths=image_paths, cwd=workdir)
+            return _run_codex(prepared, image_paths=image_paths, cwd=workdir, model=model)
         if provider == "claude":
-            return _run_claude(prepared, image_paths=image_paths, cwd=workdir)
+            return _run_claude(prepared, image_paths=image_paths, cwd=workdir, model=model)
         raise RuntimeError(f"지원하지 않는 로컬 에이전트입니다: {provider}")
 
 
@@ -509,25 +527,31 @@ def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
             time.sleep(wait)
 
 
-def call_text(prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> str:
-    """
-    텍스트 프롬프트를 선택된 백엔드에 전달한다.
-
-    기본값은 Gemini API가 아니라 로컬 Codex CLI이며, 응답은 JSON 문자열이어야 한다.
-    실패 시 빈 JSON으로 품질 저하를 숨기지 않고 예외를 발생시킨다.
-    """
-    provider = _resolve_provider()
+def call_text(
+    prompt: str,
+    system: str = "",
+    max_retries: int = config.MAX_RETRIES,
+    stage: str | None = None,
+) -> str:
+    """텍스트 프롬프트를 단계별 백엔드 오버라이드까지 반영해 전달한다."""
+    provider = _resolve_provider(stage)
+    stage_model = _stage_model(stage)
     request = LLMCacheRequest(
         call_kind="text",
         provider=provider,
-        model=_model_identity(provider),
+        model=_model_identity(provider, stage),
         system=system,
         prompt=prompt,
     )
     if provider == "gemini":
+        def produce_gemini_text() -> str:
+            if stage_model:
+                return _call_gemini_text(prompt, system, max_retries=max_retries, model=stage_model)
+            return _call_gemini_text(prompt, system, max_retries=max_retries)
+
         return cached_response(
             request,
-            lambda: _record_call("text", provider, lambda: _call_gemini_text(prompt, system, max_retries=max_retries)),
+            lambda: _record_call("text", provider, produce_gemini_text),
         )
 
     return cached_response(
@@ -536,34 +560,41 @@ def call_text(prompt: str, system: str = "", max_retries: int = config.MAX_RETRI
             "text",
             provider,
             lambda: _retry_local_call(
-                lambda: _call_local_agent(prompt, system, provider=provider),
-            max_retries=max_retries,
+                lambda: _call_local_agent(prompt, system, provider=provider, model=stage_model or None),
+                max_retries=max_retries,
                 label=provider,
             ),
         ),
     )
 
 
-def call_vision(image_b64: str, prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> str:
-    """
-    이미지 + 텍스트 프롬프트를 선택된 백엔드에 전달한다.
-
-    Codex는 `--image` 첨부를 사용하고, Claude Code는 임시 이미지 파일 경로를 프롬프트에
-    포함한다. 실패 시 빈 JSON으로 품질 저하를 숨기지 않고 예외를 발생시킨다.
-    """
-    provider = _resolve_provider()
+def call_vision(
+    image_b64: str,
+    prompt: str,
+    system: str = "",
+    max_retries: int = config.MAX_RETRIES,
+    stage: str | None = None,
+) -> str:
+    """이미지 + 텍스트 프롬프트를 단계별 백엔드 오버라이드까지 반영해 전달한다."""
+    provider = _resolve_provider(stage)
+    stage_model = _stage_model(stage)
     request = LLMCacheRequest(
         call_kind="vision",
         provider=provider,
-        model=_model_identity(provider),
+        model=_model_identity(provider, stage),
         system=system,
         prompt=prompt,
         images_b64=(image_b64,),
     )
     if provider == "gemini":
+        def produce_gemini_vision() -> str:
+            if stage_model:
+                return _call_gemini_vision(image_b64, prompt, system, max_retries=max_retries, model=stage_model)
+            return _call_gemini_vision(image_b64, prompt, system, max_retries=max_retries)
+
         return cached_response(
             request,
-            lambda: _record_call("vision", provider, lambda: _call_gemini_vision(image_b64, prompt, system, max_retries=max_retries)),
+            lambda: _record_call("vision", provider, produce_gemini_vision),
         )
 
     return cached_response(
@@ -572,8 +603,8 @@ def call_vision(image_b64: str, prompt: str, system: str = "", max_retries: int 
             "vision",
             provider,
             lambda: _retry_local_call(
-                lambda: _call_local_agent(prompt, system, image_b64=image_b64, provider=provider),
-            max_retries=max_retries,
+                lambda: _call_local_agent(prompt, system, image_b64=image_b64, provider=provider, model=stage_model or None),
+                max_retries=max_retries,
                 label=f"{provider} vision",
             ),
         ),
@@ -585,30 +616,33 @@ def call_vision_batch(
     prompt: str,
     system: str = "",
     max_retries: int = config.MAX_RETRIES,
+    stage: str | None = None,
 ) -> str:
-    """
-    여러 이미지 + 텍스트 프롬프트를 선택된 백엔드에 한 번에 전달한다.
-
-    Codex CLI의 반복 `--image` 첨부를 사용해 전수 이미지 분석 시 호출 수를 줄인다.
-    """
+    """여러 이미지 + 텍스트 프롬프트를 단계별 백엔드 오버라이드까지 반영해 전달한다."""
     if not images_b64:
         return "{}"
     if len(images_b64) == 1:
-        return call_vision(images_b64[0], prompt, system=system, max_retries=max_retries)
+        return call_vision(images_b64[0], prompt, system=system, max_retries=max_retries, stage=stage)
 
-    provider = _resolve_provider()
+    provider = _resolve_provider(stage)
+    stage_model = _stage_model(stage)
     request = LLMCacheRequest(
         call_kind="vision_batch",
         provider=provider,
-        model=_model_identity(provider),
+        model=_model_identity(provider, stage),
         system=system,
         prompt=prompt,
         images_b64=tuple(images_b64),
     )
     if provider == "gemini":
+        def produce_gemini_vision_batch() -> str:
+            if stage_model:
+                return _call_gemini_vision_batch(images_b64, prompt, system, max_retries=max_retries, model=stage_model)
+            return _call_gemini_vision_batch(images_b64, prompt, system, max_retries=max_retries)
+
         return cached_response(
             request,
-            lambda: _record_call("vision_batch", provider, lambda: _call_gemini_vision_batch(images_b64, prompt, system, max_retries=max_retries)),
+            lambda: _record_call("vision_batch", provider, produce_gemini_vision_batch),
         )
 
     return cached_response(
@@ -617,8 +651,8 @@ def call_vision_batch(
             "vision_batch",
             provider,
             lambda: _retry_local_call(
-                lambda: _call_local_agent(prompt, system, images_b64=images_b64, provider=provider),
-            max_retries=max_retries,
+                lambda: _call_local_agent(prompt, system, images_b64=images_b64, provider=provider, model=stage_model or None),
+                max_retries=max_retries,
                 label=f"{provider} vision batch",
             ),
         ),
@@ -662,7 +696,7 @@ def _handle_gemini_retry(e: Exception, attempt: int, max_retries: int, label: st
     return True
 
 
-def _call_gemini_text(prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> str:
+def _call_gemini_text(prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES, model: str | None = None) -> str:
     """레거시 Gemini API 텍스트 호출."""
     _, types, google_exceptions = _get_gemini_modules()
     full_text = f"[지침]\n{system}\n\n[요청]\n{prompt}" if system else prompt
@@ -678,7 +712,7 @@ def _call_gemini_text(prompt: str, system: str = "", max_retries: int = config.M
     for attempt in range(1, max_retries + 1):
         try:
             response = client.models.generate_content(
-                model=config.MODEL,
+                model=model or config.MODEL,
                 contents=contents,
                 config=api_config,
             )
@@ -701,6 +735,7 @@ def _call_gemini_vision(
     prompt: str,
     system: str = "",
     max_retries: int = config.MAX_RETRIES,
+    model: str | None = None,
 ) -> str:
     """레거시 Gemini API Vision 호출."""
     _, types, google_exceptions = _get_gemini_modules()
@@ -726,7 +761,7 @@ def _call_gemini_vision(
     for attempt in range(1, max_retries + 1):
         try:
             response = client.models.generate_content(
-                model=config.MODEL,
+                model=model or config.MODEL,
                 contents=contents,
                 config=api_config,
             )
@@ -749,6 +784,7 @@ def _call_gemini_vision_batch(
     prompt: str,
     system: str = "",
     max_retries: int = config.MAX_RETRIES,
+    model: str | None = None,
 ) -> str:
     """Gemini API에 여러 이미지를 한 요청의 inline image parts로 전달한다."""
     _, types, google_exceptions = _get_gemini_modules()
@@ -774,7 +810,7 @@ def _call_gemini_vision_batch(
     for attempt in range(1, max_retries + 1):
         try:
             response = client.models.generate_content(
-                model=config.MODEL,
+                model=model or config.MODEL,
                 contents=contents,
                 config=api_config,
             )
@@ -883,18 +919,23 @@ def _json_parse_ok(raw_text: str, parsed: Any) -> bool:
     return False
 
 
-def call_text_json(prompt: str, system: str = "", max_retries: int = config.MAX_RETRIES) -> tuple[Any, bool]:
+def call_text_json(
+    prompt: str,
+    system: str = "",
+    max_retries: int = config.MAX_RETRIES,
+    stage: str | None = None,
+) -> tuple[Any, bool]:
     """
     call_text 후 JSON 파싱까지 수행한다.
 
     JSON 파싱 실패가 의심되면 같은 프롬프트에 재요청 지시문을 덧붙여 1회 재호출한다.
     반환값은 (파싱 결과, 파싱 성공 여부)다.
     """
-    raw = call_text(prompt, system=system, max_retries=max_retries)
+    raw = call_text(prompt, system=system, max_retries=max_retries, stage=stage)
     parsed = parse_json(raw)
     if _json_parse_ok(raw, parsed):
         return parsed, True
-    retry_raw = call_text(f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries)
+    retry_raw = call_text(f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries, stage=stage)
     retry_parsed = parse_json(retry_raw)
     return retry_parsed, _json_parse_ok(retry_raw, retry_parsed)
 
@@ -904,13 +945,14 @@ def call_vision_json(
     prompt: str,
     system: str = "",
     max_retries: int = config.MAX_RETRIES,
+    stage: str | None = None,
 ) -> tuple[Any, bool]:
     """call_vision 후 JSON 파싱 실패 시 1회 재요청한다."""
-    raw = call_vision(image_b64, prompt, system=system, max_retries=max_retries)
+    raw = call_vision(image_b64, prompt, system=system, max_retries=max_retries, stage=stage)
     parsed = parse_json(raw)
     if _json_parse_ok(raw, parsed):
         return parsed, True
-    retry_raw = call_vision(image_b64, f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries)
+    retry_raw = call_vision(image_b64, f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries, stage=stage)
     retry_parsed = parse_json(retry_raw)
     return retry_parsed, _json_parse_ok(retry_raw, retry_parsed)
 
@@ -920,12 +962,13 @@ def call_vision_batch_json(
     prompt: str,
     system: str = "",
     max_retries: int = config.MAX_RETRIES,
+    stage: str | None = None,
 ) -> tuple[Any, bool]:
     """call_vision_batch 후 JSON 파싱 실패 시 1회 재요청한다."""
-    raw = call_vision_batch(images_b64, prompt, system=system, max_retries=max_retries)
+    raw = call_vision_batch(images_b64, prompt, system=system, max_retries=max_retries, stage=stage)
     parsed = parse_json(raw)
     if _json_parse_ok(raw, parsed):
         return parsed, True
-    retry_raw = call_vision_batch(images_b64, f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries)
+    retry_raw = call_vision_batch(images_b64, f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries, stage=stage)
     retry_parsed = parse_json(retry_raw)
     return retry_parsed, _json_parse_ok(retry_raw, retry_parsed)

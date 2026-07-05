@@ -107,7 +107,7 @@ def test_sheetwise_review_deduplicates_and_normalises_candidates(monkeypatch: py
     _configure_hybrid(monkeypatch, adjudication=False)
     pages = _pages(2)
 
-    def fake_call_text(prompt: str, system: str = "", max_retries: int = 1) -> str:
+    def fake_call_text(prompt: str, system: str = "", max_retries: int = 1, stage: str | None = None) -> str:
         return _review_response(1)
 
     monkeypatch.setattr(llm_client, "call_text", fake_call_text)
@@ -134,7 +134,7 @@ def test_sheetwise_adjudication_uses_configured_batch_size(monkeypatch: pytest.M
     pages = _pages(5)
     adjudication_calls = []
 
-    def fake_call_text(prompt: str, system: str = "", max_retries: int = 1) -> str:
+    def fake_call_text(prompt: str, system: str = "", max_retries: int = 1, stage: str | None = None) -> str:
         if "[판정 후보 목록]" in prompt:
             candidate_ids = _prepared_candidate_ids(prompt)
             adjudication_calls.append(candidate_ids)
@@ -161,7 +161,7 @@ def test_batch_adjudication_missing_candidate_ids_fail_closed(monkeypatch: pytes
     _configure_hybrid(monkeypatch, auto_merge=True)
     pages = _pages(2)
 
-    def fake_call_text(prompt: str, system: str = "", max_retries: int = 1) -> str:
+    def fake_call_text(prompt: str, system: str = "", max_retries: int = 1, stage: str | None = None) -> str:
         if "[판정 후보 목록]" in prompt:
             return json.dumps({
                 "adjudications": [
@@ -199,7 +199,7 @@ def test_auto_merge_only_accepts_high_confidence_unblocked_rows(monkeypatch: pyt
     _configure_hybrid(monkeypatch, auto_merge=True)
     pages = _pages(3)
 
-    def fake_call_text(prompt: str, system: str = "", max_retries: int = 1) -> str:
+    def fake_call_text(prompt: str, system: str = "", max_retries: int = 1, stage: str | None = None) -> str:
         if "[판정 후보 목록]" in prompt:
             candidate_ids = _prepared_candidate_ids(prompt)
             decisions = []
@@ -238,7 +238,7 @@ def test_sheetwise_review_propagates_quota(monkeypatch: pytest.MonkeyPatch) -> N
     # Given: 후보 탐색 호출이 quota 예외를 발생시키는 보조 검수 설정
     _configure_hybrid(monkeypatch)
 
-    def raise_quota(prompt: str, system: str = "", max_retries: int = 1) -> str:
+    def raise_quota(prompt: str, system: str = "", max_retries: int = 1, stage: str | None = None) -> str:
         raise llm_client.LLMQuotaExceededError("quota")
 
     monkeypatch.setattr(llm_client, "call_text", raise_quota)

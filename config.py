@@ -120,12 +120,28 @@ OPENAI_RETRY_BASE_SECONDS = _env_int("OPENAI_RETRY_BASE_SECONDS", 10)
 OPENAI_RETRY_MAX_SECONDS = _env_int("OPENAI_RETRY_MAX_SECONDS", 60)
 OPENAI_FAIL_SOFT_ON_TRANSIENT = _env_bool("OPENAI_FAIL_SOFT_ON_TRANSIENT", True)
 
+STAGE_PROVIDERS = {
+    "extraction": os.environ.get("STAGE_PROVIDER_EXTRACTION", "").strip().lower(),
+    "vision": os.environ.get("STAGE_PROVIDER_VISION", "").strip().lower(),
+    "gap_fill": os.environ.get("STAGE_PROVIDER_GAP_FILL", "").strip().lower(),
+    "review": os.environ.get("STAGE_PROVIDER_REVIEW", "").strip().lower(),
+}
+STAGE_MODELS = {
+    "extraction": os.environ.get("STAGE_MODEL_EXTRACTION", "").strip(),
+    "vision": os.environ.get("STAGE_MODEL_VISION", "").strip(),
+    "gap_fill": os.environ.get("STAGE_MODEL_GAP_FILL", "").strip(),
+    "review": os.environ.get("STAGE_MODEL_REVIEW", "").strip(),
+}
+
 # GPT-Mini/OpenAI 기본본 + Gemini 타깃 검수 구조.
 # 기본값은 비용/시간 보호를 위해 비활성이고, 테스트 시 --hybrid-review 또는
 # HYBRID_REVIEW_ENABLED=1로 켠다. 검수 결과는 자동 병합하지 않고 별도 후보 시트에 남긴다.
 HYBRID_REVIEW_ENABLED = _env_bool("HYBRID_REVIEW_ENABLED", False)
 HYBRID_REVIEW_PROVIDER = os.environ.get("HYBRID_REVIEW_PROVIDER", "gemini").strip().lower()
 HYBRID_REVIEW_MODEL = os.environ.get("HYBRID_REVIEW_MODEL", MODEL).strip()
+HYBRID_REVIEW_TARGETED = _env_bool("HYBRID_REVIEW_TARGETED", True)
+HYBRID_REVIEW_INCLUDE_FAILED_PAGES = _env_bool("HYBRID_REVIEW_INCLUDE_FAILED_PAGES", False)
+HYBRID_REVIEW_TARGET_MAX_ROWS = _env_int("HYBRID_REVIEW_TARGET_MAX_ROWS", 50)
 HYBRID_REVIEW_SHEETS = _env_list(
     "HYBRID_REVIEW_SHEETS",
     [

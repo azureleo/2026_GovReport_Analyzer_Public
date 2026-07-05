@@ -180,7 +180,7 @@ class GapFillAgent:
             f"[배치 텍스트]\n{batch_text}\n\n"
             f"{cfg['prompt']}\n\n{_PROVENANCE_INSTRUCTION}"
         )
-        parsed, parse_ok = llm_client.call_text_json(prompt, system=GAP_FILL_SYSTEM)
+        parsed, parse_ok = llm_client.call_text_json(prompt, system=GAP_FILL_SYSTEM, stage="gap_fill")
         if not parse_ok or not isinstance(parsed, dict):
             self.ledger.append(BatchRecord(sheet_key, page_nums, "parse_fail", 0, "JSON 파싱 실패"))
             return []

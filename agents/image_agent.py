@@ -470,7 +470,7 @@ class ImageAgent:
   "other_data": {{}}
 }}"""
 
-        parsed, parse_ok = llm_client.call_vision_json(image["base64"], prompt, system=IMAGE_SYSTEM)
+        parsed, parse_ok = llm_client.call_vision_json(image["base64"], prompt, system=IMAGE_SYSTEM, stage="vision")
         if not parse_ok:
             return None
         # list나 빈 값이 반환되면 건너뜀
@@ -512,7 +512,7 @@ class ImageAgent:
 차량 등록대수/주행거리 표라면 target_sheet는 vehicle, 에너지 소비량 표라면 target_sheet는 energy로 두세요.
 이미지에 숫자축만 있고 정확한 값을 읽기 어려우면 대략값을 만들지 말고 null로 반환하세요."""
 
-        parsed, parse_ok = llm_client.call_vision_json(image["base64"], prompt, system=CHART_TABLE_SYSTEM)
+        parsed, parse_ok = llm_client.call_vision_json(image["base64"], prompt, system=CHART_TABLE_SYSTEM, stage="vision")
         if not parse_ok:
             return None
         if not parsed or not isinstance(parsed, dict):
@@ -587,7 +587,7 @@ class ImageAgent:
 - 반드시 JSON만 반환하세요."""
 
         images = [image["base64"] for _, image in batch]
-        parsed, parse_ok = llm_client.call_vision_batch_json(images, prompt, system=CHART_TABLE_SYSTEM)
+        parsed, parse_ok = llm_client.call_vision_batch_json(images, prompt, system=CHART_TABLE_SYSTEM, stage="vision")
         if not parse_ok:
             return []
         raw_analyses = parsed.get("analyses", []) if isinstance(parsed, dict) else parsed

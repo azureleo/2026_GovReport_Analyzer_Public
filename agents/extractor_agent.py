@@ -791,7 +791,7 @@ class ExtractorAgent:
             f"[배치 텍스트]\n{batch_text}\n\n"
             f"{cfg['prompt']}\n\n{_PROVENANCE_INSTRUCTION}"
         )
-        parsed, parse_ok = llm_client.call_text_json(full_prompt, system=EXTRACTION_SYSTEM)
+        parsed, parse_ok = llm_client.call_text_json(full_prompt, system=EXTRACTION_SYSTEM, stage="extraction")
 
         if not parse_ok or not isinstance(parsed, dict):
             self._record_batch(sheet_key, page_nums, "parse_fail", 0, "JSON 파싱 실패")
@@ -850,7 +850,7 @@ class ExtractorAgent:
             f"{_PROVENANCE_INSTRUCTION}\n\n"
             f"최종 출력은 다음 키를 모두 포함하는 단일 JSON 객체입니다: {{{keys_csv}}}"
         )
-        parsed, parse_ok = llm_client.call_text_json(full_prompt, system=EXTRACTION_SYSTEM)
+        parsed, parse_ok = llm_client.call_text_json(full_prompt, system=EXTRACTION_SYSTEM, stage="extraction")
 
         out: dict[str, list] = {sk: [] for sk in sheet_keys}
         if not parse_ok or not isinstance(parsed, dict):

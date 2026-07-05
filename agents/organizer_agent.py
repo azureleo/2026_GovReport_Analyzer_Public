@@ -1258,6 +1258,19 @@ class OrganizerAgent:
         self._final_data: dict = {}
         self._validation_report: list[dict] = []
 
+    def organize_sheet(self, sheet_key: str, rows: list[dict], municipality: str) -> list[dict]:
+        cleaner = _CLEANERS.get(sheet_key)
+        if cleaner is None:
+            return []
+        source_rows = [dict(row) for row in rows if isinstance(row, dict)]
+        cleaned_rows = cleaner(source_rows, municipality)
+        cleaned = {
+            "municipality_name": municipality,
+            sheet_key: [_normalize_row_provenance(row) for row in cleaned_rows],
+        }
+        _apply_default_data_status(cleaned)
+        return cleaned[sheet_key]
+
     def organize(
         self,
         raw_data: dict,

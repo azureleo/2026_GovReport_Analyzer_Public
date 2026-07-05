@@ -20,6 +20,8 @@ class LLMClientTests(unittest.TestCase):
                 "LOCAL_AGENT_TIMEOUT",
                 "GEMINI_API_KEY",
                 "LLM_QUOTA_WAIT_ENABLED",
+                "STAGE_PROVIDERS",
+                "STAGE_MODELS",
             )
         }
         self._saved_optional = {
@@ -52,8 +54,10 @@ class LLMClientTests(unittest.TestCase):
                 args = sys.argv[1:]
                 prompt = sys.stdin.read()
                 output_path = args[args.index('--output-last-message') + 1]
+                model = args[args.index('--model') + 1] if '--model' in args else ''
                 payload = {
                     'provider': 'codex',
+                    'model': model,
                     'saw_json_instruction': '유효한 JSON' in prompt,
                     'saw_system': '[시스템 지침]' in prompt,
                     'has_image': '--image' in args,
@@ -188,6 +192,22 @@ class LLMClientTests(unittest.TestCase):
             call_count = (tmpdir / "call_count.txt").read_text(encoding="utf-8")
 
         self.assertEqual(call_count, "2")
+
+    def test_stage_provider_and_model_override_route_without_changing_global_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            llm_client.config.LLM_PROVIDER = "gemini"
+            llm_client.config.GEMINI_API_KEY = ""
+            llm_client.config.CODEX_COMMAND = self._fake_codex_command(Path(tmp))
+            llm_client.config.LOCAL_AGENT_TIMEOUT = 5
+            llm_client.config.LOCAL_AGENT_MODEL = "global-model"
+            llm_client.config.STAGE_PROVIDERS = {"review": "codex"}
+            llm_client.config.STAGE_MODELS = {"review": "stage-model"}
+
+            raw = llm_client.call_text('{"answer": true}', system="system", max_retries=1, stage="review")
+            parsed = llm_client.parse_json(raw)
+
+        self.assertEqual(parsed["provider"], "codex")
+        self.assertEqual(parsed["model"], "stage-model")
 
     def test_quota_errors_raise_instead_of_returning_empty_json(self):
         with tempfile.TemporaryDirectory() as tmp:
