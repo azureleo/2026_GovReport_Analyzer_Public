@@ -753,6 +753,7 @@ class ImageAgent:
                     if target_sheet == "vision_strategy":
                         continue
 
+                    # 이미지 병합 행은 출처 문구가 없는 시트에서도 visual_only 상태를 직접 보존한다.
                     if target_sheet == "regional_conditions":
                         # 자동차/에너지 등 지역여건 데이터
                         year_int = _chart_year_int(merged_item.get("연도"))
@@ -785,6 +786,7 @@ class ImageAgent:
                             "성과지표단위": "",
                             "정량여부": True,
                             "출처페이지": analysis.get("page_number"),
+                            "데이터상태": "visual_only",
                         })
                         continue
 
@@ -801,6 +803,7 @@ class ImageAgent:
                             "예산액": val,
                             "예산단위": merged_item.get("단위") or analysis.get("unit") or "",
                             "출처페이지": analysis.get("page_number"),
+                            "데이터상태": "visual_only",
                         })
                         continue
 
@@ -856,6 +859,7 @@ class ImageAgent:
                             "목표배출량": numeric,
                             "감축률": None,
                             "출처페이지": analysis.get("page_number"),
+                            "데이터상태": "visual_only",
                         })
                     else:
                         existing_ghg.append({

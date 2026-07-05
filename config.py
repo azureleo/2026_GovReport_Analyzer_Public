@@ -90,6 +90,7 @@ GUIDELINE_PROMPT_MAX_CHARS = _env_int("GUIDELINE_PROMPT_MAX_CHARS", 3000)
 APPENDIX4_MATCH_THRESHOLD = _env_float("APPENDIX4_MATCH_THRESHOLD", 0.55)
 APPENDIX3_MATCH_THRESHOLD = _env_float("APPENDIX3_MATCH_THRESHOLD", APPENDIX4_MATCH_THRESHOLD)
 CODEBOOK_SHEET_ENABLED = _env_bool("CODEBOOK_SHEET_ENABLED", True)
+DATA_STATUS_ENABLED = _env_bool("DATA_STATUS_ENABLED", True)
 
 # 추출은 단발 JSON 작업이라 레포 파일·MCP 서버·스킬·프로젝트 메모리(CLAUDE.md)가 불필요하다.
 # True이면 claude/codex를 중립 임시 디렉터리에서 실행하고, claude는 MCP/스킬/설정/동적
@@ -339,6 +340,8 @@ _PROVENANCE_DATA_SHEETS = [name for name in EXCEL_HEADERS if name[:2].isdigit() 
 for _sheet_name in _PROVENANCE_DATA_SHEETS:
     if "출처페이지" not in EXCEL_HEADERS[_sheet_name]:
         EXCEL_HEADERS[_sheet_name].append("출처페이지")
+    if "데이터상태" not in EXCEL_HEADERS[_sheet_name]:
+        EXCEL_HEADERS[_sheet_name].append("데이터상태")
 
 # PDF 페이지 배치 처리 크기.
 # 너무 크면 출력 JSON이 길어져 파싱 실패가 늘 수 있어 안정성 위주로 둔다.

@@ -28,12 +28,14 @@ HEADER_KEY_ALIASES = {
 
 
 def _headers_for_output(sheet_name: str, headers: list[str]) -> list[str]:
-    """출처페이지 opt-out을 엑셀 쓰기 직전에 적용한다."""
-    if getattr(config, "PROVENANCE_ENABLED", True):
-        return list(headers)
+    """출처페이지·데이터상태 opt-out을 엑셀 쓰기 직전에 적용한다."""
+    output = list(headers)
     if sheet_name[:2].isdigit() and int(sheet_name[:2]) <= 15:
-        return [header for header in headers if header != "출처페이지"]
-    return list(headers)
+        if not getattr(config, "PROVENANCE_ENABLED", True):
+            output = [header for header in output if header != "출처페이지"]
+        if not getattr(config, "DATA_STATUS_ENABLED", True):
+            output = [header for header in output if header != "데이터상태"]
+    return output
 
 
 def _thin_border() -> Border:

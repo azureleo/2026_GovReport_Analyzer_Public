@@ -211,6 +211,13 @@ _NUMERIC_CONFLICT_FIELDS = {
     "기준배출량", "배출전망", "값", "활동량", "목표물량", "감축률",
 }
 _PLAN_CONTEXT_FIELD = "계획구분출처"
+_DATA_STATUS_PRIORITY = {
+    "reported": 0,
+    "gap_fill": 1,
+    "visual_only": 2,
+    "calculated": 3,
+    "conflicting": 4,
+}
 
 
 def _normalize_provenance_pages(value: Any) -> str:
@@ -293,6 +300,43 @@ def _normalize_project_id(value: Any) -> str:
 
 def _has_cell_value(value: Any) -> bool:
     return value is not None and str(value).strip() != ""
+
+
+def _set_data_status(row: dict, status: Any) -> None:
+    status_text = str(status or "").strip()
+    if status_text not in _DATA_STATUS_PRIORITY:
+        return
+    current = str(row.get("데이터상태", "") or "").strip()
+    if _DATA_STATUS_PRIORITY.get(status_text, -1) > _DATA_STATUS_PRIORITY.get(current, -1):
+        row["데이터상태"] = status_text
+
+
+def _is_visual_row(row: dict) -> bool:
+    source_values = [
+        row.get("출처"),
+        row.get("인벤토리출처"),
+        row.get("전망방법원문"),
+        row.get("주요가정"),
+    ]
+    return any("이미지" in str(value or "") for value in source_values)
+
+
+def _apply_row_data_status(row: dict) -> None:
+    _set_data_status(row, "reported")
+    if row.get("보완출처") == "gap_fill":
+        _set_data_status(row, "gap_fill")
+    if _is_visual_row(row):
+        _set_data_status(row, "visual_only")
+
+
+def _apply_default_data_status(cleaned: dict) -> None:
+    for sheet_key in getattr(config, "EXTRACTION_SHEETS", []):
+        rows = cleaned.get(sheet_key, [])
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict):
+                _apply_row_data_status(row)
 
 
 def _remember_validation_issue(
@@ -478,6 +522,7 @@ def _row_conflicts(kept: dict, discarded: dict) -> list[str]:
 
 
 def _remember_dedup_conflict(key_fields: list[str], kept: dict, discarded: dict, fields: list[str]) -> None:
+    _set_data_status(kept, "conflicting")
     key_summary = ", ".join(f"{field}={kept.get(field) or discarded.get(field) or ''}" for field in key_fields)
     detail = "; ".join(
         f"{field}: 유지 {kept.get(field)} vs 폐기 {discarded.get(field)}"
@@ -492,6 +537,9 @@ def _merge_missing_values(target: dict, source: dict) -> None:
             merged = _merge_provenance(target.get("출처페이지"), value)
             if merged:
                 target["출처페이지"] = merged
+            continue
+        if key == "데이터상태":
+            _set_data_status(target, value)
             continue
         if _has_cell_value(value) and not _has_cell_value(target.get(key)):
             target[key] = value
@@ -531,6 +579,7 @@ def _deduplicate_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
     seen: dict[tuple, dict] = {}
     for source_row in rows:
         row = _normalize_row_provenance(dict(source_row))
+        _apply_row_data_status(row)
         key = tuple(_dedup_key_text(row.get(f)) for f in key_fields)
         if key not in seen:
             seen[key] = row
@@ -832,6 +881,7 @@ def _recompute_reduction_rate(rows: list[dict], municipality: str) -> list[dict]
             sector = row.get("부문") or row.get("목표수준") or ""
             if rate is None:
                 row["감축률"] = computed
+                _set_data_status(row, "calculated")
             elif isinstance(rate, (int, float)) and abs(rate - computed) > 1.0:
                 issues.append(_issue(
                     municipality, "경고", "감축목표", f"감축률 불일치({sector} {row.get('목표연도')})",
@@ -841,6 +891,7 @@ def _recompute_reduction_rate(rows: list[dict], municipality: str) -> list[dict]
                     target_row_number=index,
                 ))
                 row["감축률"] = computed
+                _set_data_status(row, "calculated")
         # 산식과 무관하게 비정상 범위는 점검 항목으로만 표시(흡수원 음수는 정상 가능).
         final_rate = row.get("감축률")
         if isinstance(final_rate, (int, float)) and (final_rate > 100 or final_rate < -50):
@@ -1240,6 +1291,7 @@ class OrganizerAgent:
         cleaned["chart_observations"] = observations
         cleaned["visual_inventory"] = _build_visual_inventory(observations, municipality)
         cleaned["codebook"] = build_codebook_rows() if getattr(config, "CODEBOOK_SHEET_ENABLED", True) else []
+        _apply_default_data_status(cleaned)
         _tag_prior_plan_rows(cleaned, municipality, prior_plan_pages or set())
 
         # 결정론적 검증·정합성 점검(감축률 재계산은 reduction_targets를 인플레이스 교정).
