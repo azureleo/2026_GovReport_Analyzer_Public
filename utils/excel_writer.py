@@ -5,9 +5,11 @@ carbon_guideline.md 기반 16개 시트 구조의 Excel 파일을 생성합니�
 """
 
 from datetime import datetime
+import json
 from pathlib import Path
 
 import openpyxl
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import (
     Alignment, Font, PatternFill, Border, Side,
 )
@@ -80,6 +82,22 @@ def _fallback_output_path(output_path: Path) -> Path:
     return output_path.with_name(f"{output_path.stem}_{timestamp}{suffix}")
 
 
+def _sanitize_cell_value(value):
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, str):
+        return ILLEGAL_CHARACTERS_RE.sub("", value)
+    return value
+
+
+def _write_cell(ws, row: int, column: int, value):
+    sanitized = _sanitize_cell_value(value)
+    cell = ws.cell(row=row, column=column, value=sanitized)
+    if isinstance(sanitized, str) and sanitized.startswith(("=", "+", "@")):
+        cell.data_type = "s"
+    return cell
+
+
 def _write_generic_sheet(ws, headers: list[str], data: list[dict]):
     """범용 시트 작성: 헤더 기반으로 데이터를 행에 씀"""
     _apply_header_row(ws, headers)
@@ -92,7 +110,7 @@ def _write_generic_sheet(ws, headers: list[str], data: list[dict]):
                 val = row_data.get(HEADER_KEY_ALIASES[header], None)
             if isinstance(val, bool):
                 val = "Y" if val else "N"
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell = _write_cell(ws, row_idx, col_idx, val)
             cell.border = _thin_border()
             cell.alignment = Alignment(
                 horizontal="center" if col_idx <= 4 else "left",
