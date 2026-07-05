@@ -2,23 +2,26 @@
 LLM/로컬 에이전트 공통 래퍼.
 
 기본 실행 경로는 Gemini API가 아니라 로컬 에이전트 CLI입니다.
-- call_text()  : 텍스트 프롬프트를 Codex/Claude Code 같은 로컬 에이전트에 전달
-- call_vision(): 이미지 파일을 임시로 저장한 뒤 로컬 에이전트에 첨부/경로 전달
+- call_text()  : 텍스트 프롬프트를 선택된 LLM 백엔드에 전달
+- call_vision(): 이미지 파일을 선택된 LLM 백엔드에 전달
 - call_vision_batch(): 여러 이미지를 한 번에 첨부해 전수 분석 호출 수를 줄임
 - parse_json() : 에이전트 응답에서 JSON만 안전하게 파싱
 
 환경변수/CLI(main.py)로 선택 가능한 백엔드:
 - LLM_PROVIDER=codex  : `codex exec` 사용 (기본값)
 - LLM_PROVIDER=claude : `claude -p` 사용
-- LLM_PROVIDER=auto   : codex → claude → gemini 순으로 사용 가능한 백엔드 선택
+- LLM_PROVIDER=auto   : codex → claude → gemini → openai 순으로 사용 가능한 백엔드 선택
 - LLM_PROVIDER=gemini : 기존 Gemini API 백엔드(명시 선택 시에만)
+- LLM_PROVIDER=openai : OpenAI Responses API 사용
 """
 
 from __future__ import annotations
 
 import base64
+import importlib
 import json
 import logging
+import random
 import re
 import shlex
 import shutil
@@ -56,6 +59,30 @@ _QUOTA_ERROR_MARKERS = (
     "429",
     "한도",
     "할당량",
+)
+
+
+_TRANSIENT_ERROR_MARKERS = (
+    "503",
+    "unavailable",
+    "service unavailable",
+    "high demand",
+    "temporarily",
+    "temporary",
+    "server error",
+    "internal error",
+    "deadline",
+    "timeout",
+)
+
+
+_OPENAI_QUOTA_ERROR_MARKERS = (
+    "insufficient_quota",
+    "billing",
+    "exceeded your current quota",
+    "quota exceeded",
+    "payment",
+    "credit",
 )
 
 
@@ -158,6 +185,8 @@ def _resolve_provider(stage: str | None = None) -> str:
         "local-agent": "codex",
         "claude-code": "claude",
         "gemini-api": "gemini",
+        "gpt": "openai",
+        "openai-api": "openai",
     }
     provider = aliases.get(provider, provider)
 
@@ -168,9 +197,11 @@ def _resolve_provider(stage: str | None = None) -> str:
             return "claude"
         if getattr(config, "GEMINI_API_KEY", ""):
             return "gemini"
+        if getattr(config, "OPENAI_API_KEY", ""):
+            return "openai"
         raise RuntimeError(
             "사용 가능한 로컬 에이전트를 찾지 못했습니다. "
-            "Codex CLI 또는 Claude Code를 설치하거나 LLM_PROVIDER를 명시하세요."
+            "Codex CLI 또는 Claude Code를 설치하거나 API 백엔드를 설정하세요."
         )
 
     if provider == "codex" and not _command_exists(getattr(config, "CODEX_COMMAND", "codex")):
@@ -179,7 +210,9 @@ def _resolve_provider(stage: str | None = None) -> str:
         raise RuntimeError("Claude Code CLI를 찾을 수 없습니다. CLAUDE_COMMAND 또는 --agent codex를 설정하세요.")
     if provider == "gemini" and not getattr(config, "GEMINI_API_KEY", ""):
         raise RuntimeError("Gemini 백엔드를 사용하려면 GEMINI_API_KEY가 필요합니다.")
-    if provider not in {"codex", "claude", "gemini"}:
+    if provider == "openai" and not getattr(config, "OPENAI_API_KEY", ""):
+        raise RuntimeError("OpenAI 백엔드를 사용하려면 OPENAI_API_KEY가 필요합니다.")
+    if provider not in {"codex", "claude", "gemini", "openai"}:
         raise RuntimeError(f"지원하지 않는 LLM_PROVIDER 값입니다: {provider}")
     return provider
 
@@ -215,6 +248,16 @@ def _is_quota_error_message(message: str) -> bool:
     return any(marker in normalized for marker in _QUOTA_ERROR_MARKERS)
 
 
+def _is_transient_error_message(message: str) -> bool:
+    normalized = message.casefold()
+    return any(marker in normalized for marker in _TRANSIENT_ERROR_MARKERS)
+
+
+def _is_openai_quota_error_message(message: str) -> bool:
+    normalized = message.casefold()
+    return any(marker in normalized for marker in _OPENAI_QUOTA_ERROR_MARKERS)
+
+
 def _stage_model(stage: str | None) -> str:
     return _stage_config_value("STAGE_MODELS", stage)
 
@@ -223,6 +266,8 @@ def _model_identity(provider: str, stage: str | None = None) -> str:
     stage_model = _stage_model(stage)
     if provider == "gemini":
         return stage_model or str(getattr(config, "MODEL", ""))
+    if provider == "openai":
+        return stage_model or str(getattr(config, "OPENAI_MODEL", ""))
     if provider == "codex":
         return ":".join([
             str(getattr(config, "CODEX_COMMAND", "codex")),
@@ -554,6 +599,21 @@ def call_text(
             lambda: _record_call("text", provider, produce_gemini_text),
         )
 
+    if provider == "openai":
+        return cached_response(
+            request,
+            lambda: _record_call(
+                "text",
+                provider,
+                lambda: _call_openai_text(
+                    prompt,
+                    system,
+                    max_retries=max_retries,
+                    model=stage_model or None,
+                ),
+            ),
+        )
+
     return cached_response(
         request,
         lambda: _record_call(
@@ -595,6 +655,22 @@ def call_vision(
         return cached_response(
             request,
             lambda: _record_call("vision", provider, produce_gemini_vision),
+        )
+
+    if provider == "openai":
+        return cached_response(
+            request,
+            lambda: _record_call(
+                "vision",
+                provider,
+                lambda: _call_openai_vision(
+                    image_b64,
+                    prompt,
+                    system,
+                    max_retries=max_retries,
+                    model=stage_model or None,
+                ),
+            ),
         )
 
     return cached_response(
@@ -645,6 +721,22 @@ def call_vision_batch(
             lambda: _record_call("vision_batch", provider, produce_gemini_vision_batch),
         )
 
+    if provider == "openai":
+        return cached_response(
+            request,
+            lambda: _record_call(
+                "vision_batch",
+                provider,
+                lambda: _call_openai_vision_batch(
+                    images_b64,
+                    prompt,
+                    system,
+                    max_retries=max_retries,
+                    model=stage_model or None,
+                ),
+            ),
+        )
+
     return cached_response(
         request,
         lambda: _record_call(
@@ -656,6 +748,223 @@ def call_vision_batch(
                 label=f"{provider} vision batch",
             ),
         ),
+    )
+
+
+def _get_openai_client_class():
+    """OpenAI 백엔드는 명시적으로 선택된 경우에만 SDK를 지연 import한다."""
+    try:
+        module = importlib.import_module("openai")
+    except ImportError as exc:  # pragma: no cover - 선택 백엔드 미설치 환경용
+        raise RuntimeError(
+            "OpenAI 백엔드를 사용하려면 openai 패키지를 설치하세요: pip install openai"
+        ) from exc
+    try:
+        return module.OpenAI
+    except AttributeError as exc:  # pragma: no cover - 비정상 SDK 설치 환경용
+        raise RuntimeError("OpenAI SDK에서 OpenAI 클라이언트를 찾지 못했습니다.") from exc
+
+
+def _openai_client():
+    client_class = _get_openai_client_class()
+    return client_class(api_key=config.OPENAI_API_KEY)
+
+
+def _openai_instructions(system: str = "") -> str:
+    parts = [_JSON_ONLY_INSTRUCTION]
+    if system:
+        parts.append(system.strip())
+    return "\n\n".join(parts)
+
+
+def _openai_response_text(response: Any) -> str:
+    """Responses API 결과에서 SDK 버전 차이를 흡수해 텍스트를 꺼낸다."""
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    chunks: list[str] = []
+    output = getattr(response, "output", None)
+    if output is None and isinstance(response, dict):
+        output = response.get("output")
+    for item in output or []:
+        content = getattr(item, "content", None)
+        if content is None and isinstance(item, dict):
+            content = item.get("content")
+        for part in content or []:
+            text = getattr(part, "text", None)
+            if text is None and isinstance(part, dict):
+                text = part.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+    if chunks:
+        return "\n".join(chunks).strip()
+
+    text = getattr(response, "text", None)
+    if isinstance(text, str):
+        return text.strip()
+    raise LLMCallError("OpenAI 응답에서 텍스트를 찾지 못했습니다.")
+
+
+def _openai_max_retries(max_retries: int) -> int:
+    return max(max_retries, int(getattr(config, "OPENAI_MAX_RETRIES", max_retries)))
+
+
+def _is_openai_transient_error(e: Exception) -> bool:
+    status_code = getattr(e, "status_code", None)
+    if status_code in {408, 409, 429, 500, 502, 503, 504}:
+        return True
+    message = str(e)
+    normalized = message.casefold()
+    return (
+        _is_transient_error_message(message)
+        or "rate_limit" in normalized
+        or "rate limit" in normalized
+        or "connection" in normalized
+    )
+
+
+def _handle_openai_retry(e: Exception, attempt: int, max_retries: int, label: str) -> bool:
+    if attempt >= max_retries or _is_openai_quota_error_message(str(e)):
+        return False
+
+    base = max(1, int(getattr(config, "OPENAI_RETRY_BASE_SECONDS", 10)))
+    max_wait = max(base, int(getattr(config, "OPENAI_RETRY_MAX_SECONDS", 60)))
+    if _is_openai_transient_error(e):
+        wait = min(max_wait, base * (2 ** (attempt - 1)))
+        wait += random.uniform(0, min(2.0, base / 4))
+        logger.warning(
+            "%s 일시 오류: %s. %.1f초 후 재시도 (%s/%s)",
+            label,
+            e,
+            wait,
+            attempt,
+            max_retries,
+        )
+    else:
+        wait = 5
+        logger.warning("%s 오류: %s. %s초 후 재시도 (%s/%s)", label, e, wait, attempt, max_retries)
+    time.sleep(wait)
+    return True
+
+
+def _should_fail_soft_openai(e: Exception | None) -> bool:
+    if e is None or _is_openai_quota_error_message(str(e)):
+        return False
+    return bool(getattr(config, "OPENAI_FAIL_SOFT_ON_TRANSIENT", True)) and _is_openai_transient_error(e)
+
+
+def _empty_json_after_openai_failure(label: str, last_error: Exception | None) -> str:
+    logger.error(
+        "%s 일시 오류 최대 재시도 초과. 해당 호출은 빈 JSON으로 처리하고 파이프라인을 계속합니다: %s",
+        label,
+        last_error,
+    )
+    return "{}"
+
+
+def _openai_request_args(
+    prompt: str,
+    system: str = "",
+    images_b64: Sequence[str] | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    content: list[dict[str, Any]] = []
+    for image in list(images_b64 or []):
+        content.append({
+            "type": "input_image",
+            "image_url": f"data:image/png;base64,{image}",
+        })
+    content.append({"type": "input_text", "text": prompt})
+
+    return {
+        "model": model or getattr(config, "OPENAI_MODEL", "gpt-5.4-mini"),
+        "instructions": _openai_instructions(system),
+        "input": [{"role": "user", "content": content}],
+        "max_output_tokens": int(getattr(config, "OPENAI_MAX_OUTPUT_TOKENS", 32768)),
+        "text": {"format": {"type": "json_object"}},
+    }
+
+
+def _call_openai_response(
+    prompt: str,
+    system: str,
+    *,
+    images_b64: Sequence[str] | None = None,
+    max_retries: int = config.MAX_RETRIES,
+    label: str = "OpenAI",
+    model: str | None = None,
+) -> str:
+    max_retries = _openai_max_retries(max_retries)
+    client = _openai_client()
+    request_args = _openai_request_args(prompt, system, images_b64=images_b64, model=model)
+
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.responses.create(**request_args)
+            return _openai_response_text(response)
+        except Exception as e:  # noqa: BLE001 - SDK 예외 범위가 넓고 버전별 타입이 다르다.
+            last_error = e
+            if not _handle_openai_retry(e, attempt, max_retries, label):
+                break
+
+    logger.error("%s 최대 재시도 초과.", label)
+    if last_error is not None and _is_openai_quota_error_message(str(last_error)):
+        raise LLMQuotaExceededError(f"{label} quota/billing 한도 초과") from last_error
+    if _should_fail_soft_openai(last_error):
+        return _empty_json_after_openai_failure(label, last_error)
+    if last_error is not None:
+        raise LLMCallError(f"{label} 최대 재시도 초과") from last_error
+    raise LLMCallError(f"{label} 호출 실패")
+
+
+def _call_openai_text(
+    prompt: str,
+    system: str = "",
+    max_retries: int = config.MAX_RETRIES,
+    model: str | None = None,
+) -> str:
+    return _call_openai_response(
+        prompt,
+        system,
+        max_retries=max_retries,
+        label="OpenAI",
+        model=model,
+    )
+
+
+def _call_openai_vision(
+    image_b64: str,
+    prompt: str,
+    system: str = "",
+    max_retries: int = config.MAX_RETRIES,
+    model: str | None = None,
+) -> str:
+    return _call_openai_response(
+        prompt,
+        system,
+        images_b64=[image_b64],
+        max_retries=max_retries,
+        label="OpenAI vision",
+        model=model,
+    )
+
+
+def _call_openai_vision_batch(
+    images_b64: Sequence[str],
+    prompt: str,
+    system: str = "",
+    max_retries: int = config.MAX_RETRIES,
+    model: str | None = None,
+) -> str:
+    return _call_openai_response(
+        prompt,
+        system,
+        images_b64=images_b64,
+        max_retries=max_retries,
+        label="OpenAI vision batch",
+        model=model,
     )
 
 

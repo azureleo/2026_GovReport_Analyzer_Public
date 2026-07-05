@@ -19,6 +19,12 @@ class LLMClientTests(unittest.TestCase):
                 "LOCAL_AGENT_MODEL",
                 "LOCAL_AGENT_TIMEOUT",
                 "GEMINI_API_KEY",
+                "OPENAI_API_KEY",
+                "OPENAI_MODEL",
+                "OPENAI_MAX_RETRIES",
+                "OPENAI_RETRY_BASE_SECONDS",
+                "OPENAI_RETRY_MAX_SECONDS",
+                "OPENAI_FAIL_SOFT_ON_TRANSIENT",
                 "LLM_QUOTA_WAIT_ENABLED",
                 "STAGE_PROVIDERS",
                 "STAGE_MODELS",
@@ -112,6 +118,91 @@ class LLMClientTests(unittest.TestCase):
             encoding="utf-8",
         )
         return f"{sys.executable} {fake}"
+
+    def test_auto_provider_falls_back_to_openai_when_only_openai_key_exists(self):
+        llm_client.config.LLM_PROVIDER = "auto"
+        llm_client.config.CODEX_COMMAND = "__missing_codex_for_test__"
+        llm_client.config.CLAUDE_COMMAND = "__missing_claude_for_test__"
+        llm_client.config.GEMINI_API_KEY = ""
+        llm_client.config.OPENAI_API_KEY = "openai-key"
+
+        provider = llm_client._resolve_provider()
+
+        self.assertEqual(provider, "openai")
+
+    def test_openai_requires_api_key_with_korean_message(self):
+        llm_client.config.LLM_PROVIDER = "openai"
+        llm_client.config.OPENAI_API_KEY = ""
+
+        with self.assertRaisesRegex(RuntimeError, "OPENAI_API_KEY"):
+            llm_client._resolve_provider()
+
+    def test_openai_stage_model_is_used_for_call_and_cache_key(self):
+        calls = []
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                return type("Response", (), {"output_text": f'{{"model": "{kwargs["model"]}", "call": {len(calls)}}}'})()
+
+        class FakeOpenAI:
+            def __init__(self, api_key):
+                self.api_key = api_key
+                self.responses = FakeResponses()
+
+        original_client_class = llm_client._get_openai_client_class
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                llm_client.config.LLM_PROVIDER = "openai"
+                llm_client.config.OPENAI_API_KEY = "openai-key"
+                llm_client.config.OPENAI_MODEL = "global-openai"
+                llm_client.config.STAGE_MODELS = {"review": "review-openai-a"}
+                llm_client.config.LLM_CACHE_ENABLED = True
+                llm_client.config.LLM_CACHE_DIR = str(Path(tmp) / "cache")
+                llm_client.config.LLM_CACHE_VERSION = "openai-stage-cache"
+                llm_client._get_openai_client_class = lambda: FakeOpenAI
+
+                first = llm_client.parse_json(llm_client.call_text('{"answer": true}', stage="review"))
+                cached = llm_client.parse_json(llm_client.call_text('{"answer": true}', stage="review"))
+
+                llm_client.config.STAGE_MODELS = {"review": "review-openai-b"}
+                changed_model = llm_client.parse_json(llm_client.call_text('{"answer": true}', stage="review"))
+        finally:
+            llm_client._get_openai_client_class = original_client_class
+
+        self.assertEqual(first, {"model": "review-openai-a", "call": 1})
+        self.assertEqual(cached, first)
+        self.assertEqual(changed_model, {"model": "review-openai-b", "call": 2})
+        self.assertEqual([call["model"] for call in calls], ["review-openai-a", "review-openai-b"])
+
+    def test_openai_quota_marker_raises_quota_error(self):
+        class FakeResponses:
+            def create(self, **kwargs):
+                raise RuntimeError("insufficient_quota: billing hard limit")
+
+        class FakeOpenAI:
+            def __init__(self, api_key):
+                self.api_key = api_key
+                self.responses = FakeResponses()
+
+        original_client_class = llm_client._get_openai_client_class
+        original_sleep = llm_client.time.sleep
+
+        try:
+            llm_client.config.LLM_PROVIDER = "openai"
+            llm_client.config.OPENAI_API_KEY = "openai-key"
+            llm_client.config.OPENAI_MODEL = "global-openai"
+            llm_client.config.OPENAI_MAX_RETRIES = 3
+            llm_client.config.LLM_CACHE_ENABLED = False
+            llm_client._get_openai_client_class = lambda: FakeOpenAI
+            llm_client.time.sleep = lambda seconds: None
+
+            with self.assertRaises(llm_client.LLMQuotaExceededError):
+                llm_client.call_text('{"answer": true}', max_retries=1)
+        finally:
+            llm_client._get_openai_client_class = original_client_class
+            llm_client.time.sleep = original_sleep
 
     def test_call_text_uses_codex_cli_output_last_message(self):
         with tempfile.TemporaryDirectory() as tmp:
