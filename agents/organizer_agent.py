@@ -14,6 +14,13 @@ from copy import deepcopy
 from typing import Any
 
 import config
+from utils.reference_data import (
+    build_codebook_rows,
+    find_appendix3_unit_by_id,
+    match_appendix3_unit,
+    match_appendix4_project,
+    normalise_key_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -260,12 +267,7 @@ def _row_source_pages(row: dict) -> set[int]:
 
 def _dedup_key_text(val: Any) -> str:
     """dedup 키 생성 전용 텍스트 정규화. 원본 셀 값은 바꾸지 않는다."""
-    if val is None:
-        return ""
-    text = unicodedata.normalize("NFKC", str(val))
-    text = text.replace("ㆍ", "·").replace("･", "·").replace("ᆞ", "·").replace("・", "·")
-    text = re.sub(r"\s+", " ", text).strip().casefold()
-    return text.replace(" ", "")
+    return normalise_key_text(val).replace(" ", "")
 
 
 def _normalize_project_id(value: Any) -> str:
@@ -325,6 +327,69 @@ def _normalise_sector_with_raw(row: dict, field: str, raw_field: str) -> str:
     if raw_text and normalized and normalized != raw_text:
         row[raw_field] = raw_text
     return normalized
+
+
+def _apply_appendix4_project_match(row: dict, municipality: str, row_index: int) -> None:
+    match = match_appendix4_project(row.get("사업명"))
+    if match is None:
+        return
+    reference = match["row"]
+    row["표준사업연번"] = reference.get("연번")
+    row["표준사업명"] = reference.get("사업명")
+    row["매칭신뢰도"] = match["confidence"]
+
+    reference_sector = str(reference.get("부문", "") or "").strip()
+    current_sector = str(row.get("부문", "") or "").strip()
+    if reference_sector and not current_sector:
+        row["부문"] = reference_sector
+        return
+    if reference_sector and current_sector and current_sector != reference_sector:
+        _remember_validation_issue(
+            municipality,
+            "정보",
+            _sheet_area("mitigation_projects"),
+            f"부문 불일치(08 행 {row_index})",
+            f"행 부문 '{current_sector}' vs 부록4 '{reference_sector}'",
+            "지자체 신규/혼합 사업인지 확인하고 필요 시 부문을 수동 보정",
+        )
+
+
+def _appendix3_reference_value(reference: dict[str, str] | None) -> float | None:
+    if reference is None:
+        return None
+    return _to_float(reference.get("원단위값"))
+
+
+def _apply_appendix3_unit_match(row: dict, municipality: str, row_index: int) -> None:
+    unit_id = str(row.get("감축원단위ID", "") or "").strip()
+    reference = find_appendix3_unit_by_id(unit_id, row.get("모니터링인자")) if unit_id else None
+    match = None
+    if reference is None:
+        match = match_appendix3_unit(row.get("사업명"), row.get("모니터링인자"))
+        reference = match["row"] if match is not None else None
+    if reference is None:
+        return
+
+    if not unit_id:
+        row["감축원단위ID"] = reference.get("번호")
+        if match is not None:
+            row["감축원단위매칭신뢰도"] = match["confidence"]
+    reference_value = _appendix3_reference_value(reference)
+    current_value = row.get("감축원단위값")
+    if current_value is None and reference_value is not None:
+        row["감축원단위값"] = reference_value
+        return
+    if not isinstance(current_value, (int, float)) or reference_value in (None, 0):
+        return
+    if abs(current_value - reference_value) / abs(reference_value) > 0.05:
+        _remember_validation_issue(
+            municipality,
+            "정보",
+            _sheet_area("quantitative_reductions"),
+            f"감축원단위값 차이(10 행 {row_index})",
+            f"행 값 {current_value} vs 부록3 {reference.get('번호')} 값 {reference_value}",
+            "원문 산식·단위와 부록3 적용 가능성을 확인",
+        )
 
 
 def _merge_target_year_values(values: list[Any]) -> str:
@@ -591,9 +656,10 @@ def _clean_vision_strategy(rows: list[dict], municipality: str) -> list[dict]:
 
 
 def _clean_mitigation_projects(rows: list[dict], municipality: str) -> list[dict]:
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         row["지자체명"] = row.get("지자체명") or municipality
         row["부문"] = _normalise_sector_with_raw(row, "부문", "부문원문")
+        _apply_appendix4_project_match(row, municipality, index)
     return _filter_empty_rows(rows, ["사업명"])
 
 
@@ -608,12 +674,13 @@ def _clean_annual_implementation(rows: list[dict], municipality: str) -> list[di
 
 
 def _clean_quantitative_reductions(rows: list[dict], municipality: str) -> list[dict]:
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         row["지자체명"] = row.get("지자체명") or municipality
         row["연도"] = _to_int(row.get("연도"))
         row["활동량"] = _to_float(row.get("활동량"))
         row["감축원단위값"] = _to_float(row.get("감축원단위값"))
         row["예상감축량"] = _to_float(row.get("예상감축량"))
+        _apply_appendix3_unit_match(row, municipality, index)
     return _filter_empty_rows(rows, ["예상감축량", "활동량"])
 
 
@@ -1172,6 +1239,7 @@ class OrganizerAgent:
             observations = []
         cleaned["chart_observations"] = observations
         cleaned["visual_inventory"] = _build_visual_inventory(observations, municipality)
+        cleaned["codebook"] = build_codebook_rows() if getattr(config, "CODEBOOK_SHEET_ENABLED", True) else []
         _tag_prior_plan_rows(cleaned, municipality, prior_plan_pages or set())
 
         # 결정론적 검증·정합성 점검(감축률 재계산은 reduction_targets를 인플레이스 교정).

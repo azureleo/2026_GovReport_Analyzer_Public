@@ -87,6 +87,9 @@ CODEX_COMMAND = os.environ.get("CODEX_COMMAND", "codex").strip()
 CLAUDE_COMMAND = os.environ.get("CLAUDE_COMMAND", "claude").strip()
 GUIDELINE_STRUCTURED_INJECTION = _env_bool("GUIDELINE_STRUCTURED_INJECTION", True)
 GUIDELINE_PROMPT_MAX_CHARS = _env_int("GUIDELINE_PROMPT_MAX_CHARS", 3000)
+APPENDIX4_MATCH_THRESHOLD = _env_float("APPENDIX4_MATCH_THRESHOLD", 0.55)
+APPENDIX3_MATCH_THRESHOLD = _env_float("APPENDIX3_MATCH_THRESHOLD", APPENDIX4_MATCH_THRESHOLD)
+CODEBOOK_SHEET_ENABLED = _env_bool("CODEBOOK_SHEET_ENABLED", True)
 
 # 추출은 단발 JSON 작업이라 레포 파일·MCP 서버·스킬·프로젝트 메모리(CLAUDE.md)가 불필요하다.
 # True이면 claude/codex를 중립 임시 디렉터리에서 실행하고, claude는 MCP/스킬/설정/동적
@@ -263,6 +266,9 @@ EXCEL_HEADERS = {
     "19_검증리포트": [
         "지자체명", "심각도", "영역", "항목", "문제내용", "권장조치",
     ],
+    "90_코드북": [
+        "코드유형", "코드", "라벨", "정의", "비고",
+    ],
 }
 
 # 추출 대상 시트 키 목록 (파이프라인에서 LLM으로 추출하는 시트)
@@ -320,10 +326,11 @@ SHEET_KEY_TO_NAME = {
     "hybrid_review_candidates": "17_보조검수후보",
     "hybrid_merge_log": "18_보조병합로그",
     "validation_report": "19_검증리포트",
+    "codebook": "90_코드북",
 }
 
 # 데이터가 있을 때만 생성하는 선택 시트
-OPTIONAL_EXCEL_SHEETS = {"17_보조검수후보", "18_보조병합로그", "19_검증리포트"}
+OPTIONAL_EXCEL_SHEETS = {"17_보조검수후보", "18_보조병합로그", "19_검증리포트", "90_코드북"}
 
 # 행 단위 원문 대조를 위한 페이지 근거. 헤더에는 항상 맨 뒤에 추가하되,
 # 실제 엑셀 출력에서만 PROVENANCE_ENABLED=0으로 v3 스키마를 복원할 수 있다.

@@ -117,6 +117,9 @@ def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
     optional_sheets = getattr(config, "OPTIONAL_EXCEL_SHEETS", set())
 
     for sheet_name, headers in config.EXCEL_HEADERS.items():
+        if sheet_name == "90_코드북" and not getattr(config, "CODEBOOK_SHEET_ENABLED", True):
+            continue
+
         # config.SHEET_KEY_TO_NAME 역매핑으로 데이터 키 찾기
         data_key = None
         for key, name in config.SHEET_KEY_TO_NAME.items():
