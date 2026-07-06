@@ -336,6 +336,7 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 │  └─ excel_writer.py         # openpyxl 기반 Excel 생성
 ├─ scripts/
 │  ├─ run_ab_validation.py    # A/B 검증 리포트 생성
+│  ├─ audit_visual_inventory.py # 시각 요소 인벤토리 dump/audit 리포트
 │  ├─ build_reference_data.py # 부록 CSV 생성(1회, 경계 검증 내장)
 │  └─ verify_routing_coverage.py
 └─ tests/                     # 신뢰성·기능 계약 회귀 테스트
@@ -383,6 +384,25 @@ py scripts/verify_routing_coverage.py "서울특별시_탄소중립계획_정리
 ```powershell
 py scripts/run_ab_validation.py "서울특별시_탄소중립계획.pdf" --output-dir output/ab
 ```
+
+
+### 시각 요소 인벤토리 리콜 감사
+
+`16_시각자료목록`이 서울 문서의 차트·이미지 표·그래프를 어느 단계에서 놓치는지 확인할 때 사용합니다. 이 도구는 PDF 파싱(PyMuPDF), 기존 이미지 triage(Pillow 휴리스틱), xlsx 대조만 수행하며 LLM/vision 백엔드는 호출하지 않습니다. `IMAGE_TRIAGE_MIN_SCORE`나 `VECTOR_RENDER_MIN_DRAWINGS` 기본값도 바꾸지 않고, 임계 조정 판단에 필요한 숫자만 리포트합니다.
+
+```powershell
+# 사람 확정 인벤토리 작성을 위한 초안 생성
+py scripts/audit_visual_inventory.py dump "서울특별시_탄소중립계획.pdf" --out data/golden/시각요소_초안.xlsx
+
+# 사람 확정 인벤토리와 파이프라인 출력의 16_시각자료목록 대조
+py scripts/audit_visual_inventory.py audit `
+  data/golden/서울_시각요소_인벤토리_v1.xlsx `
+  output/서울_결과.xlsx `
+  "서울특별시_탄소중립계획.pdf" `
+  --report-dir output
+```
+
+리포트는 `visual_inventory_audit_*.md/json`으로 저장되며 요소별 상태(`이미지_미추출`, `triage_탈락`, `참고자료_제외`, `vision_유실`, `동일페이지_부분기록`, `기록됨`), 유형별 리콜, `IMAGE_TRIAGE_MIN_SCORE={3,4,5,6}` 및 `VECTOR_RENDER_MIN_DRAWINGS={30,45,60}` 민감도 표를 포함합니다. dump 초안은 파이프라인이 본 후보만 나열하므로 사람이 원문 PDF를 넘기며 통째로 누락된 요소를 직접 추가해야 최종 인벤토리가 됩니다.
 
 ### 캐시
 
