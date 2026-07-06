@@ -245,6 +245,14 @@ def _caption_candidates(text: str) -> str:
     return " | ".join(match.group(0).strip() for match in _CAPTION_RE.finditer(text or ""))
 
 
+def _limited_reasons_with_reference(reasons: Sequence[str], limit: int) -> tuple[str, ...]:
+    selected = list(reasons[:limit])
+    for reason in reasons:
+        if reason.startswith("reference_context:") and reason not in selected:
+            selected.append(reason)
+    return tuple(selected)
+
+
 def _triage_page_evidence(pdf_path: Path, municipality: str) -> dict[int, PageEvidence]:
     pdf = extract_pdf(pdf_path)
     drawings = _drawing_counts(pdf_path)
@@ -282,7 +290,7 @@ def _triage_page_evidence(pdf_path: Path, municipality: str) -> dict[int, PageEv
             triage_passed_count=passed_counts[page.page_number],
             reference_filtered_count=reference_counts[page.page_number],
             top_score=top_score,
-            top_reasons=tuple(reasons.get(page.page_number, [])[:6]),
+            top_reasons=_limited_reasons_with_reference(tuple(reasons.get(page.page_number, [])), 6),
             drawing_count=drawings.get(page.page_number, 0),
             triage_scores=page_scores,
         )
@@ -466,11 +474,7 @@ def _type_breakdown(audits: Sequence[ElementAudit]) -> list[str]:
 
 
 def _display_reasons(reasons: Sequence[str]) -> str:
-    selected = list(reasons[:4])
-    for reason in reasons:
-        if reason.startswith("reference_context:") and reason not in selected:
-            selected.append(reason)
-    return ",".join(selected)
+    return ",".join(_limited_reasons_with_reference(reasons, 4))
 
 
 def _detail_lines(audits: Sequence[ElementAudit]) -> list[str]:

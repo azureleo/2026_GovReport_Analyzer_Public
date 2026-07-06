@@ -391,3 +391,14 @@ def test_detail_table_keeps_reference_context_reason_when_reason_list_is_long() 
 
     # Then: reference_context 사유가 잘리지 않고 표시된다.
     assert "reference_context:OECD" in lines[-1]
+
+
+def test_limited_reasons_preserve_reference_context_when_source_reason_list_is_long() -> None:
+    # Given: reference_context가 제한 개수 밖에 있으면
+    reasons = ("large", "line_grid_density", "page_render", "context:그림", "negative_context:목차", "weak_render_context", "reference_context:OECD")
+
+    # When: 감사 표시용 사유를 제한하면
+    limited = audit._limited_reasons_with_reference(reasons, 6)
+
+    # Then: reference_context 사유는 잘리지 않는다.
+    assert "reference_context:OECD" in limited
