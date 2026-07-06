@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from utils import llm_client
 
 
@@ -72,3 +76,40 @@ def test_gemini_timeout_enters_retry_path(monkeypatch) -> None:
 
     assert result == '{"ok": true}'
     assert calls == {"count": 2, "sleeps": [5]}
+
+
+def test_gemini_missing_genai_module_message_names_module(monkeypatch) -> None:
+    def fake_import_module(name: str):
+        raise ImportError("missing", name=name)
+
+    monkeypatch.setattr(llm_client.importlib, "import_module", fake_import_module)
+
+    with pytest.raises(RuntimeError, match="google.genai"):
+        llm_client._get_gemini_modules()
+
+
+def test_gemini_missing_api_core_module_message_names_module(monkeypatch) -> None:
+    class FakeGenai:
+        pass
+
+    class FakeTypes:
+        pass
+
+    def fake_import_module(name: str):
+        if name == "google.genai":
+            return FakeGenai
+        if name == "google.genai.types":
+            return FakeTypes
+        raise ImportError("missing", name=name)
+
+    monkeypatch.setattr(llm_client.importlib, "import_module", fake_import_module)
+
+    with pytest.raises(RuntimeError, match="google.api_core.exceptions"):
+        llm_client._get_gemini_modules()
+
+
+def test_requirements_lists_google_api_core() -> None:
+    body = Path("requirements.txt").read_text(encoding="utf-8")
+
+    assert "google-genai" in body
+    assert "google-api-core" in body

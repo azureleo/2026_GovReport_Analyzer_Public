@@ -973,16 +973,21 @@ def _call_openai_vision_batch(
     )
 
 
+def _import_gemini_dependency(module_name: str):
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as exc:  # pragma: no cover - 선택 백엔드 미설치 환경용
+        missing = exc.name or module_name
+        raise RuntimeError(
+            f"Gemini 백엔드를 사용하려면 누락 모듈 '{missing}'을 설치하세요."
+        ) from exc
+
+
 def _get_gemini_modules():
     """Gemini 백엔드는 명시적으로 선택된 경우에만 SDK를 지연 import한다."""
-    try:
-        from google import genai  # type: ignore
-        from google.genai import types  # type: ignore
-        from google.api_core import exceptions as google_exceptions  # type: ignore
-    except ImportError as exc:  # pragma: no cover - 선택 백엔드 미설치 환경용
-        raise RuntimeError(
-            "Gemini 백엔드를 사용하려면 google-genai 패키지를 별도로 설치하세요."
-        ) from exc
+    genai = _import_gemini_dependency("google.genai")
+    types = _import_gemini_dependency("google.genai.types")
+    google_exceptions = _import_gemini_dependency("google.api_core.exceptions")
     return genai, types, google_exceptions
 
 
