@@ -36,7 +36,10 @@ from agents.image_agent import (  # 기존 동작을 바꾸지 않고 감사 입
 from utils.pdf_reader import PageContent, extract_pdf
 
 INVENTORY_HEADERS = ["요소ID", "페이지", "요소유형", "제목", "데이터포함", "기대추출", "관련시트", "비고"]
-AUTO_HEADERS = ["자동_트리아지점수", "자동_이미지크기", "자동_캡션후보", "자동_벡터드로잉수"]
+AUTO_HEADERS = [
+    "자동_트리아지점수", "자동_이미지크기", "자동_캡션후보", "자동_벡터드로잉수",
+    "자동_풀렌더여부", "자동_관련성통과", "자동_트리아지통과및사유",
+]
 VALID_ELEMENT_TYPES = {"그래프", "이미지표", "이미지", "지도·사진", "장식"}
 STATUS_ORDER = ["이미지_미추출", "triage_탈락", "참고자료_제외", "vision_유실", "동일페이지_부분기록", "기록됨"]
 DRAFT_NOTICE = (
@@ -47,6 +50,8 @@ _VISUAL_ID_RE = re.compile(r"^V(?P<page>\d+)-\d+")
 _CAPTION_RE = re.compile(r"^\s*\[?\s*(그림|표)\s*[\d\-]+[^\n]*", re.MULTILINE)
 CellValue = str | int | float | bool | None
 WorkbookRow = dict[str, CellValue]
+JsonScalar = str | int | float | bool | None
+JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 class InventoryFormatError(Exception):
@@ -260,7 +265,6 @@ def _triage_page_evidence(pdf_path: Path, municipality: str) -> dict[int, PageEv
             is_reference, ref_hits = _has_reference_context(page, image, municipality)
             if is_reference:
                 passed = False
-                score -= 20
                 reason_list.append("reference_context:" + ",".join(ref_hits[:4]))
                 reference_counts[page.page_number] += 1
         if passed:
@@ -310,7 +314,7 @@ def classify_inventory(
         else:
             index = seen_expected[item.page]
             seen_expected[item.page] += 1
-            matched = page_records[:1] if index < len(page_records) else page_records
+            matched = page_records
             if page.image_count == 0 or page.reduced_image_count == 0:
                 status = "이미지_미추출"
             elif page.triage_passed_count == 0 and page.reference_filtered_count > 0:
@@ -358,43 +362,59 @@ def _append_rows(ws, headers: Sequence[str], rows: Iterable[WorkbookRow]) -> int
     return count
 
 
+def _draft_base_row(page: PageContent, title: str, caption_text: str, drawing_count: int) -> WorkbookRow:
+    return {
+        "요소ID": "",
+        "페이지": page.page_number,
+        "요소유형": "",
+        "제목": title,
+        "데이터포함": "",
+        "기대추출": "",
+        "관련시트": "",
+        "비고": "",
+        "자동_캡션후보": caption_text,
+        "자동_벡터드로잉수": drawing_count,
+    }
+
+
+def _image_draft_row(page: PageContent, image: WorkbookRow, caption_text: str, drawing_count: int) -> WorkbookRow:
+    triage = _triage_image(page, image)
+    reasons = ",".join(str(reason) for reason in triage["reasons"][:4])
+    passed_text = "Y" if bool(triage["passed"]) else "N"
+    row = _draft_base_row(page, caption_text or str(image.get("caption", "")), caption_text, drawing_count)
+    row.update({
+        "자동_트리아지점수": int(triage["score"]),
+        "자동_이미지크기": f"{image.get('width', '')}x{image.get('height', '')}",
+        "자동_풀렌더여부": "Y" if "full render" in str(image.get("caption", "")).lower() else "N",
+        "자동_관련성통과": "Y" if _is_relevant_image(image) else "N",
+        "자동_트리아지통과및사유": f"{passed_text}:{reasons}",
+    })
+    return row
+
+
+def _page_draft_row(page: PageContent, caption_text: str, drawing_count: int) -> WorkbookRow:
+    row = _draft_base_row(page, caption_text, caption_text, drawing_count)
+    row.update({
+        "자동_트리아지점수": "",
+        "자동_이미지크기": "",
+        "자동_풀렌더여부": "",
+        "자동_관련성통과": "",
+        "자동_트리아지통과및사유": "",
+    })
+    return row
+
+
 def dump_inventory(source_pdf: Path, out: Path) -> int:
     pdf = extract_pdf(source_pdf)
     drawings = _drawing_counts(source_pdf)
     rows: list[WorkbookRow] = []
     for page in pdf.pages:
         caption_text = _caption_candidates(page.text)
+        drawing_count = drawings.get(page.page_number, 0)
         for image in page.images:
-            triage = _triage_image(page, image)
-            rows.append({
-                "요소ID": "",
-                "페이지": page.page_number,
-                "요소유형": "",
-                "제목": caption_text or str(image.get("caption", "")),
-                "데이터포함": "",
-                "기대추출": "",
-                "관련시트": "",
-                "비고": "",
-                "자동_트리아지점수": int(triage["score"]),
-                "자동_이미지크기": f"{image.get('width', '')}x{image.get('height', '')}",
-                "자동_캡션후보": caption_text,
-                "자동_벡터드로잉수": drawings.get(page.page_number, 0),
-            })
-        if not page.images and caption_text:
-            rows.append({
-                "요소ID": "",
-                "페이지": page.page_number,
-                "요소유형": "",
-                "제목": caption_text,
-                "데이터포함": "",
-                "기대추출": "",
-                "관련시트": "",
-                "비고": "",
-                "자동_트리아지점수": "",
-                "자동_이미지크기": "",
-                "자동_캡션후보": caption_text,
-                "자동_벡터드로잉수": drawings.get(page.page_number, 0),
-            })
+            rows.append(_image_draft_row(page, image, caption_text, drawing_count))
+        if not page.images and (caption_text or drawing_count >= 30):
+            rows.append(_page_draft_row(page, caption_text, drawing_count))
     out.parent.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
     info = wb.active
@@ -479,14 +499,57 @@ def _sensitivity_lines(sensitivity: SensitivityReport) -> list[str]:
     return lines
 
 
-def _false_positive_line(audits: Sequence[ElementAudit], records: Sequence[VisualRecord]) -> str:
+def _false_positive_stats(audits: Sequence[ElementAudit], records: Sequence[VisualRecord]) -> dict[str, int]:
     records_by_page = _records_by_page(records)
     excluded = [audit for audit in audits if not audit.item.expected]
     over = sum(1 for audit in excluded if records_by_page.get(audit.item.page))
-    return f"- 기대추출=N 요소 {len(excluded)}개 중 16시트에 같은 페이지가 기록된 수: {over}"
+    return {"excluded_rows": len(excluded), "excluded_recorded_pages": over}
 
 
-def _report_json(audits: Sequence[ElementAudit], sensitivity: SensitivityReport, paths: AuditPaths) -> dict[str, CellValue | list[WorkbookRow] | dict[str, int]]:
+def _false_positive_line(audits: Sequence[ElementAudit], records: Sequence[VisualRecord]) -> str:
+    stats = _false_positive_stats(audits, records)
+    return (
+        f"- 기대추출=N 요소 {stats['excluded_rows']}개 중 "
+        f"16시트에 같은 페이지가 기록된 수: {stats['excluded_recorded_pages']}"
+    )
+
+
+def _type_breakdown_payload(audits: Sequence[ElementAudit]) -> dict[str, JsonValue]:
+    payload: dict[str, JsonValue] = {}
+    for element_type in sorted({audit.item.element_type for audit in audits if audit.item.expected}):
+        bucket = [audit for audit in audits if audit.item.expected and audit.item.element_type == element_type]
+        recorded = sum(1 for audit in bucket if audit.status == "기록됨")
+        counts = Counter(audit.status for audit in bucket)
+        payload[element_type] = {
+            "expected": len(bucket),
+            "recorded": recorded,
+            "recall": recorded / len(bucket) if bucket else 0.0,
+            "status_counts": {status: counts.get(status, 0) for status in STATUS_ORDER},
+        }
+    return payload
+
+
+def _sensitivity_payload(sensitivity: SensitivityReport) -> dict[str, JsonValue]:
+    return {
+        "image_thresholds": {
+            str(threshold): {
+                "passed_elements": row.passed_elements,
+                "total_expected": row.total_expected,
+                "recall": row.recall,
+                "passed_images": row.passed_images,
+            }
+            for threshold, row in sensitivity.image_thresholds.items()
+        },
+        "vector_thresholds": {str(threshold): count for threshold, count in sensitivity.vector_thresholds.items()},
+    }
+
+
+def _report_json(
+    audits: Sequence[ElementAudit],
+    sensitivity: SensitivityReport,
+    paths: AuditPaths,
+    records: Sequence[VisualRecord],
+) -> dict[str, JsonValue]:
     counts = _status_counts(audits)
     return {
         "source_pdf": str(paths.source_pdf),
@@ -496,6 +559,10 @@ def _report_json(audits: Sequence[ElementAudit], sensitivity: SensitivityReport,
         "expected_rows": sum(1 for audit in audits if audit.item.expected),
         "recorded_rows": sum(1 for audit in audits if audit.item.expected and audit.status == "기록됨"),
         "status_counts": {status: counts.get(status, 0) for status in STATUS_ORDER},
+        "sensitivity": _sensitivity_payload(sensitivity),
+        "type_breakdown": _type_breakdown_payload(audits),
+        "false_positive_stats": _false_positive_stats(audits, records),
+        "format_errors": [],
         "details": [
             {
                 "요소ID": audit.item.element_id,
@@ -543,7 +610,7 @@ def _write_reports(audits: Sequence[ElementAudit], records: Sequence[VisualRecor
         "",
     ]
     md_path.write_text("\n".join(body), encoding="utf-8")
-    json_path.write_text(json.dumps(_report_json(audits, sensitivity, paths), ensure_ascii=False, indent=2), encoding="utf-8")
+    json_path.write_text(json.dumps(_report_json(audits, sensitivity, paths, records), ensure_ascii=False, indent=2), encoding="utf-8")
     return ReportPaths(markdown=md_path, json_path=json_path)
 
 

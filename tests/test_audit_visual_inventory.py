@@ -245,3 +245,131 @@ def test_image_agent_private_imports_are_same_objects() -> None:
     assert audit._triage_image is image_agent._triage_image
     assert audit._coverage_reduce_images is image_agent._coverage_reduce_images
     assert audit._is_relevant_image is image_agent._is_relevant_image
+
+
+def _make_vector_only_pdf(path: Path, drawing_count: int) -> None:
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=300)
+    for idx in range(drawing_count):
+        x = 20 + (idx % 10) * 20
+        y = 20 + (idx // 10) * 15
+        page.draw_rect(fitz.Rect(x, y, x + 10, y + 8), color=(0, 0, 0), fill=None)
+    doc.save(path)
+    doc.close()
+
+
+def test_reference_filtered_page_keeps_original_triage_score_in_sensitivity(tmp_path: Path) -> None:
+    # Given: 참고자료 키워드 때문에 제외되는 이미지 페이지가 있으면
+    source = tmp_path / "reference.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((72, 72), "[Figure 1] OECD case graph\nOECD case chart data")
+    page.insert_image(fitz.Rect(72, 120, 492, 420), stream=_make_chart_png())
+    doc.save(source)
+    doc.close()
+
+    # When: 감사용 페이지 증거를 만들면
+    evidence = audit._triage_page_evidence(source, "서울특별시")
+    page_evidence = evidence[1]
+
+    # Then: 참고자료 상태는 유지하되 민감도 점수는 -20 오염 없이 원점수를 보존한다.
+    assert page_evidence.reference_filtered_count == 1
+    assert page_evidence.triage_passed_count == 0
+    assert page_evidence.top_score is not None
+    assert page_evidence.top_score >= 3
+    assert any(reason.startswith("reference_context:") for reason in page_evidence.top_reasons)
+
+
+def test_dump_adds_vector_page_when_no_caption_or_image_but_drawings_cross_low_threshold(tmp_path: Path) -> None:
+    # Given: 이미지와 캡션이 없지만 벡터 도형 40개가 있는 페이지가 있으면
+    source = tmp_path / "vector_only.pdf"
+    out = tmp_path / "draft.xlsx"
+    _make_vector_only_pdf(source, 40)
+
+    # When: dump 초안을 생성하면
+    row_count = audit.dump_inventory(source, out)
+
+    # Then: 벡터 후보 행이 누락되지 않는다.
+    assert row_count == 1
+    wb = load_workbook(out)
+    ws = wb["시각요소"]
+    headers = [cell.value for cell in ws[1]]
+    row = dict(zip(headers, next(ws.iter_rows(min_row=2, max_row=2, values_only=True))))
+    assert row["페이지"] == 1
+    assert row["자동_벡터드로잉수"] == 40
+
+
+def test_recorded_elements_list_all_records_on_same_page() -> None:
+    # Given: 같은 페이지에 요소 2개와 16시트 레코드 2개가 있으면
+    items = [_item("E001", 10), _item("E002", 10)]
+    pages = {10: _page(10, image_count=2, passed_count=2, score=8)}
+    records = [
+        audit.VisualRecord("V10-001", 10, "첫째", "그래프", "Y", "N", "03_배출현황_지역"),
+        audit.VisualRecord("V10-002", 10, "둘째", "이미지표", "Y", "Y", "06_감축목표"),
+    ]
+
+    # When: 페이지 단위 매칭을 수행하면
+    results = audit.classify_inventory(items, pages, records)
+
+    # Then: 두 요소 모두 해당 페이지의 전체 16시트 레코드를 나열한다.
+    assert [row.status for row in results] == ["기록됨", "기록됨"]
+    assert [[record.visual_id for record in row.matched_records] for row in results] == [
+        ["V10-001", "V10-002"],
+        ["V10-001", "V10-002"],
+    ]
+
+
+def test_dump_headers_include_full_render_relevance_and_triage_reason_columns(tmp_path: Path) -> None:
+    # Given: 이미지가 있는 PDF가 있으면
+    source = tmp_path / "visual.pdf"
+    out = tmp_path / "draft.xlsx"
+    _make_visual_pdf(source)
+
+    # When: dump 초안을 생성하면
+    audit.dump_inventory(source, out)
+
+    # Then: 명세 누락 자동 컬럼 3종이 기존 자동 컬럼 뒤에 추가되고 값이 채워진다.
+    wb = load_workbook(out)
+    ws = wb["시각요소"]
+    headers = [cell.value for cell in ws[1]]
+    assert headers[8:15] == [
+        "자동_트리아지점수", "자동_이미지크기", "자동_캡션후보", "자동_벡터드로잉수",
+        "자동_풀렌더여부", "자동_관련성통과", "자동_트리아지통과및사유",
+    ]
+    row = dict(zip(headers, next(ws.iter_rows(min_row=2, values_only=True))))
+    assert row["자동_풀렌더여부"] in {"Y", "N"}
+    assert row["자동_관련성통과"] in {"Y", "N"}
+    assert str(row["자동_트리아지통과및사유"]).startswith(("Y:", "N:"))
+
+
+def test_json_report_contains_sensitivity_type_breakdown_false_positive_and_format_errors(tmp_path: Path) -> None:
+    # Given: 기대추출 Y/N이 섞인 감사 결과가 있으면
+    paths = audit.AuditPaths(
+        inventory=tmp_path / "inventory.xlsx",
+        pipeline_output=tmp_path / "pipeline.xlsx",
+        source_pdf=tmp_path / "source.pdf",
+        report_dir=tmp_path / "reports",
+    )
+    items = [_item("E001", 1, "그래프", True), _item("E002", 1, "장식", False)]
+    pages = {1: _page(1, image_count=1, passed_count=1, score=6)}
+    records = [audit.VisualRecord("V1-001", 1, "캡션", "그래프", "Y", "N", "03_배출현황_지역")]
+    audits = audit.classify_inventory(items, pages, records)
+    sensitivity = audit.calculate_sensitivity(audits, pages)
+
+    # When: JSON 리포트를 쓰면
+    report_paths = audit._write_reports(audits, records, sensitivity, paths)
+    payload = json.loads(report_paths.json_path.read_text(encoding="utf-8"))
+
+    # Then: md와 같은 핵심 구조가 JSON에도 존재한다.
+    assert "sensitivity" in payload
+    assert payload["sensitivity"]["image_thresholds"]["5"]["passed_elements"] == 1
+    assert "type_breakdown" in payload
+    assert payload["type_breakdown"]["그래프"]["recorded"] == 1
+    assert payload["false_positive_stats"]["excluded_recorded_pages"] == 1
+    assert payload["format_errors"] == []
+
+
+def test_image_agent_reference_context_import_is_same_object() -> None:
+    # Given: 참고자료 게이트도 기존 image_agent helper를 그대로 재사용하면
+    # When / Then: 감사 도구의 import 객체가 원본과 같다.
+    assert audit._has_reference_context is image_agent._has_reference_context
