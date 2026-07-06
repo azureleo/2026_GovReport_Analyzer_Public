@@ -14,6 +14,7 @@ LLM/로컬 에이전트 공통 래퍼.
 - LLM_PROVIDER=gemini : 기존 Gemini API 백엔드(명시 선택 시에만)
 - LLM_PROVIDER=openai : OpenAI Responses API 사용
 """
+# noqa: SIZE_OK — 클라우드 SDK와 로컬 에이전트 백엔드 선택·재시도 계약을 한 파일에 보존하는 기존 래퍼.
 
 from __future__ import annotations
 
@@ -986,8 +987,12 @@ def _get_gemini_modules():
 
 
 def _gemini_client():
-    genai, _, _ = _get_gemini_modules()
-    return genai.Client(api_key=config.GEMINI_API_KEY)
+    genai, types, _ = _get_gemini_modules()
+    timeout_ms = max(1, int(getattr(config, "GEMINI_REQUEST_TIMEOUT_SECONDS", 180))) * 1000
+    return genai.Client(
+        api_key=config.GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=timeout_ms),
+    )
 
 
 def _handle_gemini_retry(e: Exception, attempt: int, max_retries: int, label: str) -> bool:
