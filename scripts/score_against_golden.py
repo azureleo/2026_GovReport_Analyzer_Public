@@ -53,6 +53,7 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
     all_source = 출처집계초기화()
     numeric_source = 출처집계초기화()
     format_errors: list[str] = []
+    format_warnings: list[str] = []
     skipped: list[str] = []
     excluded = 0
     page_pairs = 0
@@ -62,6 +63,7 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
         golden_sheet = golden_sheets[sheet_name]
         output_sheet = output_sheets[sheet_name]
         excluded += golden_sheet.제외행수
+        format_warnings.extend(golden_sheet.경고)
         if golden_sheet.상태 == "골든 없음":
             sheet_results[sheet_name] = 없는골든요약(output_sheet)
             continue
@@ -94,6 +96,7 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
         "채점제외행수": excluded,
         "생략시트": skipped,
         "형식오류": format_errors,
+        "형식경고": format_warnings,
         "시트별": sheet_results,
         "출처유형별_전체": 출처직렬화(all_source),
         "출처유형별_수치시트": 출처직렬화(numeric_source),

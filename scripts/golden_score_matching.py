@@ -103,8 +103,6 @@ def 값비교(sheet_name: str, matches: list[매칭]) -> tuple[값집계, list[d
             output_has = 값있음(output_value)
             if not golden_has and not output_has:
                 continue
-            total.전체 += 1
-            row_stats.전체 += 1
             if golden_has and not output_has:
                 total.골든만 += 1
                 row_stats.골든만 += 1
@@ -113,6 +111,8 @@ def 값비교(sheet_name: str, matches: list[매칭]) -> tuple[값집계, list[d
                 total.출력만 += 1
                 row_stats.출력만 += 1
                 continue
+            total.전체 += 1
+            row_stats.전체 += 1
             if _필드일치(field_name, golden_value, output_value):
                 total.일치 += 1
                 row_stats.일치 += 1

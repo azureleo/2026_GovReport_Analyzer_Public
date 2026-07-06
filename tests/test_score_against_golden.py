@@ -174,7 +174,6 @@ def test_수치_허용오차와_불일치_상세를_구분한다(tmp_path: Path)
     assert len(result["값불일치상세"]) == 1
     assert result["값불일치상세"][0]["필드"] == "배출량"
 
-
 def test_출처유형_분해와_채점제외를_반영한다(tmp_path: Path) -> None:
     result = _점수(
         tmp_path,
@@ -212,7 +211,6 @@ def test_없는_골든시트와_형식오류시트를_명확히_보고한다(tmp
     assert result["시트별"]["02_지역여건"]["상태"] == "골든 없음"
     assert result["시트별"]["03_배출현황_지역"]["상태"] == "형식 오류"
     assert "1행이 제목 행으로 추정" in result["형식오류"][0]
-
 
 def test_문서메타는_필드별로_다중값_집합을_비교한다(tmp_path: Path) -> None:
     result = _점수(

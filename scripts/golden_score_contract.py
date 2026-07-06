@@ -91,6 +91,7 @@ class 시트자료:
     상태: str = "정상"
     오류: list[str] = field(default_factory=list)
     제외행수: int = 0
+    경고: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)

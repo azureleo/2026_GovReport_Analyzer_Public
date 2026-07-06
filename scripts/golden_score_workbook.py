@@ -33,10 +33,11 @@ def _제목행_추정(headers: list[str], sheet_name: str) -> bool:
     return first.startswith(sheet_name[:2]) or first.startswith(f"{int(sheet_name[:2])}.") or "제목" in first
 
 
-def _행목록(ws, headers: list[str], *, golden: bool, sheet_name: str) -> tuple[list[행], int, list[str]]:
+def _행목록(ws, headers: list[str], *, golden: bool, sheet_name: str) -> tuple[list[행], int, list[str], list[str]]:
     rows: list[행] = []
     excluded = 0
     errors: list[str] = []
+    warnings: list[str] = []
     for row_number, values in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         if not any(값있음(value) for value in values):
             continue
@@ -48,8 +49,10 @@ def _행목록(ws, headers: list[str], *, golden: bool, sheet_name: str) -> tupl
         source_pages = normalize_provenance_pages(data.get("골든_출처페이지")) if golden else ""
         if golden and sheet_name != "00_문서메타" and source_type not in 출처유형목록:
             errors.append(f"{sheet_name} {row_number}행: 골든_출처유형 값이 허용 코드가 아닙니다: {source_type or '빈칸'}")
+        if golden and sheet_name != "00_문서메타" and not source_pages:
+            warnings.append(f"{sheet_name} {row_number}행: 골든_출처페이지가 비어 있습니다")
         rows.append(행(row_number, data, source_type, source_pages))
-    return rows, excluded, errors
+    return rows, excluded, errors, warnings
 
 
 def _골든시트(ws, sheet_name: str) -> 시트자료:
@@ -65,16 +68,16 @@ def _골든시트(ws, sheet_name: str) -> 시트자료:
         golden_headers = headers[len(expected) : len(expected) + len(골든열)]
         if golden_headers[:2] != 골든열[:2]:
             errors.append(f"{sheet_name}: 골든_출처유형·골든_출처페이지 컬럼이 계약 컬럼 뒤에 필요합니다.")
-    rows, excluded, row_errors = _행목록(ws, headers, golden=True, sheet_name=sheet_name)
+    rows, excluded, row_errors, row_warnings = _행목록(ws, headers, golden=True, sheet_name=sheet_name)
     errors.extend(row_errors)
     if errors:
-        return 시트자료(sheet_name, headers, [], "형식 오류", errors, excluded)
-    return 시트자료(sheet_name, headers, rows, 제외행수=excluded)
+        return 시트자료(sheet_name, headers, [], "형식 오류", errors, excluded, row_warnings)
+    return 시트자료(sheet_name, headers, rows, 제외행수=excluded, 경고=row_warnings)
 
 
 def _출력시트(ws, sheet_name: str) -> 시트자료:
     headers = [문자열(cell.value) for cell in ws[1]]
-    rows, _, _ = _행목록(ws, headers, golden=False, sheet_name=sheet_name)
+    rows, _, _, _ = _행목록(ws, headers, golden=False, sheet_name=sheet_name)
     return 시트자료(sheet_name, headers, rows)
 
 

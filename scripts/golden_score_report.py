@@ -24,7 +24,9 @@ def 마크다운(result: dict[str, Any]) -> str:
         f"- 골든셋: `{result['골든셋']}`\n",
         f"- 실행시각: {result['실행시각']}\n",
         f"- 채점제외 행 수: {result['채점제외행수']}\n",
-        f"- 형식 오류 생략 시트: {', '.join(result['생략시트']) if result['생략시트'] else '없음'}\n\n",
+        f"- 형식 오류 생략 시트: {', '.join(result['생략시트']) if result['생략시트'] else '없음'}\n",
+        f"- 형식 경고: {len(result.get('형식경고', []))}건\n",
+        "- 값일치율 정의: 양쪽 값이 모두 존재하는 비교 쌍 중 일치한 값의 비율입니다.\n\n",
         "## 시트별 표\n\n",
         "| 시트 | 상태 | 골든 행수 | 출력 행수 | 매칭 수 | 엄격 | 완화 | 리콜 | 정밀도 | 값일치율 | 골든만 있는 값 | 출력만 있는 값 |\n",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
@@ -54,4 +56,8 @@ def 마크다운(result: dict[str, Any]) -> str:
         lines.append("\n## 형식 오류\n\n")
         for error in result["형식오류"]:
             lines.append(f"- {error}\n")
+    if result.get("형식경고"):
+        lines.append("\n## 형식 경고\n\n")
+        for warning in result["형식경고"]:
+            lines.append(f"- {warning}\n")
     return "".join(lines)
