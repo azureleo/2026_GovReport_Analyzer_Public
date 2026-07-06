@@ -110,6 +110,8 @@ py -m pip install -r requirements.txt
 npm install
 ```
 
+`requirements.txt`에는 기본 Gemini 백엔드 실행에 필요한 `google-genai`와 `google-api-core`가 모두 포함되어 있습니다. Gemini 실행 중 두 모듈 중 하나가 없다는 오류가 나오면 같은 명령으로 의존성을 다시 설치하세요.
+
 macOS/Linux에서는 `py` 대신 `python3`를 사용합니다.
 
 ```bash
@@ -232,6 +234,7 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 | 설정 | 기본값 | 설명 |
 |---|---:|---|
 | `LLM_PROVIDER` | `gemini` | 기본 LLM 백엔드 |
+| `GEMINI_REQUEST_TIMEOUT_SECONDS` | `180` | Gemini SDK 요청 1회 타임아웃. 초 단위 env 값을 SDK에는 ms로 전달 |
 | `LOCAL_AGENT_TIMEOUT` | `300` | Codex/Claude 1회 호출 제한 시간 |
 | `PARALLEL_PROCESSING_ENABLED` | `True` | 독립 배치 병렬 실행 |
 | `TEXT_WORKERS` | `4` | 텍스트 추출 병렬 워커 수 |
@@ -382,6 +385,8 @@ py scripts/audit_visual_inventory.py audit `
 ### 캐시
 
 성공한 LLM 응답은 `.cache/llm_responses`에 저장됩니다. 같은 프롬프트·모델·이미지 조합은 재사용되므로 재실행 비용이 줄어듭니다. 실패 응답은 캐시하지 않습니다.
+
+긴 실행이 중간에 멈췄다면 같은 `LLM_CACHE_DIR`을 유지한 채 같은 입력·모델·옵션으로 재실행하세요. 성공했던 호출은 캐시에서 재사용되고, 실패했거나 캐시되지 않은 구간만 다시 호출되는 보충런 패턴으로 이어갈 수 있습니다.
 
 ### 실행 시간 로그
 
