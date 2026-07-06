@@ -28,3 +28,6 @@ excel_source_verification*.json
 !docs/references/가이드라인.hwp
 
 .cache/
+
+# 골든셋·인벤토리는 측정 기준 자산이라 추적한다
+!data/golden/*.xlsx
