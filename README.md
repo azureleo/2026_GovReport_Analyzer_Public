@@ -335,6 +335,7 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 │  ├─ reference_data.py       # 부록3·4 참조 사전 로드와 매칭
 │  └─ excel_writer.py         # openpyxl 기반 Excel 생성
 ├─ scripts/
+│  ├─ score_against_golden.py # 골든셋 대비 리콜·정밀도·값일치율 채점
 │  ├─ run_ab_validation.py    # A/B 검증 리포트 생성
 │  ├─ audit_visual_inventory.py # 시각 요소 인벤토리 dump/audit 리포트
 │  ├─ build_reference_data.py # 부록 CSV 생성(1회, 경계 검증 내장)
@@ -366,6 +367,7 @@ python -m pytest tests/ -q
 | organizer 보정·장 문맥 프로비넌스 | `tests/test_organizer_wp6.py`, `tests/test_prior_plan_context.py` |
 | 시트 폐루프 | `tests/test_sheet_closed_loop.py`, `tests/test_sheet_closed_loop_regressions.py` |
 | A/B 하네스 | `tests/test_ab_validation.py` |
+| 골든셋 채점 | `tests/test_score_against_golden.py` |
 
 ## 검증과 운영 팁
 
@@ -385,6 +387,26 @@ py scripts/verify_routing_coverage.py "서울특별시_탄소중립계획_정리
 py scripts/run_ab_validation.py "서울특별시_탄소중립계획.pdf" --output-dir output/ab
 ```
 
+골든셋이 있으면 기존 라우팅 커버리지 검증과 함께 스니펫·구조 결과 xlsx 각각을 채점합니다. A/B 리포트에는 `골든셋 채점 — 스니펫`, `골든셋 채점 — 구조` 섹션이 추가되고, 세부 리포트는 같은 출력 디렉터리의 `golden_score_*.md/json`에 저장됩니다.
+
+```powershell
+py scripts/run_ab_validation.py "서울특별시_탄소중립계획.pdf" `
+  --golden data/golden/서울특별시_골든셋_v1.xlsx `
+  --output-dir output/ab
+```
+
+### 골든셋 채점
+
+파이프라인 출력 xlsx와 사람이 확정한 골든셋 xlsx를 LLM 호출 없이 대조합니다. 골든셋은 1행 헤더 형식이어야 하며, `00_문서메타`를 제외한 01~15 시트에는 계약 컬럼 뒤에 `골든_출처유형`, `골든_출처페이지`, `골든_채점제외`, `골든_비고`를 붙입니다.
+
+```powershell
+py scripts/score_against_golden.py output/서울_결과.xlsx data/golden/서울특별시_골든셋_v1.xlsx `
+  --report-dir output `
+  --label 서울_기준선 `
+  --json
+```
+
+리포트에는 시트별 리콜·정밀도·값일치율, 엄격/완화 매칭 수, 텍스트 유래와 시각 유래 출처유형별 분해, 미매칭 상세, 값 불일치 상세, 출처페이지 교집합 참고 통계가 포함됩니다. 점수 자체는 실패 게이트가 아니며, 파일·형식 오류가 있을 때만 비정상 종료합니다.
 
 ### 시각 요소 인벤토리 리콜 감사
 
