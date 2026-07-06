@@ -52,6 +52,7 @@ def test_organizer_공개_별칭은_기존_private_함수와_같은_객체다() 
     """기존 정규화 함수의 공개 별칭은 본문을 바꾸지 않고 같은 객체를 가리킨다."""
     assert organizer_agent.dedup_key_text is organizer_agent._dedup_key_text
     assert organizer_agent.normalize_project_id is organizer_agent._normalize_project_id
+    assert organizer_agent.normalize_direct_indirect_type is organizer_agent._normalize_direct_indirect_type
     assert organizer_agent.to_float is organizer_agent._to_float
     assert organizer_agent.normalize_provenance_pages is organizer_agent._normalize_provenance_pages
 
@@ -107,6 +108,48 @@ def test_정규화키와_완화키로_행을_매칭한다(tmp_path: Path) -> Non
 
     assert result["시트별"]["08_감축사업목록"]["엄격매칭수"] == 1
     assert result["시트별"]["03_배출현황_지역"]["완화매칭수"] == 1
+
+
+def test_시트04_직간접구분_표기차이는_엄격키로_매칭한다(tmp_path: Path) -> None:
+    result = _점수(
+        tmp_path,
+        {
+            "04_배출현황_관리권한": [
+                {"관리부문": "건물", "세부부문": "가정", "직간접구분": "직접", "연도": 2020, "배출량": 10, "단위": "톤"},
+            ]
+        },
+        {
+            "04_배출현황_관리권한": [
+                {"관리부문": "건물", "세부부문": "가정", "직간접구분": "direct", "연도": 2020, "배출량": 10, "단위": "톤", "골든_출처유형": "텍스트표", "골든_출처페이지": "7"},
+            ]
+        },
+    )
+
+    sheet = result["시트별"]["04_배출현황_관리권한"]
+    assert sheet["엄격매칭수"] == 1
+    assert sheet["완화매칭수"] == 0
+    assert sheet["값일치율"] == 1.0
+
+
+def test_시트04_완화키는_직간접구분이_다른_행을_섞지_않는다(tmp_path: Path) -> None:
+    result = _점수(
+        tmp_path,
+        {
+            "04_배출현황_관리권한": [
+                {"관리부문": "건물", "세부부문": "상업", "직간접구분": "간접", "연도": 2020, "배출량": 20, "단위": "톤"},
+            ]
+        },
+        {
+            "04_배출현황_관리권한": [
+                {"관리부문": "건물", "세부부문": "가정", "직간접구분": "direct", "연도": 2020, "배출량": 10, "단위": "톤", "골든_출처유형": "텍스트표", "골든_출처페이지": "8"},
+            ]
+        },
+    )
+
+    sheet = result["시트별"]["04_배출현황_관리권한"]
+    assert sheet["매칭수"] == 0
+    assert sheet["완화매칭수"] == 0
+    assert sheet["리콜"] == 0.0
 
 
 def test_수치_허용오차와_불일치_상세를_구분한다(tmp_path: Path) -> None:

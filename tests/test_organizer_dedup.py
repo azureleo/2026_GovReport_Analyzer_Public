@@ -54,6 +54,24 @@ class OrganizerDedupTests(unittest.TestCase):
         self.assertEqual(len(cleaned["emissions_regional"]), 2)
         self.assertTrue(any("중복 키 값 충돌" in row["항목"] for row in cleaned["validation_report"]))
 
+    def test_management_direct_label_variants_share_dedup_key(self):
+        # Given: 관리권한 직간접구분이 영어/한국어 표기만 다르게 들어오면
+        raw = {
+            "municipality_name": "서울특별시",
+            "emissions_management": [
+                {"지자체명": "서울특별시", "관리부문": "건물", "세부부문": "가정", "직간접구분": "direct", "연도": 2020, "배출량": 10, "단위": "천톤"},
+                {"지자체명": "서울특별시", "관리부문": "건물", "세부부문": "가정", "직간접구분": "직접", "연도": 2020, "배출량": 10},
+            ],
+        }
+
+        # When: organizer가 관리권한 시트를 정제하면
+        cleaned = OrganizerAgent().organize(raw)
+
+        # Then: 직간접구분 정규화 후 같은 dedup 키로 병합된다.
+        self.assertEqual(cleaned["emissions_management"], [
+            {"지자체명": "서울특별시", "관리부문": "건물", "세부부문": "가정", "직간접구분": "직접", "연도": 2020, "배출량": 10.0, "단위": "천톤", "데이터상태": "reported"}
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()

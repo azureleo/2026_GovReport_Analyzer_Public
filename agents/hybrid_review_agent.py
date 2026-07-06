@@ -20,7 +20,7 @@ import config
 from utils import llm_client
 from utils.pdf_reader import PageContent
 from agents.extractor_agent import _build_page_text, _route_pages_by_sheet
-from agents.organizer_agent import OrganizerAgent, _dedup_key_text
+from agents.organizer_agent import OrganizerAgent, _dedup_key_text, normalize_direct_indirect_type
 
 logger = logging.getLogger(__name__)
 
@@ -446,7 +446,14 @@ def _row_signature(row: dict, sheet_key: str) -> tuple:
     if not fields:
         sheet_name = config.SHEET_KEY_TO_NAME.get(sheet_key, "")
         fields = config.EXCEL_HEADERS.get(sheet_name, [])[:5]
-    return tuple(_dedup_key_text(row.get(field)) for field in fields)
+    return tuple(
+        _dedup_key_text(
+            normalize_direct_indirect_type(row.get(field))
+            if field == "직간접구분"
+            else row.get(field)
+        )
+        for field in fields
+    )
 
 
 def _is_missing_candidate(candidate: dict) -> bool:

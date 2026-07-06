@@ -54,6 +54,15 @@ _TYPE_MAP = {
     "배출량": "직접배출",
 }
 
+_DIRECT_INDIRECT_TYPE_MAP = {
+    "direct": "직접",
+    "Direct": "직접",
+    "직접배출": "직접",
+    "indirect": "간접",
+    "Indirect": "간접",
+    "간접배출": "간접",
+}
+
 # 달성여부 정규화
 _ACHIEVEMENT_MAP = {
     "달성": "달성", "완료": "달성", "목표달성": "달성",
@@ -109,6 +118,14 @@ def _normalize(val: str, mapping: dict) -> str:
     if not isinstance(val, str):
         return str(val) if val is not None else ""
     return mapping.get(val.strip(), val.strip())
+
+
+def _normalize_direct_indirect_type(value: Any) -> str:
+    """관리권한 직간접구분 표기 차이를 키 비교 전용 표준값으로 정규화한다."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return _DIRECT_INDIRECT_TYPE_MAP.get(text, text)
 
 
 def _normalize_co2_unit(unit: Any) -> str:
@@ -660,6 +677,8 @@ def _clean_emissions_management(rows: list[dict], municipality: str) -> list[dic
             )
         else:
             row["관리부문"] = normalized_sector
+        if _has_cell_value(row.get("직간접구분")):
+            row["직간접구분"] = _normalize_direct_indirect_type(row.get("직간접구분"))
         row["연도"] = _to_int(row.get("연도"))
         row["배출량"] = _to_float(row.get("배출량"))
         row["단위"] = _normalize_co2_unit(row.get("단위", ""))
@@ -1343,5 +1362,6 @@ class OrganizerAgent:
 
 dedup_key_text = _dedup_key_text
 normalize_project_id = _normalize_project_id
+normalize_direct_indirect_type = _normalize_direct_indirect_type
 to_float = _to_float
 normalize_provenance_pages = _normalize_provenance_pages

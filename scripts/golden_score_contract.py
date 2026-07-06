@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 import config  # noqa: E402
 from agents.organizer_agent import (  # noqa: E402
     dedup_key_text,
+    normalize_direct_indirect_type,
     normalize_project_id,
     normalize_provenance_pages,
     to_float,
@@ -59,7 +60,7 @@ from agents.organizer_agent import (  # noqa: E402
     "01_계획개요": ["항목명"],
     "02_지역여건": ["지표명", "연도"],
     "03_배출현황_지역": ["배출유형", "부문", "연도"],
-    "04_배출현황_관리권한": ["관리부문", "연도"],
+    "04_배출현황_관리권한": ["관리부문", "직간접구분", "연도"],
     "05_배출전망": ["부문", "연도"],
     "06_감축목표": ["부문", "목표연도"],
     "07_비전전략": ["전략명"],
@@ -155,6 +156,8 @@ def 연도문자열(value: Any) -> str:
 def 키값(field_name: str, value: Any) -> str:
     if field_name == "관리번호":
         return normalize_project_id(value).replace("-", "")
+    if field_name == "직간접구분":
+        return dedup_key_text(normalize_direct_indirect_type(value))
     if field_name.endswith("연도") or field_name == "연도":
         return 연도문자열(value)
     return dedup_key_text(value)
