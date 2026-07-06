@@ -373,3 +373,21 @@ def test_image_agent_reference_context_import_is_same_object() -> None:
     # Given: 참고자료 게이트도 기존 image_agent helper를 그대로 재사용하면
     # When / Then: 감사 도구의 import 객체가 원본과 같다.
     assert audit._has_reference_context is image_agent._has_reference_context
+
+
+def test_detail_table_keeps_reference_context_reason_when_reason_list_is_long() -> None:
+    # Given: 참고자료 사유가 긴 triage 사유 뒤에 붙어 있으면
+    audit_row = audit.ElementAudit(
+        item=_item("E001", 1),
+        status="참고자료_제외",
+        triage_score=12,
+        triage_reasons=("large", "white_background", "line_grid_density", "contrast", "reference_context:OECD"),
+        drawing_count=0,
+        matched_records=(),
+    )
+
+    # When: 상세 markdown 표를 만들면
+    lines = audit._detail_lines([audit_row])
+
+    # Then: reference_context 사유가 잘리지 않고 표시된다.
+    assert "reference_context:OECD" in lines[-1]

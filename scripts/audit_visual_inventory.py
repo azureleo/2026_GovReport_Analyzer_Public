@@ -465,6 +465,14 @@ def _type_breakdown(audits: Sequence[ElementAudit]) -> list[str]:
     return lines
 
 
+def _display_reasons(reasons: Sequence[str]) -> str:
+    selected = list(reasons[:4])
+    for reason in reasons:
+        if reason.startswith("reference_context:") and reason not in selected:
+            selected.append(reason)
+    return ",".join(selected)
+
+
 def _detail_lines(audits: Sequence[ElementAudit]) -> list[str]:
     lines = [
         "| 요소ID | 페이지 | 유형 | 상태 | triage 점수·사유 | 벡터 drawing 수 | 16시트 매칭 |",
@@ -477,7 +485,7 @@ def _detail_lines(audits: Sequence[ElementAudit]) -> list[str]:
             f"{r.visual_id}/{r.data_included}/{r.digitizing_needed}/{r.related_sheet}" for r in audit.matched_records
         ) or ""
         score = "" if audit.triage_score is None else str(audit.triage_score)
-        reasons = ",".join(audit.triage_reasons[:4])
+        reasons = _display_reasons(audit.triage_reasons)
         lines.append(
             f"| {audit.item.element_id} | {audit.item.page} | {audit.item.element_type} | {audit.status} | {score} {reasons} | {audit.drawing_count} | {records} |"
         )
