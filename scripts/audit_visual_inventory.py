@@ -6,6 +6,7 @@
 # .venv/bin/python scripts/audit_visual_inventory.py dump 서울특별시_탄소중립계획.pdf --out data/golden/시각요소_초안.xlsx
 # .venv/bin/python scripts/audit_visual_inventory.py audit data/golden/서울_시각요소_인벤토리_v1.xlsx output/서울.xlsx 서울특별시_탄소중립계획.pdf --report-dir output
 """시각 요소 인벤토리 리콜 감사 도구."""
+# noqa: SIZE_OK — M2-1 명세가 신규 production 코드를 이 단일 CLI 스크립트로 제한한다.
 from __future__ import annotations
 
 import argparse
