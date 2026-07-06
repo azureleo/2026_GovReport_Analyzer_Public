@@ -42,6 +42,22 @@ def _run_tool(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=ROOT, text=True, capture_output=True, check=False)
 
 
+def _run_golden_score(excel_path: Path, golden_path: str, output_dir: Path, label: str) -> subprocess.CompletedProcess[str]:
+    return _run_tool(
+        [
+            sys.executable,
+            "scripts/score_against_golden.py",
+            str(excel_path),
+            golden_path,
+            "--report-dir",
+            str(output_dir),
+            "--label",
+            label,
+            "--json",
+        ]
+    )
+
+
 def _section(title: str, body: str) -> str:
     return f"## {title}\n\n```text\n{body.strip()}\n```\n\n"
 
@@ -107,6 +123,10 @@ def main() -> int:
     if args.golden:
         routing = _run_tool([sys.executable, "scripts/verify_routing_coverage.py", args.golden, str(source)])
         report.append(_section("ROUTE_DROP_UBIQUITOUS_STRONG 검증", routing.stdout + "\n" + routing.stderr))
+        snippet_score = _run_golden_score(snippet_xlsx, args.golden, output_dir, f"스니펫_{stamp}")
+        report.append(_section("골든셋 채점 — 스니펫", snippet_score.stdout + "\n" + snippet_score.stderr))
+        structured_score = _run_golden_score(structured_xlsx, args.golden, output_dir, f"구조_{stamp}")
+        report.append(_section("골든셋 채점 — 구조", structured_score.stdout + "\n" + structured_score.stderr))
 
     report.append(
         "## 판정 체크리스트\n\n"
