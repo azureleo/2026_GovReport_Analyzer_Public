@@ -1340,3 +1340,8 @@ class OrganizerAgent:
             f"  - 지자체명: {d.get('municipality_name', '미확인')}\n"
             + "\n".join(f"  - {k}: {v}건" for k, v in counts.items())
         )
+
+dedup_key_text = _dedup_key_text
+normalize_project_id = _normalize_project_id
+to_float = _to_float
+normalize_provenance_pages = _normalize_provenance_pages
