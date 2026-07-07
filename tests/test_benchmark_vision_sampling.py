@@ -90,3 +90,27 @@ def test_sample_sheet_reports_shortfall_when_intersection_is_under_15(tmp_path: 
 
     assert len(sheet.rows) == 3
     assert any("15 미만" in note for note in sheet.notes)
+
+
+def test_sample_sheet_excludes_collapsed_candidate_from_intersection_pool(tmp_path: Path) -> None:
+    inventory = tmp_path / "inventory.xlsx"
+    rows = [[f"E{idx:03d}", idx, "그래프", f"제목 {idx}", "Y", "Y", "", ""] for idx in range(1, 11)]
+    _inventory(inventory, rows)
+
+    valid_xlsx = tmp_path / "valid.xlsx"
+    valid_audit = tmp_path / "valid.json"
+    _workbook(valid_xlsx, [["서울", f"V{idx}-001", f"제목 {idx}", "그래프", "Y", f"valid-{idx}", "N", ""] for idx in range(1, 6)])
+    _audit_json(valid_audit, [(f"E{idx:03d}", idx, "그래프", "기록됨") for idx in range(1, 6)])
+
+    collapsed_xlsx = tmp_path / "collapsed.xlsx"
+    collapsed_audit = tmp_path / "collapsed.json"
+    _workbook(collapsed_xlsx, [["서울", "V1-001", "제목 1", "그래프", "Y", "collapsed-1", "N", ""]])
+    _audit_json(collapsed_audit, [("E001", 1, "그래프", "기록됨")])
+
+    sheet = build_sample_sheet(inventory, (
+        CandidateSampleInput("valid", valid_xlsx, valid_audit),
+        CandidateSampleInput("collapsed", collapsed_xlsx, collapsed_audit),
+    ), 15)
+
+    assert {row.element_id for row in sheet.rows} == {f"E{idx:03d}" for idx in range(1, 6)}
+    assert any("교집합 계산 제외" in note and "collapsed" in note for note in sheet.notes)

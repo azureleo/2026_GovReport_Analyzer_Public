@@ -74,10 +74,10 @@ def build_sample_sheet(inventory_path: Path, inputs: tuple[CandidateSampleInput,
     candidates = tuple(item.candidate for item in inputs if item.output_xlsx.exists())
     inventory = {item.element_id: item for item in load_inventory(inventory_path) if item.expected}
     records = {item.candidate: load_visual_records(item.output_xlsx) for item in inputs if item.output_xlsx.exists()}
-    common_ids = _common_recorded_ids(inventory, inputs, records)
+    common_ids, pool_notes = _common_recorded_ids(inventory, inputs, records)
     selected = _select_elements([inventory[element_id] for element_id in sorted(common_ids)], limit)
     rows = tuple(_sample_row(item, candidates, records) for item in selected)
-    return SampleSheet(rows=rows, candidates=candidates, notes=_sample_notes(rows, common_ids, limit))
+    return SampleSheet(rows=rows, candidates=candidates, notes=_sample_notes(rows, common_ids, limit, pool_notes))
 
 
 def load_inventory(path: Path) -> list[InventoryElement]:
@@ -133,21 +133,26 @@ def _common_recorded_ids(
     inventory: dict[str, InventoryElement],
     inputs: tuple[CandidateSampleInput, ...],
     records: dict[str, list[VisualRecord]],
-) -> set[str]:
+) -> tuple[set[str], tuple[str, ...]]:
     pools: list[set[str]] = []
+    notes: list[str] = []
+    expected_total = len(inventory)
     for item in inputs:
         if item.candidate not in records:
             continue
         recorded = _recorded_ids_from_audit(item.audit_json)
         if not recorded:
             recorded = _recorded_ids_from_pages(inventory, records[item.candidate])
+        if expected_total and len(recorded) / expected_total < 0.2:
+            notes.append(f"교집합 계산 제외: {item.candidate} 기록 요소 {len(recorded)}/{expected_total}(기대치의 20% 미만).")
+            continue
         pools.append(recorded)
     if not pools:
-        return set()
+        return set(), tuple(notes)
     common = set(pools[0])
     for pool in pools[1:]:
         common &= pool
-    return common
+    return common, tuple(notes)
 
 
 def _recorded_ids_from_audit(path: Path | None) -> set[str]:
@@ -225,8 +230,13 @@ def _summary_for(item: InventoryElement, records: list[VisualRecord]) -> str:
     return " / ".join(dict.fromkeys(summaries))
 
 
-def _sample_notes(rows: tuple[SampleRow, ...], common_ids: set[str], limit: int) -> tuple[str, ...]:
-    notes: list[str] = []
+def _sample_notes(
+    rows: tuple[SampleRow, ...],
+    common_ids: set[str],
+    limit: int,
+    pool_notes: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    notes: list[str] = list(pool_notes)
     if len(common_ids) < limit:
         notes.append(f"교집합 표본 풀이 {len(common_ids)}개라 목표 {limit}개(기본 15) 미만, 즉 15 미만입니다.")
     if sum(1 for row in rows if row.element_type == "그래프") < min(10, len(rows)):
