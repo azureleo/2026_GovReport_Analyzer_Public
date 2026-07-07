@@ -181,6 +181,10 @@ HYBRID_ADJUDICATION_CONTEXT_CHARS = _env_int("HYBRID_ADJUDICATION_CONTEXT_CHARS"
 HYBRID_AUTO_MERGE_ENABLED = _env_bool("HYBRID_AUTO_MERGE_ENABLED", False)
 HYBRID_AUTO_MERGE_MIN_CONFIDENCE = os.environ.get("HYBRID_AUTO_MERGE_MIN_CONFIDENCE", "high").strip().lower()
 
+# 라벨 기반 시각 판독값을 Organizer에서 본 시트로 병합하는 실험 플래그.
+# 기본값은 False로 고정해 기존 이미지 병합 경로와 기본 실행 산출물을 바꾸지 않는다.
+VISUAL_MERGE_LABELED_ENABLED = _env_bool("VISUAL_MERGE_LABELED_ENABLED", False)
+
 # 연도 범위 (탄소중립 기본계획 기준)
 YEARS = list(range(2018, 2051))
 

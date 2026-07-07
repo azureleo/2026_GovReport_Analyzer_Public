@@ -7,6 +7,7 @@
 """
 # noqa: SIZE_OK — 16개 시트 정제 계약을 보존하는 기존 모놀리식 cleaner. WP별로만 국소 수정.
 
+import json
 import logging
 import re
 import unicodedata
@@ -299,6 +300,23 @@ _DATA_STATUS_PRIORITY = {
 }
 _REGIONAL_EMISSIONS_KEY_FIELDS = ["지자체명", "배출유형", "부문", "세부부문", "연도"]
 _MANAGEMENT_EMISSIONS_KEY_FIELDS = ["지자체명", "관리부문", "세부부문", "직간접구분", "연도"]
+_CONFIDENCE_RANK = {"low": 1, "medium": 2, "high": 3}
+_VISUAL_MERGE_KEY_FIELDS = {
+    "regional_conditions": ["지자체명", "지표범주", "지표명", "연도"],
+    "emissions_regional": _REGIONAL_EMISSIONS_KEY_FIELDS,
+    "emissions_management": _MANAGEMENT_EMISSIONS_KEY_FIELDS,
+    "emissions_forecast": ["지자체명", "시나리오", "부문", "연도"],
+    "reduction_targets": ["지자체명", "목표수준", "목표범위", "부문", "목표연도"],
+    "financial_plan": ["지자체명", "계획구분", "부문", "사업명", "재원구분", "연도"],
+}
+_VISUAL_MERGE_VALUE_FIELDS = {
+    "regional_conditions": "값",
+    "emissions_regional": "배출량",
+    "emissions_management": "배출량",
+    "emissions_forecast": "전망값",
+    "reduction_targets": "목표배출량",
+    "financial_plan": "예산액",
+}
 _BLANK_ABSORB_FIELDS_BY_KEY = {
     tuple(_REGIONAL_EMISSIONS_KEY_FIELDS): ("세부부문", "배출유형"),
     tuple(_MANAGEMENT_EMISSIONS_KEY_FIELDS): ("세부부문", "직간접구분"),
@@ -981,6 +999,305 @@ def _build_visual_inventory(observations: list[dict], municipality: str) -> list
     return inventory
 
 
+def _visual_fields(observation: dict):
+    raw_fields = observation.get("판독필드") or observation.get("fields")
+    if isinstance(raw_fields, dict):
+        return dict(raw_fields)
+    evidence = str(observation.get("근거", "") or "").strip()
+    if not evidence.startswith("{"):
+        return {}
+    candidate = evidence.split(" | ", 1)[0]
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _visual_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().casefold()
+    if not text:
+        return None
+    if text in {"false", "0", "no", "n", "off", "비추정", "원문", "라벨"}:
+        return False
+    if text in {"true", "1", "yes", "y", "on", "추정", "estimated"}:
+        return True
+    return None
+
+
+def _visual_estimated_state(observation: dict, fields: dict) -> bool | None:
+    for key in ("estimated", "추정여부"):
+        state = _visual_bool(fields.get(key))
+        if state is not None:
+            return state
+    for key in ("estimated", "추정여부"):
+        state = _visual_bool(observation.get(key))
+        if state is not None:
+            return state
+    return None
+
+
+def _confidence_at_least(value: Any, minimum: Any) -> bool:
+    confidence = str(value or "").strip().lower()
+    threshold = str(minimum or "high").strip().lower()
+    return _CONFIDENCE_RANK.get(confidence, 0) >= _CONFIDENCE_RANK.get(threshold, 3)
+
+
+def _is_reference_visual_observation(observation: dict) -> bool:
+    text = " ".join(
+        str(observation.get(key, "") or "")
+        for key in ("제목", "근거", "단위", "그래프유형")
+    ).casefold()
+    return any(keyword.casefold() in text for keyword in config.IMAGE_CHART_REFERENCE_KEYWORDS)
+
+
+def _visual_observation_value(observation: dict, fields: dict, value_field: str) -> Any:
+    for key in (value_field, "값", "value"):
+        value = fields.get(key)
+        if _has_cell_value(value):
+            return value
+    return observation.get("값")
+
+
+def _visual_candidate_row(sheet_key: str, observation: dict, fields: dict, municipality: str) -> dict | None:
+    page = observation.get("페이지")
+    title = str(observation.get("제목", "") or "").strip()
+    item = str(fields.get("항목") or observation.get("항목") or title).strip()
+    unit = fields.get("단위") or observation.get("단위") or ""
+    year = fields.get("연도") or observation.get("연도")
+    value_field = _VISUAL_MERGE_VALUE_FIELDS.get(sheet_key)
+    if value_field is None:
+        return None
+    value = _visual_observation_value(observation, fields, value_field)
+    base = {
+        "지자체명": observation.get("지자체명") or municipality,
+        "출처페이지": page,
+        "데이터상태": "visual_only",
+    }
+    if sheet_key == "regional_conditions":
+        return base | {
+            "지표범주": fields.get("지표범주") or "시각자료",
+            "지표세부범주": fields.get("지표세부범주") or "",
+            "지표명": fields.get("지표명") or item,
+            "연도": year,
+            "값": value,
+            "단위": unit,
+            "출처": f"이미지 p.{page}" if page else "이미지",
+        }
+    if sheet_key == "emissions_regional":
+        emission_type = fields.get("배출유형") or fields.get("배출범위") or "직접배출"
+        return base | {
+            "인벤토리출처": "이미지",
+            "배출범위": fields.get("배출범위") or emission_type,
+            "배출유형": emission_type,
+            "부문": fields.get("부문") or item,
+            "세부부문": fields.get("세부부문") or "",
+            "연도": year,
+            "배출량": value,
+            "단위": unit,
+            "흡수원여부": fields.get("흡수원여부") or emission_type == "흡수원",
+        }
+    if sheet_key == "emissions_management":
+        return base | {
+            "인벤토리출처": "이미지",
+            "관리부문": fields.get("관리부문") or fields.get("부문") or item,
+            "세부부문": fields.get("세부부문") or "",
+            "직간접구분": fields.get("직간접구분") or "",
+            "연도": year,
+            "배출량": value,
+            "단위": unit,
+            "합계포함여부": fields.get("합계포함여부") or "",
+        }
+    if sheet_key == "emissions_forecast":
+        return base | {
+            "시나리오": fields.get("시나리오") or "BAU",
+            "전망방법코드": fields.get("전망방법코드") or "",
+            "전망방법원문": fields.get("전망방법원문") or "",
+            "부문": fields.get("부문") or item,
+            "세부부문": fields.get("세부부문") or "",
+            "연도": year,
+            "전망값": value,
+            "단위": unit,
+            "주요가정": f"이미지 p.{page}" if page else "이미지",
+        }
+    if sheet_key == "reduction_targets":
+        return base | {
+            "목표수준": fields.get("목표수준") or ("총괄" if item in {"합계", "총괄", "전체"} else "부문"),
+            "목표범위": fields.get("목표범위") or "지역전체",
+            "부문": fields.get("부문") or item,
+            "기준연도": fields.get("기준연도"),
+            "기준배출량": fields.get("기준배출량"),
+            "목표연도": fields.get("목표연도") or year,
+            "배출전망": fields.get("배출전망"),
+            "목표감축량": fields.get("목표감축량"),
+            "목표배출량": value,
+            "감축률": fields.get("감축률"),
+        }
+    if sheet_key == "financial_plan":
+        return base | {
+            "계획구분": fields.get("계획구분") or "온실가스감축대책",
+            "부문": fields.get("부문") or item,
+            "사업명": fields.get("사업명") or title,
+            "재원구분": fields.get("재원구분") or "합계",
+            "연도": year,
+            "예산액": value,
+            "예산단위": unit,
+        }
+    return None
+
+
+def _visual_allowed_fields(sheet_key: str) -> set[str]:
+    sheet_name = config.SHEET_KEY_TO_NAME.get(sheet_key, "")
+    headers = set(config.EXCEL_HEADERS.get(sheet_name, []))
+    if "감축률(%)" in headers:
+        headers.add("감축률")
+    return headers
+
+
+def _clean_visual_candidate(sheet_key: str, row: dict, municipality: str) -> dict | None:
+    cleaner = _CLEANERS.get(sheet_key)
+    if cleaner is None:
+        return None
+    cleaned_rows = cleaner([dict(row)], municipality)
+    if not cleaned_rows:
+        return None
+    cleaned = _normalize_row_provenance(dict(cleaned_rows[0]))
+    _apply_row_data_status(cleaned)
+    allowed = _visual_allowed_fields(sheet_key)
+    return {key: value for key, value in cleaned.items() if key in allowed}
+
+
+def _visual_key(row: dict, key_fields: list[str]) -> tuple[str, ...]:
+    return tuple(_dedup_key_text(row.get(field)) for field in key_fields)
+
+
+def _visual_text_rows(rows: list[dict], candidate: dict, key_fields: list[str]) -> list[dict]:
+    candidate_key = _visual_key(candidate, key_fields)
+    return [
+        row for row in rows
+        if _visual_key(row, key_fields) == candidate_key
+        and str(row.get("데이터상태", "") or "").strip() != "visual_only"
+    ]
+
+
+def _remember_visual_merge_issue(
+    municipality: str,
+    severity: str,
+    item: str,
+    detail: str,
+    action: str,
+    sheet_key: str | None,
+) -> None:
+    _remember_validation_issue(
+        municipality,
+        severity,
+        "시각병합",
+        item,
+        detail,
+        action,
+        target_sheet_key=sheet_key,
+    )
+
+
+def _visual_key_summary(row: dict, key_fields: list[str]) -> str:
+    return ", ".join(f"{field}={row.get(field) or ''}" for field in key_fields)
+
+
+def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municipality: str) -> None:
+    if not getattr(config, "VISUAL_MERGE_LABELED_ENABLED", False):
+        return
+    min_confidence = getattr(config, "IMAGE_CHART_MERGE_MIN_CONFIDENCE", "medium")
+    for observation in observations:
+        if not isinstance(observation, dict):
+            continue
+        if str(observation.get("반영여부", "") or "").strip() != "검토":
+            continue
+        sheet_key = str(observation.get("대상시트", "") or "").strip()
+        fields = _visual_fields(observation)
+        blockers: list[str] = []
+        if _visual_estimated_state(observation, fields) is not False:
+            blockers.append("G1 라벨 기반 비추정 메타데이터 없음")
+        if not _confidence_at_least(observation.get("신뢰도"), min_confidence):
+            blockers.append(f"G2 신뢰도 기준 미달({observation.get('신뢰도') or ''} < {min_confidence})")
+        if _is_reference_visual_observation(observation):
+            blockers.append("G4 참고자료/사례 판정")
+
+        candidate = None
+        key_fields = _VISUAL_MERGE_KEY_FIELDS.get(sheet_key)
+        value_field = _VISUAL_MERGE_VALUE_FIELDS.get(sheet_key)
+        raw_candidate = _visual_candidate_row(sheet_key, observation, fields, municipality)
+        if raw_candidate is None or key_fields is None or value_field is None:
+            blockers.append(f"G3 대상 시트 미지원 또는 키 정의 없음({sheet_key or '미지정'})")
+        else:
+            candidate = _clean_visual_candidate(sheet_key, raw_candidate, municipality)
+            if candidate is None:
+                blockers.append("G3 정제 후 유효 행 없음")
+            else:
+                missing = [field for field in key_fields if not _has_cell_value(candidate.get(field))]
+                if missing:
+                    blockers.append(f"G3 1차 키 누락({', '.join(missing)})")
+                if not _has_cell_value(candidate.get(value_field)):
+                    blockers.append(f"G3 비교값 누락({value_field})")
+
+        if blockers:
+            _remember_visual_merge_issue(
+                municipality,
+                "정보",
+                "차단",
+                f"{sheet_key or '미지정'} p{observation.get('페이지') or '?'}: {'; '.join(blockers)}",
+                "시각 판독 메타데이터와 원문 표기 확인",
+                sheet_key or None,
+            )
+            continue
+
+        if candidate is None or key_fields is None or value_field is None:
+            continue
+        rows = cleaned.setdefault(sheet_key, [])
+        if not isinstance(rows, list):
+            continue
+        text_rows = _visual_text_rows(rows, candidate, key_fields)
+        key_summary = _visual_key_summary(candidate, key_fields)
+        if text_rows:
+            matching_rows = [
+                row for row in text_rows
+                if not _values_conflict(row.get(value_field), candidate.get(value_field))
+            ]
+            if matching_rows:
+                _remember_visual_merge_issue(
+                    municipality,
+                    "정보",
+                    "생략",
+                    f"{sheet_key} {key_summary}: 교차일치, 텍스트 {matching_rows[0].get(value_field)} vs 시각 {candidate.get(value_field)}",
+                    "기존 텍스트 행 유지",
+                    sheet_key,
+                )
+                continue
+            conflict_row = text_rows[0]
+            _remember_visual_merge_issue(
+                municipality,
+                "경고",
+                "차단",
+                f"{sheet_key} {key_summary}: 텍스트-시각 값 불일치, 텍스트 {conflict_row.get(value_field)} vs 시각 {candidate.get(value_field)}",
+                "원문 표·차트와 텍스트 추출값 수동 확인",
+                sheet_key,
+            )
+            continue
+
+        rows.append(candidate)
+        _remember_visual_merge_issue(
+            municipality,
+            "정보",
+            "병합",
+            f"{sheet_key} {key_summary}: 텍스트 행 없음, 시각 전용 값 {candidate.get(value_field)} 병합",
+            "visual_only 행으로 출처페이지 확인",
+            sheet_key,
+        )
+
+
 def _issue(
     municipality: str,
     severity: str,
@@ -1451,6 +1768,7 @@ class OrganizerAgent:
         execution_info = raw_data.get("execution_info") if isinstance(raw_data.get("execution_info"), dict) else None
         cleaned["codebook"] = build_codebook_rows(execution_info) if getattr(config, "CODEBOOK_SHEET_ENABLED", True) else []
         _apply_default_data_status(cleaned)
+        _apply_visual_labeled_merge(cleaned, observations, municipality)
         _tag_prior_plan_rows(cleaned, municipality, prior_plan_pages or set())
 
         # 결정론적 검증·정합성 점검(감축률 재계산은 reduction_targets를 인플레이스 교정).

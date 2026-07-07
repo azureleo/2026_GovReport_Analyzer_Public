@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+import config
+from agents.organizer_agent import OrganizerAgent
+
+
+def _관리권한_관찰값(
+    *,
+    value: float = 100.0,
+    confidence: str = "high",
+    fields: dict | None = None,
+    title: str = "관리권한 배출량",
+):
+    판독필드 = {
+        "estimated": False,
+        "관리부문": "건물",
+        "세부부문": "공공",
+        "직간접구분": "직접",
+    }
+    if fields is not None:
+        판독필드 = fields
+    return {
+        "지자체명": "서울특별시",
+        "페이지": 188,
+        "대상시트": "emissions_management",
+        "그래프유형": "표",
+        "제목": title,
+        "단위": "천톤CO2eq",
+        "항목": "건물",
+        "연도": 2030,
+        "값": value,
+        "신뢰도": confidence,
+        "반영여부": "검토",
+        "근거": json.dumps(판독필드, ensure_ascii=False),
+    }
+
+
+def _텍스트_관리권한행(value: float):
+    return {
+        "지자체명": "서울특별시",
+        "인벤토리출처": "본문",
+        "관리부문": "건물",
+        "세부부문": "공공",
+        "직간접구분": "직접",
+        "연도": 2030,
+        "배출량": value,
+        "단위": "천톤CO2eq",
+    }
+
+
+def _시각_관찰값(target_sheet: str, fields: dict, *, value: float = 100.0):
+    판독필드 = {"estimated": False} | fields
+    return {
+        "지자체명": "서울특별시",
+        "페이지": 188,
+        "대상시트": target_sheet,
+        "그래프유형": "표",
+        "제목": "지원 시트별 시각 판독",
+        "단위": "천톤CO2eq",
+        "항목": fields.get("지표명") or fields.get("부문") or fields.get("관리부문") or fields.get("사업명") or "합계",
+        "연도": fields.get("목표연도") or fields.get("연도") or 2030,
+        "값": value,
+        "신뢰도": "high",
+        "반영여부": "검토",
+        "근거": json.dumps(판독필드, ensure_ascii=False),
+    }
+
+
+def test_시각_라벨병합은_기본값에서_본시트와_리포트를_바꾸지_않는다(monkeypatch) -> None:
+    # Given: 병합 가능한 라벨 기반 시각 판독값이 있지만 opt-in 플래그가 꺼져 있으면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", False, raising=False)
+    raw = {"municipality_name": "서울특별시", "chart_observations": [_관리권한_관찰값()]}
+
+    # When: organizer가 기본 설정으로 정제하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 기존 격리 정책처럼 본 시트와 검증리포트는 조용히 유지된다.
+    assert cleaned["emissions_management"] == []
+    assert not any(row.get("영역") == "시각병합" for row in cleaned["validation_report"])
+
+
+def test_시각_라벨병합은_게이트_미충족_사유를_행단위로_기록한다(monkeypatch) -> None:
+    # Given: G1~G4 중 하나씩 실패하는 판독값이 들어오면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    raw = {
+        "municipality_name": "서울특별시",
+        "chart_observations": [
+            _관리권한_관찰값(fields={"estimated": True, "관리부문": "건물", "세부부문": "공공", "직간접구분": "직접"}),
+            _관리권한_관찰값(confidence="low"),
+            _관리권한_관찰값(fields={"estimated": False, "관리부문": "건물", "세부부문": "공공"}),
+            _관리권한_관찰값(title="세계도시 사례 관리권한 배출량"),
+        ],
+    }
+
+    # When: opt-in 병합 게이트를 적용하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 본 시트 병합 없이 각 차단 근거가 검증리포트에 남는다.
+    assert cleaned["emissions_management"] == []
+    visual_issues = [row for row in cleaned["validation_report"] if row.get("영역") == "시각병합"]
+    assert len(visual_issues) == 4
+    details = "\n".join(row["문제내용"] for row in visual_issues)
+    assert "G1" in details
+    assert "G2" in details
+    assert "G3" in details
+    assert "G4" in details
+    assert all(row["항목"] == "차단" for row in visual_issues)
+
+
+def test_시각_라벨병합은_텍스트가_없을_때_visual_only로_본시트에_반영한다(monkeypatch) -> None:
+    # Given: G1~G4를 통과하고 같은 키의 텍스트 행이 없는 시각 판독값이면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    raw = {"municipality_name": "서울특별시", "chart_observations": [_관리권한_관찰값()]}
+
+    # When: organizer가 opt-in 병합을 수행하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 기존 시트 컬럼만 가진 visual_only 행과 병합 기록이 생긴다.
+    assert len(cleaned["emissions_management"]) == 1
+    row = cleaned["emissions_management"][0]
+    assert row["관리부문"] == "건물"
+    assert row["세부부문"] == "공공"
+    assert row["직간접구분"] == "직접"
+    assert row["배출량"] == 100.0
+    assert row["출처페이지"] == "188"
+    assert row["데이터상태"] == "visual_only"
+    allowed = set(config.EXCEL_HEADERS["04_배출현황_관리권한"])
+    assert set(row) <= allowed
+    assert any(issue.get("영역") == "시각병합" and issue.get("항목") == "병합" for issue in cleaned["validation_report"])
+
+
+@pytest.mark.parametrize(
+    ("target_sheet", "fields", "value_field", "excel_sheet"),
+    [
+        ("regional_conditions", {"지표범주": "교통", "지표명": "통행량", "연도": 2030}, "값", "02_지역여건"),
+        ("emissions_regional", {"배출유형": "직접배출", "부문": "건물", "세부부문": "공공", "연도": 2030}, "배출량", "03_배출현황_지역"),
+        ("emissions_management", {"관리부문": "건물", "세부부문": "공공", "직간접구분": "직접", "연도": 2030}, "배출량", "04_배출현황_관리권한"),
+        ("emissions_forecast", {"시나리오": "BAU", "부문": "건물", "연도": 2030}, "전망값", "05_배출전망"),
+        ("reduction_targets", {"목표수준": "부문", "목표범위": "지역전체", "부문": "건물", "목표연도": 2030}, "목표배출량", "06_감축목표"),
+        ("financial_plan", {"계획구분": "온실가스감축대책", "부문": "건물", "사업명": "효율화", "재원구분": "합계", "연도": 2030}, "예산액", "11_재정투자계획"),
+    ],
+)
+def test_시각_라벨병합은_지원_수치시트의_계약컬럼만_사용한다(
+    monkeypatch,
+    target_sheet: str,
+    fields: dict,
+    value_field: str,
+    excel_sheet: str,
+) -> None:
+    # Given: 지원 대상 수치 시트별 1차 키가 모두 채워진 라벨 기반 시각 판독값이면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    raw = {"municipality_name": "서울특별시", "chart_observations": [_시각_관찰값(target_sheet, fields)]}
+
+    # When: organizer가 opt-in 병합을 수행하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 각 대상 시트는 기존 엑셀 계약 컬럼만 가진 visual_only 행을 받는다.
+    assert len(cleaned[target_sheet]) == 1
+    row = cleaned[target_sheet][0]
+    assert row[value_field] == 100.0
+    assert row["데이터상태"] == "visual_only"
+    allowed = set(config.EXCEL_HEADERS[excel_sheet])
+    if "감축률(%)" in allowed:
+        allowed.add("감축률")
+    assert set(row) <= allowed
+    assert any(issue.get("영역") == "시각병합" and issue.get("항목") == "병합" for issue in cleaned["validation_report"])
+
+
+def test_시각_라벨병합은_텍스트_일치시_생략하고_교차일치를_기록한다(monkeypatch) -> None:
+    # Given: 같은 키의 텍스트 행이 0.5% 이내 값으로 이미 있으면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    raw = {
+        "municipality_name": "서울특별시",
+        "emissions_management": [_텍스트_관리권한행(100.3)],
+        "chart_observations": [_관리권한_관찰값(value=100.0)],
+    }
+
+    # When: organizer가 교차검증하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 중복 병합을 생략하고 교차일치 근거를 남긴다.
+    assert len(cleaned["emissions_management"]) == 1
+    assert cleaned["emissions_management"][0]["배출량"] == 100.3
+    assert any(
+        issue.get("영역") == "시각병합" and issue.get("항목") == "생략" and "교차일치" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
+
+
+def test_시각_라벨병합은_텍스트_불일치시_경고하고_병합하지_않는다(monkeypatch) -> None:
+    # Given: 같은 키의 텍스트 행과 0.5% 넘게 불일치하는 시각 판독값이면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    raw = {
+        "municipality_name": "서울특별시",
+        "emissions_management": [_텍스트_관리권한행(120.0)],
+        "chart_observations": [_관리권한_관찰값(value=100.0)],
+    }
+
+    # When: organizer가 교차검증하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 본 시트는 텍스트 행만 유지하고 경고를 남긴다.
+    assert len(cleaned["emissions_management"]) == 1
+    assert cleaned["emissions_management"][0]["배출량"] == 120.0
+    assert any(
+        issue.get("영역") == "시각병합"
+        and issue.get("항목") == "차단"
+        and issue.get("심각도") == "경고"
+        and "텍스트-시각 값 불일치" in issue.get("문제내용", "")
+        and "텍스트 120.0" in issue.get("문제내용", "")
+        and "시각 100.0" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
