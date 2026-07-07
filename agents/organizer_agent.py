@@ -107,6 +107,9 @@ _IPCC_INVENTORY_SECTOR_MAP = {
 }
 _SECTOR_QUALIFIER_RE = re.compile(r"^\s*(?P<sector>[^()（）]+?)\s*[（(](?P<qualifier>[^()（）]+)[）)]\s*$")
 _IPCC_SECTOR_PREFIX_RE = re.compile(r"^\s*(?P<code>[1-4][A-D]?\d*)\s*(?P<label>[가-힣A-Za-z].*)$")
+_TABLE_MARKER_RE = re.compile(r"(?:\[\s*)?표\s*\d+\s*[-–—.]\s*\d+(?:\s*\])?")
+_DEDUP_TABLE_MARKER_FIELD = "__dedup_표마커"
+_INTERNAL_DEDUP_FIELDS = {_DEDUP_TABLE_MARKER_FIELD}
 
 
 def _to_float(val: Any) -> float | None:
@@ -602,18 +605,28 @@ def _row_conflicts(kept: dict, discarded: dict) -> list[str]:
     return conflicts
 
 
-def _remember_dedup_conflict(key_fields: list[str], kept: dict, discarded: dict, fields: list[str]) -> None:
+def _remember_dedup_conflict(
+    key_fields: list[str],
+    kept: dict,
+    discarded: dict,
+    fields: list[str],
+    reason: str = "기존 순서 유지",
+) -> None:
     _set_data_status(kept, "conflicting")
     key_summary = ", ".join(f"{field}={kept.get(field) or discarded.get(field) or ''}" for field in key_fields)
     detail = "; ".join(
         f"{field}: 유지 {kept.get(field)} vs 폐기 {discarded.get(field)}"
         for field in fields
     )
+    if reason:
+        detail = f"{detail}; 채택근거: {reason}"
     _DEDUP_CONFLICTS.append({"key": key_summary, "detail": detail})
 
 
 def _merge_missing_values(target: dict, source: dict) -> None:
     for key, value in source.items():
+        if key in _INTERNAL_DEDUP_FIELDS:
+            continue
         if key == "출처페이지":
             merged = _merge_provenance(target.get("출처페이지"), value)
             if merged:
@@ -624,6 +637,41 @@ def _merge_missing_values(target: dict, source: dict) -> None:
             continue
         if _has_cell_value(value) and not _has_cell_value(target.get(key)):
             target[key] = value
+
+
+def _source_has_table_marker(row: dict) -> bool:
+    return bool(_TABLE_MARKER_RE.search(str(row.get("출처페이지", "") or "")))
+
+
+def _filled_cell_count(row: dict) -> int:
+    return sum(
+        1 for key, value in row.items()
+        if key not in _INTERNAL_DEDUP_FIELDS and _has_cell_value(value)
+    )
+
+
+def _choose_conflict_row(kept: dict, incoming: dict) -> tuple[dict, dict, str]:
+    kept_count = _filled_cell_count(kept)
+    incoming_count = _filled_cell_count(incoming)
+    if incoming_count > kept_count:
+        return incoming, kept, "값 채움 필드 수 우선"
+    if kept_count > incoming_count:
+        return kept, incoming, "값 채움 필드 수 우선"
+
+    kept_table = bool(kept.get(_DEDUP_TABLE_MARKER_FIELD))
+    incoming_table = bool(incoming.get(_DEDUP_TABLE_MARKER_FIELD))
+    if incoming_table and not kept_table:
+        return incoming, kept, "표 마커 출처 우선"
+    if kept_table and not incoming_table:
+        return kept, incoming, "표 마커 출처 우선"
+    return kept, incoming, "기존 순서 유지"
+
+
+def _strip_dedup_internal_fields(rows: list[dict]) -> list[dict]:
+    for row in rows:
+        for field in _INTERNAL_DEDUP_FIELDS:
+            row.pop(field, None)
+    return rows
 
 
 def _same_except_field(left: dict, right: dict, key_fields: list[str], blank_field: str) -> bool:
@@ -666,6 +714,7 @@ def _deduplicate_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
     seen: dict[tuple, dict] = {}
     for source_row in rows:
         row = _normalize_row_provenance(dict(source_row))
+        row[_DEDUP_TABLE_MARKER_FIELD] = _source_has_table_marker(source_row)
         _apply_row_data_status(row)
         key = tuple(_dedup_key_text(row.get(f)) for f in key_fields)
         if key not in seen:
@@ -674,9 +723,13 @@ def _deduplicate_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
         kept = seen[key]
         conflicts = _row_conflicts(kept, row)
         if conflicts:
-            _remember_dedup_conflict(key_fields, kept, row, conflicts)
+            winner, loser, reason = _choose_conflict_row(kept, row)
+            seen[key] = winner
+            _remember_dedup_conflict(key_fields, winner, loser, conflicts, reason)
+            _merge_missing_values(winner, loser)
+            continue
         _merge_missing_values(kept, row)
-    return _absorb_blank_key_rows(list(seen.values()), key_fields)
+    return _strip_dedup_internal_fields(_absorb_blank_key_rows(list(seen.values()), key_fields))
 
 
 def _filter_empty_rows(rows: list[dict], required_fields: list[str]) -> list[dict]:
