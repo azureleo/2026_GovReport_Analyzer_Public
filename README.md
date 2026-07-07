@@ -32,7 +32,14 @@ v6의 방향은 하나입니다. **측정 없이는 개선도 없다** — 추�
 - `서울_시각요소_인벤토리_v1.xlsx`: 본문 캡션 505건에서 확정한 시각요소 176개(사람+Claude 3라운드 교정).
 - **첫 기준선** (`docs/audit/M1_기준선_잠정_20260706.md`): 텍스트 리콜 0.674·매칭 행 값일치율 0.829, 시각 리콜 codex 0.988 vs gemini flash-lite 0.707. 시각 경로(추출·triage·필터)는 유실 0으로 검증됐고, 남은 병목은 vision 판독력 — 다음 단계인 M2-3(교차 프로바이더 vision 벤치마크)의 근거입니다.
 
-### 4. 후속 수정 대기
+### 4. vision 기본값 채택 (2026-07-07)
+
+벤치마크 결과에 따라 **API 모드의 vision 기본 모델을 `gemini-2.5-pro`로 채택**했다
+(`GEMINI_VISION_MODEL`). 에이전트 모드(codex)의 vision은 CLI 기본 모델(gpt-5.5)을
+그대로 쓴다 — 구독 quota 기반이라 API 과금이 없기 때문. 텍스트 추출 기본은 비용을
+고려해 flash-lite를 유지한다.
+
+### 5. 후속 수정 대기
 
 기준선 측정에서 실측된 결함 8건이 `docs/specs/소수정_v5.2_지시서.md`에 정리되어 있습니다(gemini 클라이언트 타임아웃, 직간접구분 정규화, requirements의 google-genai/google-api-core 누락 등).
 
@@ -234,6 +241,7 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 | 설정 | 기본값 | 설명 |
 |---|---:|---|
 | `LLM_PROVIDER` | `gemini` | 기본 LLM 백엔드 |
+| `GEMINI_VISION_MODEL` | `gemini-2.5-pro` | API 모드 vision(차트 판독) 기본 모델. 벤치마크 실측(0.976 vs flash-lite 0.707)으로 채택. 에이전트(codex/claude) 모드 vision에는 적용되지 않음 |
 | `GEMINI_REQUEST_TIMEOUT_SECONDS` | `180` | Gemini SDK 요청 1회 타임아웃. 초 단위 env 값을 SDK에는 ms로 전달 |
 | `LOCAL_AGENT_TIMEOUT` | `300` | Codex/Claude 1회 호출 제한 시간 |
 | `PARALLEL_PROCESSING_ENABLED` | `True` | 독립 배치 병렬 실행 |
