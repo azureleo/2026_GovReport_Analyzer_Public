@@ -82,3 +82,68 @@ def test_시트04_관리부문도_괄호_한정어와_ipcc_코드를_일반_규�
     assert by_year[2021]["관리부문"] == "폐기물"
     assert by_year[2021]["세부부문"] == "4A 폐기물 매립(직접)"
     assert by_year[2021]["직간접구분"] == "직접"
+
+
+def test_시트03_빈_배출유형_행은_동일_키_채움_행에_흡수된다() -> None:
+    # Given: 배출유형만 빈 행이 같은 부문·세부부문·연도·수치를 가진 행과 함께 들어오면
+    raw = {
+        "municipality_name": "강원특별자치도",
+        "emissions_regional": [
+            {"배출유형": "", "부문": "에너지", "세부부문": "연료연소", "연도": 2020, "배출량": 10, "단위": "천톤"},
+            {"배출유형": "직접배출", "부문": "에너지", "세부부문": "연료연소", "연도": 2020, "배출량": 10},
+        ],
+    }
+
+    # When: organizer가 지역 배출현황을 dedup하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 빈 배출유형 행은 채워진 키 행에 흡수되고 보조 값은 병합된다.
+    assert cleaned["emissions_regional"] == [
+        {
+            "지자체명": "강원특별자치도",
+            "배출유형": "직접배출",
+            "부문": "에너지",
+            "세부부문": "연료연소",
+            "연도": 2020,
+            "배출량": 10.0,
+            "데이터상태": "reported",
+            "단위": "천톤",
+        }
+    ]
+
+
+def test_시트03_빈_배출유형_행도_수치_충돌이면_흡수하지_않는다() -> None:
+    # Given: 배출유형만 빈 행이 같은 논리 키에서 다른 수치를 갖고 있으면
+    raw = {
+        "municipality_name": "강원특별자치도",
+        "emissions_regional": [
+            {"배출유형": "", "부문": "에너지", "세부부문": "연료연소", "연도": 2020, "배출량": 10},
+            {"배출유형": "직접배출", "부문": "에너지", "세부부문": "연료연소", "연도": 2020, "배출량": 20},
+        ],
+    }
+
+    # When: organizer가 지역 배출현황을 dedup하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 행을 합치지 않고 중복 키 값 충돌로 보고한다.
+    assert len(cleaned["emissions_regional"]) == 2
+    assert any("중복 키 값 충돌" in row["항목"] for row in cleaned["validation_report"])
+
+
+def test_시트04_빈_직간접구분_행은_동일_키_채움_행에_흡수된다() -> None:
+    # Given: 직간접구분만 빈 관리권한 행이 같은 관리부문·세부부문·연도·수치를 가진 행과 함께 들어오면
+    raw = {
+        "municipality_name": "경기도",
+        "emissions_management": [
+            {"관리부문": "건물", "세부부문": "공공", "직간접구분": "", "연도": 2030, "배출량": 7, "단위": "천톤"},
+            {"관리부문": "건물", "세부부문": "공공", "직간접구분": "간접", "연도": 2030, "배출량": 7},
+        ],
+    }
+
+    # When: organizer가 관리권한 배출현황을 dedup하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 빈 직간접구분 행은 채워진 키 행에 흡수된다.
+    assert len(cleaned["emissions_management"]) == 1
+    assert cleaned["emissions_management"][0]["직간접구분"] == "간접"
+    assert cleaned["emissions_management"][0]["단위"] == "천톤"

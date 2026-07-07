@@ -293,6 +293,12 @@ _DATA_STATUS_PRIORITY = {
     "calculated": 3,
     "conflicting": 4,
 }
+_REGIONAL_EMISSIONS_KEY_FIELDS = ["지자체명", "배출유형", "부문", "세부부문", "연도"]
+_MANAGEMENT_EMISSIONS_KEY_FIELDS = ["지자체명", "관리부문", "세부부문", "직간접구분", "연도"]
+_BLANK_ABSORB_FIELDS_BY_KEY = {
+    tuple(_REGIONAL_EMISSIONS_KEY_FIELDS): ("세부부문", "배출유형"),
+    tuple(_MANAGEMENT_EMISSIONS_KEY_FIELDS): ("세부부문", "직간접구분"),
+}
 
 
 def _normalize_provenance_pages(value: Any) -> str:
@@ -620,23 +626,22 @@ def _merge_missing_values(target: dict, source: dict) -> None:
             target[key] = value
 
 
-def _same_except_detail(left: dict, right: dict, key_fields: list[str], detail_field: str) -> bool:
+def _same_except_field(left: dict, right: dict, key_fields: list[str], blank_field: str) -> bool:
     return all(
-        field == detail_field or _dedup_key_text(left.get(field)) == _dedup_key_text(right.get(field))
+        field == blank_field or _dedup_key_text(left.get(field)) == _dedup_key_text(right.get(field))
         for field in key_fields
     )
 
 
-def _absorb_blank_detail_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
-    detail_field = "세부부문"
-    if detail_field not in key_fields:
+def _absorb_blank_field_rows(rows: list[dict], key_fields: list[str], blank_field: str) -> list[dict]:
+    if blank_field not in key_fields:
         return rows
-    retained: list[dict] = [row for row in rows if _dedup_key_text(row.get(detail_field))]
-    blanks = [row for row in rows if not _dedup_key_text(row.get(detail_field))]
+    retained: list[dict] = [row for row in rows if _dedup_key_text(row.get(blank_field))]
+    blanks = [row for row in rows if not _dedup_key_text(row.get(blank_field))]
     for blank in blanks:
         absorbed = False
         for candidate in retained:
-            if not _same_except_detail(blank, candidate, key_fields, detail_field):
+            if not _same_except_field(blank, candidate, key_fields, blank_field):
                 continue
             conflicts = _row_conflicts(candidate, blank)
             if conflicts:
@@ -648,6 +653,13 @@ def _absorb_blank_detail_rows(rows: list[dict], key_fields: list[str]) -> list[d
         if not absorbed:
             retained.append(blank)
     return retained
+
+
+def _absorb_blank_key_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
+    absorbed = rows
+    for blank_field in _BLANK_ABSORB_FIELDS_BY_KEY.get(tuple(key_fields), ()):
+        absorbed = _absorb_blank_field_rows(absorbed, key_fields, blank_field)
+    return absorbed
 
 
 def _deduplicate_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
@@ -664,7 +676,7 @@ def _deduplicate_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
         if conflicts:
             _remember_dedup_conflict(key_fields, kept, row, conflicts)
         _merge_missing_values(kept, row)
-    return _absorb_blank_detail_rows(list(seen.values()), key_fields)
+    return _absorb_blank_key_rows(list(seen.values()), key_fields)
 
 
 def _filter_empty_rows(rows: list[dict], required_fields: list[str]) -> list[dict]:
@@ -713,7 +725,7 @@ def _clean_emissions_regional(rows: list[dict], municipality: str) -> list[dict]
         row["배출량"] = _to_float(row.get("배출량"))
         row["단위"] = _normalize_co2_unit(row.get("단위", ""))
     rows = _filter_empty_rows(rows, ["배출량"])
-    return _deduplicate_rows(rows, ["지자체명", "배출유형", "부문", "세부부문", "연도"])
+    return _deduplicate_rows(rows, _REGIONAL_EMISSIONS_KEY_FIELDS)
 
 
 def _clean_emissions_management(rows: list[dict], municipality: str) -> list[dict]:
@@ -744,7 +756,7 @@ def _clean_emissions_management(rows: list[dict], municipality: str) -> list[dic
         row["단위"] = _normalize_co2_unit(row.get("단위", ""))
     rows = [r for r in rows if r.get("관리부문")]
     rows = _filter_empty_rows(rows, ["배출량"])
-    return _deduplicate_rows(rows, ["지자체명", "관리부문", "세부부문", "직간접구분", "연도"])
+    return _deduplicate_rows(rows, _MANAGEMENT_EMISSIONS_KEY_FIELDS)
 
 
 def _clean_emissions_forecast(rows: list[dict], municipality: str) -> list[dict]:
