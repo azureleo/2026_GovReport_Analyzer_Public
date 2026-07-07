@@ -90,6 +90,23 @@ _FORECAST_METHOD_MAP = {
 }
 
 _MANAGEMENT_ENERGY_SOURCE_TERMS = {"전력", "열", "에너지"}
+_GUIDELINE_INVENTORY_SECTORS = (
+    "에너지",
+    "산업공정 및 제품 생산",
+    "농업",
+    "LULUCF",
+    "전력",
+    "열",
+    "폐기물",
+)
+_IPCC_INVENTORY_SECTOR_MAP = {
+    "1": "에너지",
+    "2": "산업공정 및 제품 생산",
+    "3": "농업",
+    "4": "폐기물",
+}
+_SECTOR_QUALIFIER_RE = re.compile(r"^\s*(?P<sector>[^()（）]+?)\s*[（(](?P<qualifier>[^()（）]+)[）)]\s*$")
+_IPCC_SECTOR_PREFIX_RE = re.compile(r"^\s*(?P<code>[1-4][A-D]?\d*)\s*(?P<label>[가-힣A-Za-z].*)$")
 
 
 def _to_float(val: Any) -> float | None:
@@ -169,6 +186,47 @@ def _normalize_sector(val: str) -> str:
     if len(v) > 40:
         return ""
     return v
+
+
+def _inventory_sector_key(value: str) -> str:
+    return normalise_key_text(value).replace(" ", "")
+
+
+def _standard_inventory_sector(value: str) -> str:
+    sectors = list(_GUIDELINE_INVENTORY_SECTORS) + list(getattr(config, "SECTORS", []))
+    by_key = {_inventory_sector_key(sector): sector for sector in sectors}
+    return by_key.get(_inventory_sector_key(value), "")
+
+
+def _compact_qualifier(value: str) -> str:
+    return normalise_key_text(value).replace(" ", "")
+
+
+def _apply_inventory_sector_normalization(row: dict, field: str, raw_field: str) -> None:
+    raw_text = str(row.get(field, "") or "").strip()
+    if not raw_text:
+        return
+
+    ipcc_match = _IPCC_SECTOR_PREFIX_RE.match(raw_text)
+    if ipcc_match is not None:
+        mapped = _IPCC_INVENTORY_SECTOR_MAP.get(ipcc_match.group("code")[0])
+        if mapped:
+            row[field] = mapped
+            row.setdefault(raw_field, raw_text)
+            if not _has_cell_value(row.get("세부부문")):
+                row["세부부문"] = raw_text
+            return
+
+    qualifier_match = _SECTOR_QUALIFIER_RE.match(raw_text)
+    if qualifier_match is None:
+        return
+    sector = _standard_inventory_sector(qualifier_match.group("sector"))
+    if not sector:
+        return
+    row[field] = sector
+    row.setdefault(raw_field, raw_text)
+    if not _has_cell_value(row.get("세부부문")):
+        row["세부부문"] = _compact_qualifier(qualifier_match.group("qualifier"))
 
 
 def _chapter_id(text: str) -> str:
@@ -386,7 +444,7 @@ def _normalise_sector_with_raw(row: dict, field: str, raw_field: str) -> str:
     normalized = _normalize_sector(raw)
     raw_text = str(raw).strip() if raw is not None else ""
     if raw_text and normalized and normalized != raw_text:
-        row[raw_field] = raw_text
+        row.setdefault(raw_field, raw_text)
     return normalized
 
 
@@ -649,6 +707,7 @@ def _clean_regional_conditions(rows: list[dict], municipality: str) -> list[dict
 def _clean_emissions_regional(rows: list[dict], municipality: str) -> list[dict]:
     for row in rows:
         row["지자체명"] = row.get("지자체명") or municipality
+        _apply_inventory_sector_normalization(row, "부문", "부문원문")
         row["배출유형"] = _normalize(row.get("배출유형", ""), _TYPE_MAP)
         row["연도"] = _to_int(row.get("연도"))
         row["배출량"] = _to_float(row.get("배출량"))
@@ -660,11 +719,12 @@ def _clean_emissions_regional(rows: list[dict], municipality: str) -> list[dict]
 def _clean_emissions_management(rows: list[dict], municipality: str) -> list[dict]:
     for row in rows:
         row["지자체명"] = row.get("지자체명") or municipality
+        _apply_inventory_sector_normalization(row, "관리부문", "관리부문원문")
         raw_sector = str(row.get("관리부문", "") or "").strip()
         normalized_sector = _normalise_sector_with_raw(row, "관리부문", "관리부문원문")
         if normalized_sector == "전환" and raw_sector in _MANAGEMENT_ENERGY_SOURCE_TERMS:
             row["관리부문"] = raw_sector
-            row["관리부문원문"] = raw_sector
+            row.setdefault("관리부문원문", raw_sector)
             if not _has_cell_value(row.get("직간접구분")):
                 row["직간접구분"] = "간접"
             _remember_validation_issue(
