@@ -206,3 +206,22 @@ def test_중복_값_충돌은_우선순위가_같으면_기존_first_wins를_유
     row = cleaned["emissions_regional"][0]
     assert row["배출량"] == 10.0
     assert any("채택근거: 기존 순서 유지" in issue["문제내용"] for issue in cleaned["validation_report"])
+
+
+def test_직간접구분_코드성_텍스트는_casefold로_정규화한다() -> None:
+    # Given: 직간접구분이 대문자 영문 코드로 들어오면
+    raw = {
+        "municipality_name": "경기도",
+        "emissions_management": [
+            {"관리부문": "건물", "세부부문": "공공", "직간접구분": "DIRECT", "연도": 2030, "배출량": 7},
+            {"관리부문": "건물", "세부부문": "가정", "직간접구분": "InDiReCt", "연도": 2030, "배출량": 3},
+        ],
+    }
+
+    # When: organizer가 관리권한 배출현황을 정제하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 대소문자와 무관하게 표준 직간접구분으로 매핑된다.
+    by_subsector = {row["세부부문"]: row for row in cleaned["emissions_management"]}
+    assert by_subsector["공공"]["직간접구분"] == "직접"
+    assert by_subsector["가정"]["직간접구분"] == "간접"

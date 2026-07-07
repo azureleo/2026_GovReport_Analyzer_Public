@@ -56,10 +56,8 @@ _TYPE_MAP = {
 
 _DIRECT_INDIRECT_TYPE_MAP = {
     "direct": "직접",
-    "Direct": "직접",
     "직접배출": "직접",
     "indirect": "간접",
-    "Indirect": "간접",
     "간접배출": "간접",
 }
 
@@ -137,15 +135,18 @@ def _to_int(val: Any) -> int | None:
 def _normalize(val: str, mapping: dict) -> str:
     if not isinstance(val, str):
         return str(val) if val is not None else ""
-    return mapping.get(val.strip(), val.strip())
+    text = val.strip()
+    if text in mapping:
+        return mapping[text]
+    casefold_mapping = {str(key).casefold(): value for key, value in mapping.items()}
+    return casefold_mapping.get(text.casefold(), text)
 
 
 def _normalize_direct_indirect_type(value: Any) -> str:
     """관리권한 직간접구분 표기 차이를 키 비교 전용 표준값으로 정규화한다."""
     if value is None:
         return ""
-    text = str(value).strip()
-    return _DIRECT_INDIRECT_TYPE_MAP.get(text, text)
+    return _normalize(str(value), _DIRECT_INDIRECT_TYPE_MAP)
 
 
 def _normalize_co2_unit(unit: Any) -> str:
