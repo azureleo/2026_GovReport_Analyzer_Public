@@ -263,10 +263,24 @@ def _stage_model(stage: str | None) -> str:
     return _stage_config_value("STAGE_MODELS", stage)
 
 
+def _gemini_default_model(stage: str | None) -> str:
+    """Gemini 백엔드의 스테이지별 기본 모델.
+
+    캐시 키(_model_identity)와 실제 호출 모델이 항상 같은 값을 쓰도록, gemini 기본
+    모델 결정은 이 함수만 거친다. vision 단계의 pro 기본값 근거는
+    config.GEMINI_VISION_MODEL 주석 참조.
+    """
+    if stage == "vision":
+        vision_model = str(getattr(config, "GEMINI_VISION_MODEL", "") or "").strip()
+        if vision_model:
+            return vision_model
+    return str(getattr(config, "MODEL", ""))
+
+
 def _model_identity(provider: str, stage: str | None = None) -> str:
     stage_model = _stage_model(stage)
     if provider == "gemini":
-        return stage_model or str(getattr(config, "MODEL", ""))
+        return stage_model or _gemini_default_model(stage)
     if provider == "openai":
         return stage_model or str(getattr(config, "OPENAI_MODEL", ""))
     if provider == "codex":
@@ -652,10 +666,10 @@ def call_vision(
         images_b64=(image_b64,),
     )
     if provider == "gemini":
+        gemini_vision_model = stage_model or _gemini_default_model(stage)
+
         def produce_gemini_vision() -> str:
-            if stage_model:
-                return _call_gemini_vision(image_b64, prompt, system, max_retries=max_retries, model=stage_model)
-            return _call_gemini_vision(image_b64, prompt, system, max_retries=max_retries)
+            return _call_gemini_vision(image_b64, prompt, system, max_retries=max_retries, model=gemini_vision_model)
 
         return cached_response(
             request,
@@ -716,10 +730,10 @@ def call_vision_batch(
         images_b64=tuple(images_b64),
     )
     if provider == "gemini":
+        gemini_vision_model = stage_model or _gemini_default_model(stage)
+
         def produce_gemini_vision_batch() -> str:
-            if stage_model:
-                return _call_gemini_vision_batch(images_b64, prompt, system, max_retries=max_retries, model=stage_model)
-            return _call_gemini_vision_batch(images_b64, prompt, system, max_retries=max_retries)
+            return _call_gemini_vision_batch(images_b64, prompt, system, max_retries=max_retries, model=gemini_vision_model)
 
         return cached_response(
             request,

@@ -101,6 +101,13 @@ CLAUDE_MINIMAL_SESSION = _env_bool("CLAUDE_MINIMAL_SESSION", True)
 # Gemini API 설정
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+# vision(이미지·차트 판독) 단계의 Gemini 기본 모델.
+# 서울 시각요소 벤치마크(docs/benchmark/서울시각요소_VLM벤치마크_v1.md) 실측에서
+# flash-lite 리콜 0.707 vs 2.5-pro 0.976으로 격차가 커, API 모드의 vision 기본만
+# pro로 올린다(텍스트 추출 기본은 비용 때문에 flash-lite 유지). 채택 승인 2026-07-07.
+# 우선순위: STAGE_MODEL_VISION > GEMINI_VISION_MODEL > MODEL. codex/claude 에이전트
+# 모드의 vision은 이 값과 무관하게 각 CLI 기본 모델을 쓴다(구독 quota, 비용 0).
+GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-2.5-pro").strip()
 MAX_TOKENS = 65536  # Gemini 백엔드 사용 시 최대 출력 토큰
 
 # Gemini 503/일시 과부하 대응 설정.

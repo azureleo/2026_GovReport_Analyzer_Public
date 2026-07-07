@@ -382,8 +382,8 @@ class LLMClientTests(unittest.TestCase):
         calls = []
         original = llm_client._call_gemini_vision_batch
 
-        def fake_batch(images_b64, prompt, system="", max_retries=1):
-            calls.append((images_b64, prompt, system, max_retries))
+        def fake_batch(images_b64, prompt, system="", max_retries=1, model=None):
+            calls.append((images_b64, prompt, system, max_retries, model))
             return '{"ok": true}'
 
         try:
