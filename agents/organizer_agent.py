@@ -1448,7 +1448,8 @@ class OrganizerAgent:
             observations = []
         cleaned["chart_observations"] = observations
         cleaned["visual_inventory"] = _build_visual_inventory(observations, municipality)
-        cleaned["codebook"] = build_codebook_rows() if getattr(config, "CODEBOOK_SHEET_ENABLED", True) else []
+        execution_info = raw_data.get("execution_info") if isinstance(raw_data.get("execution_info"), dict) else None
+        cleaned["codebook"] = build_codebook_rows(execution_info) if getattr(config, "CODEBOOK_SHEET_ENABLED", True) else []
         _apply_default_data_status(cleaned)
         _tag_prior_plan_rows(cleaned, municipality, prior_plan_pages or set())
 

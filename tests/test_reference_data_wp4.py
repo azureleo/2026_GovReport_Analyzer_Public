@@ -129,6 +129,45 @@ def test_codebook_sheet_is_optional_and_opt_out_removes_sheet() -> None:
         config.CODEBOOK_SHEET_ENABLED = previous
 
 
+def test_codebook_sheet_includes_execution_info_stamp() -> None:
+    # Given: 실행 메타데이터가 포함된 organizer 입력
+    previous = getattr(config, "CODEBOOK_SHEET_ENABLED", True)
+    config.CODEBOOK_SHEET_ENABLED = True
+    try:
+        cleaned = OrganizerAgent().organize({
+            "municipality_name": "서울특별시",
+            "execution_info": {
+                "git_commit": "abc1234",
+                "text_backend": "gemini",
+                "text_model": "gemini-2.5-flash-lite",
+                "vision_backend": "gemini",
+                "vision_model": "gemini-2.5-pro",
+                "run_started_at": "2026-07-08T00:00:00+09:00",
+                "input_file": "서울특별시_탄소중립계획.pdf",
+                "pipeline_version": "v5.3",
+            },
+        })
+
+        # When: 엑셀로 저장한 뒤 코드북 시트를 다시 읽으면
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "with_execution_info.xlsx"
+            excel_writer.write_excel(cleaned, path)
+            wb = load_workbook(path, data_only=True)
+            ws = wb["90_코드북"]
+            headers = [cell.value for cell in ws[1]]
+            rows = [dict(zip(headers, values)) for values in ws.iter_rows(min_row=2, values_only=True)]
+
+        # Then: 실행정보 행이 기존 코드북 계약 컬럼 안에 행 추가로 기록된다.
+        execution_rows = {row["코드"]: row for row in rows if row["코드유형"] == "실행정보"}
+        assert execution_rows["git_commit"]["정의"] == "abc1234"
+        assert execution_rows["text_model"]["정의"] == "gemini-2.5-flash-lite"
+        assert execution_rows["vision_model"]["정의"] == "gemini-2.5-pro"
+        assert execution_rows["input_file"]["정의"] == "서울특별시_탄소중립계획.pdf"
+        assert execution_rows["pipeline_version"]["정의"] == "v5.3"
+    finally:
+        config.CODEBOOK_SHEET_ENABLED = previous
+
+
 def test_appendix4_parser_reports_skipped_rows(capsys) -> None:
     # Given: 부록4 표 안에 연번이 깨진 행이 있으면
     text = "\n".join([

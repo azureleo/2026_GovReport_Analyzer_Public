@@ -8,7 +8,9 @@ carbon_guideline.md 기반 16개 시트 구조에 맞춰 동작합니다.
 
 import json
 import logging
+import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import config
@@ -52,6 +54,51 @@ def _fmt_seconds(seconds: float) -> str:
         return f"{int(minutes)}분 {sec:.1f}초"
     hours, minutes = divmod(int(minutes), 60)
     return f"{hours}시간 {minutes}분 {sec:.1f}초"
+
+
+def _safe_stage_provider(stage: str) -> str:
+    try:
+        return llm_client._resolve_provider(stage)
+    except RuntimeError:
+        configured = getattr(config, "STAGE_PROVIDERS", {}).get(stage, "") or getattr(config, "LLM_PROVIDER", "")
+        return str(configured or "미상")
+
+
+def _safe_stage_model(provider: str, stage: str) -> str:
+    try:
+        return llm_client._model_identity(provider, stage) or "기본값"
+    except RuntimeError:
+        configured = getattr(config, "STAGE_MODELS", {}).get(stage, "") or getattr(config, "LOCAL_AGENT_MODEL", "")
+        return str(configured or "기본값")
+
+
+def _git_commit_hash() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "미상"
+    return result.stdout.strip() or "미상"
+
+
+def _execution_info(input_path: Path, started_at: datetime) -> dict[str, str]:
+    text_provider = _safe_stage_provider("extraction")
+    vision_provider = _safe_stage_provider("vision")
+    return {
+        "git_commit": _git_commit_hash(),
+        "text_backend": text_provider,
+        "text_model": _safe_stage_model(text_provider, "extraction"),
+        "vision_backend": vision_provider,
+        "vision_model": _safe_stage_model(vision_provider, "vision"),
+        "run_started_at": started_at.isoformat(timespec="seconds"),
+        "input_file": input_path.name,
+        "pipeline_version": str(getattr(config, "PIPELINE_VERSION", "v5.3")),
+    }
 
 
 def _quality_score(final_data: dict) -> tuple[float, list[str]]:
@@ -318,6 +365,8 @@ class Supervisor:
 
         file_type = "HWP" if is_hwp_file(input_path) else "PDF"
         pipeline_start = time.time()
+        run_started_at = datetime.now(timezone.utc).astimezone()
+        execution_info = _execution_info(input_path, run_started_at)
         self._timings = {}
         llm_cache.reset_cache_stats()
         llm_client.reset_llm_stats()
@@ -396,6 +445,7 @@ class Supervisor:
 
             ledger_records = list(extractor.ledger)
             municipality = raw_data.get("municipality_name", "알 수 없음")
+            raw_data["execution_info"] = execution_info
 
             if include_images:
                 image_agent = ImageAgent()
@@ -415,6 +465,7 @@ class Supervisor:
             else:
                 self._log("[에이전트2b 이미지분석] 비활성화 (--no-images)")
 
+            raw_data["execution_info"] = execution_info
             organizer = OrganizerAgent()
             t0 = time.time()
             final_data = organizer.organize(
@@ -453,6 +504,7 @@ class Supervisor:
                 # 보완 후보가 추가됐거나 보완 실패 원장이 생기면 같은 organizer로 재정제해 검증리포트를 갱신한다.
                 if enhanced_raw is not raw_data or getattr(gap_agent, "ledger", []):
                     raw_data = enhanced_raw
+                    raw_data["execution_info"] = execution_info
                     t0 = time.time()
                     final_data = organizer.organize(
                         raw_data,

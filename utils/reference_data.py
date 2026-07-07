@@ -7,7 +7,7 @@ import re
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import config
 
@@ -57,6 +57,17 @@ _CODEBOOK_DEFINITIONS = {
         ("conflicting", "중복·상충 검수 대상 값"),
     ],
 }
+
+_EXECUTION_INFO_LABELS = (
+    ("git_commit", "git 커밋 해시"),
+    ("text_backend", "텍스트 백엔드"),
+    ("text_model", "텍스트 모델"),
+    ("vision_backend", "비전 백엔드"),
+    ("vision_model", "비전 모델"),
+    ("run_started_at", "실행 시각"),
+    ("input_file", "입력 파일명"),
+    ("pipeline_version", "파이프라인 버전"),
+)
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -208,7 +219,7 @@ def find_appendix3_unit_by_id(unit_id: Any, monitoring_factor: Any = "") -> dict
     return None
 
 
-def build_codebook_rows() -> list[dict[str, str]]:
+def build_codebook_rows(execution_info: Mapping[str, str] | None = None) -> list[dict[str, str]]:
     """90_코드북 시트에 쓸 정적 코드북 행을 만든다."""
     rows: list[dict[str, str]] = []
     for code_type, entries in _CODEBOOK_DEFINITIONS.items():
@@ -220,4 +231,22 @@ def build_codebook_rows() -> list[dict[str, str]]:
                 "정의": definition,
                 "비고": "가이드라인·파이프라인 표준 코드",
             })
+    rows.extend(_execution_info_rows(execution_info))
     return rows
+
+
+def _execution_info_rows(execution_info: Mapping[str, str] | None) -> list[dict[str, str]]:
+    info = {code: "미상" for code, _label in _EXECUTION_INFO_LABELS}
+    if execution_info is not None:
+        info.update({code: str(value or "미상") for code, value in execution_info.items()})
+    info["pipeline_version"] = info.get("pipeline_version") or str(getattr(config, "PIPELINE_VERSION", "v5.3"))
+    return [
+        {
+            "코드유형": "실행정보",
+            "코드": code,
+            "라벨": label,
+            "정의": info.get(code, "미상"),
+            "비고": "출력 생성 실행 메타데이터",
+        }
+        for code, label in _EXECUTION_INFO_LABELS
+    ]

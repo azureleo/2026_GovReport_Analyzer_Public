@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+PIPELINE_VERSION = "v5.3"
+
 
 def _env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
