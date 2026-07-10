@@ -277,6 +277,20 @@ def _gemini_default_model(stage: str | None) -> str:
     return str(getattr(config, "MODEL", ""))
 
 
+def _codex_default_model(stage: str | None) -> str:
+    """codex 백엔드의 스테이지별 기본 모델.
+
+    캐시 키(_model_identity)와 실제 --model 인자가 항상 같은 값을 쓰도록, codex 기본
+    모델 결정은 이 함수만 거친다. vision 단계의 gpt-5.6-luna 기본값 근거는
+    config.CODEX_VISION_MODEL 주석 참조.
+    """
+    if stage == "vision":
+        vision_model = str(getattr(config, "CODEX_VISION_MODEL", "") or "").strip()
+        if vision_model:
+            return vision_model
+    return str(getattr(config, "LOCAL_AGENT_MODEL", "") or "")
+
+
 def _model_identity(provider: str, stage: str | None = None) -> str:
     stage_model = _stage_model(stage)
     if provider == "gemini":
@@ -286,7 +300,7 @@ def _model_identity(provider: str, stage: str | None = None) -> str:
     if provider == "codex":
         return ":".join([
             str(getattr(config, "CODEX_COMMAND", "codex")),
-            stage_model or str(getattr(config, "LOCAL_AGENT_MODEL", "")),
+            stage_model or _codex_default_model(stage),
         ])
     if provider == "claude":
         return ":".join([
@@ -698,7 +712,13 @@ def call_vision(
             "vision",
             provider,
             lambda: _retry_local_call(
-                lambda: _call_local_agent(prompt, system, image_b64=image_b64, provider=provider, model=stage_model or None),
+                lambda: _call_local_agent(
+                    prompt,
+                    system,
+                    image_b64=image_b64,
+                    provider=provider,
+                    model=(stage_model or (_codex_default_model(stage) if provider == "codex" else "")) or None,
+                ),
                 max_retries=max_retries,
                 label=f"{provider} vision",
             ),
@@ -762,7 +782,13 @@ def call_vision_batch(
             "vision_batch",
             provider,
             lambda: _retry_local_call(
-                lambda: _call_local_agent(prompt, system, images_b64=images_b64, provider=provider, model=stage_model or None),
+                lambda: _call_local_agent(
+                    prompt,
+                    system,
+                    images_b64=images_b64,
+                    provider=provider,
+                    model=(stage_model or (_codex_default_model(stage) if provider == "codex" else "")) or None,
+                ),
                 max_retries=max_retries,
                 label=f"{provider} vision batch",
             ),

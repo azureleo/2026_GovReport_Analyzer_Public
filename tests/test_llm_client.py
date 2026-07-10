@@ -17,6 +17,7 @@ class LLMClientTests(unittest.TestCase):
                 "CODEX_COMMAND",
                 "CLAUDE_COMMAND",
                 "LOCAL_AGENT_MODEL",
+                "CODEX_VISION_MODEL",
                 "LOCAL_AGENT_TIMEOUT",
                 "GEMINI_API_KEY",
                 "OPENAI_API_KEY",
@@ -246,6 +247,46 @@ class LLMClientTests(unittest.TestCase):
 
         self.assertTrue(parsed["has_image"])
         self.assertEqual(parsed["image_count"], 2)
+
+    def test_codex_vision은_기본으로_CODEX_VISION_MODEL을_지정한다(self):
+        # 벤치마크 채택(2026-07-10): 에이전트 모드 vision 기본 = gpt-5.6-luna
+        with tempfile.TemporaryDirectory() as tmp:
+            llm_client.config.LLM_PROVIDER = "codex"
+            llm_client.config.CODEX_COMMAND = self._fake_codex_command(Path(tmp))
+            llm_client.config.LOCAL_AGENT_TIMEOUT = 5
+            llm_client.config.LOCAL_AGENT_MODEL = ""
+
+            image_b64 = base64.b64encode(b"not really a png").decode("ascii")
+            raw = llm_client.call_vision(image_b64, '{"image": true}', max_retries=1, stage="vision")
+            parsed = llm_client.parse_json(raw)
+
+        self.assertEqual(parsed["model"], "gpt-5.6-luna")
+
+    def test_codex_vision은_STAGE_MODEL_VISION_오버라이드가_기본값을_이긴다(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            llm_client.config.LLM_PROVIDER = "codex"
+            llm_client.config.CODEX_COMMAND = self._fake_codex_command(Path(tmp))
+            llm_client.config.LOCAL_AGENT_TIMEOUT = 5
+            llm_client.config.LOCAL_AGENT_MODEL = ""
+            llm_client.config.STAGE_MODELS = {**llm_client.config.STAGE_MODELS, "vision": "gpt-테스트모델"}
+
+            image_b64 = base64.b64encode(b"not really a png").decode("ascii")
+            raw = llm_client.call_vision(image_b64, '{"image": true}', max_retries=1, stage="vision")
+            parsed = llm_client.parse_json(raw)
+
+        self.assertEqual(parsed["model"], "gpt-테스트모델")
+
+    def test_codex_텍스트호출은_vision_기본모델의_영향을_받지_않는다(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            llm_client.config.LLM_PROVIDER = "codex"
+            llm_client.config.CODEX_COMMAND = self._fake_codex_command(Path(tmp))
+            llm_client.config.LOCAL_AGENT_TIMEOUT = 5
+            llm_client.config.LOCAL_AGENT_MODEL = ""
+
+            raw = llm_client.call_text('{"answer": true}', system="system", max_retries=1, stage="extraction")
+            parsed = llm_client.parse_json(raw)
+
+        self.assertEqual(parsed["model"], "")
 
 
     def test_call_text_reuses_identical_successful_response_from_cache(self):
