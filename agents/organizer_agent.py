@@ -1026,6 +1026,10 @@ def _visual_bool(value: Any) -> bool | None:
         return False
     if text in {"true", "1", "yes", "y", "on", "추정", "estimated"}:
         return True
+    if "비추정" in text:
+        return False
+    if "추정" in text:
+        return True
     return None
 
 
@@ -1063,12 +1067,21 @@ def _visual_observation_value(observation: dict, fields: dict, value_field: str)
     return observation.get("값")
 
 
+def _visual_explicit_value(observation: dict, fields: dict, *keys: str) -> Any:
+    for source in (fields, observation):
+        for key in keys:
+            value = source.get(key)
+            if _has_cell_value(value):
+                return value
+    return None
+
+
 def _visual_candidate_row(sheet_key: str, observation: dict, fields: dict, municipality: str) -> dict | None:
     page = observation.get("페이지")
     title = str(observation.get("제목", "") or "").strip()
-    item = str(fields.get("항목") or observation.get("항목") or title).strip()
-    unit = fields.get("단위") or observation.get("단위") or ""
-    year = fields.get("연도") or observation.get("연도")
+    item = str(_visual_explicit_value(observation, fields, "항목") or title).strip()
+    unit = _visual_explicit_value(observation, fields, "단위") or ""
+    year = _visual_explicit_value(observation, fields, "연도")
     value_field = _VISUAL_MERGE_VALUE_FIELDS.get(sheet_key)
     if value_field is None:
         return None
@@ -1080,69 +1093,72 @@ def _visual_candidate_row(sheet_key: str, observation: dict, fields: dict, munic
     }
     if sheet_key == "regional_conditions":
         return base | {
-            "지표범주": fields.get("지표범주") or "시각자료",
-            "지표세부범주": fields.get("지표세부범주") or "",
-            "지표명": fields.get("지표명") or item,
+            "지표범주": _visual_explicit_value(observation, fields, "지표범주"),
+            "지표세부범주": _visual_explicit_value(observation, fields, "지표세부범주") or "",
+            "지표명": _visual_explicit_value(observation, fields, "지표명") or item,
             "연도": year,
             "값": value,
             "단위": unit,
             "출처": f"이미지 p.{page}" if page else "이미지",
         }
     if sheet_key == "emissions_regional":
-        emission_type = fields.get("배출유형") or fields.get("배출범위") or "직접배출"
+        emission_type = _visual_explicit_value(observation, fields, "배출유형", "배출범위")
         return base | {
             "인벤토리출처": "이미지",
-            "배출범위": fields.get("배출범위") or emission_type,
+            "배출범위": _visual_explicit_value(observation, fields, "배출범위") or emission_type,
             "배출유형": emission_type,
-            "부문": fields.get("부문") or item,
-            "세부부문": fields.get("세부부문") or "",
+            "부문": _visual_explicit_value(observation, fields, "부문") or item,
+            "세부부문": _visual_explicit_value(observation, fields, "세부부문") or "",
             "연도": year,
             "배출량": value,
             "단위": unit,
-            "흡수원여부": fields.get("흡수원여부") or emission_type == "흡수원",
+            "흡수원여부": _visual_explicit_value(observation, fields, "흡수원여부") or emission_type == "흡수원",
         }
     if sheet_key == "emissions_management":
         return base | {
             "인벤토리출처": "이미지",
-            "관리부문": fields.get("관리부문") or fields.get("부문") or item,
-            "세부부문": fields.get("세부부문") or "",
-            "직간접구분": fields.get("직간접구분") or "",
+            "관리부문": _visual_explicit_value(observation, fields, "관리부문", "부문") or item,
+            "세부부문": _visual_explicit_value(observation, fields, "세부부문") or "",
+            "직간접구분": _visual_explicit_value(observation, fields, "직간접구분") or "",
             "연도": year,
             "배출량": value,
             "단위": unit,
-            "합계포함여부": fields.get("합계포함여부") or "",
+            "합계포함여부": _visual_explicit_value(observation, fields, "합계포함여부") or "",
         }
     if sheet_key == "emissions_forecast":
         return base | {
-            "시나리오": fields.get("시나리오") or "BAU",
-            "전망방법코드": fields.get("전망방법코드") or "",
-            "전망방법원문": fields.get("전망방법원문") or "",
-            "부문": fields.get("부문") or item,
-            "세부부문": fields.get("세부부문") or "",
+            "시나리오": _visual_explicit_value(observation, fields, "시나리오"),
+            "전망방법코드": _visual_explicit_value(observation, fields, "전망방법코드") or "",
+            "전망방법원문": _visual_explicit_value(observation, fields, "전망방법원문") or "",
+            "부문": _visual_explicit_value(observation, fields, "부문") or item,
+            "세부부문": _visual_explicit_value(observation, fields, "세부부문") or "",
             "연도": year,
             "전망값": value,
             "단위": unit,
             "주요가정": f"이미지 p.{page}" if page else "이미지",
         }
     if sheet_key == "reduction_targets":
+        target_level = _visual_explicit_value(observation, fields, "목표수준")
+        if not _has_cell_value(target_level) and item:
+            target_level = "총괄" if item in {"합계", "총괄", "전체"} else "부문"
         return base | {
-            "목표수준": fields.get("목표수준") or ("총괄" if item in {"합계", "총괄", "전체"} else "부문"),
-            "목표범위": fields.get("목표범위") or "지역전체",
-            "부문": fields.get("부문") or item,
-            "기준연도": fields.get("기준연도"),
-            "기준배출량": fields.get("기준배출량"),
-            "목표연도": fields.get("목표연도") or year,
-            "배출전망": fields.get("배출전망"),
-            "목표감축량": fields.get("목표감축량"),
+            "목표수준": target_level,
+            "목표범위": _visual_explicit_value(observation, fields, "목표범위"),
+            "부문": _visual_explicit_value(observation, fields, "부문") or item,
+            "기준연도": _visual_explicit_value(observation, fields, "기준연도"),
+            "기준배출량": _visual_explicit_value(observation, fields, "기준배출량"),
+            "목표연도": _visual_explicit_value(observation, fields, "목표연도") or year,
+            "배출전망": _visual_explicit_value(observation, fields, "배출전망"),
+            "목표감축량": _visual_explicit_value(observation, fields, "목표감축량"),
             "목표배출량": value,
-            "감축률": fields.get("감축률"),
+            "감축률": _visual_explicit_value(observation, fields, "감축률"),
         }
     if sheet_key == "financial_plan":
         return base | {
-            "계획구분": fields.get("계획구분") or "온실가스감축대책",
-            "부문": fields.get("부문") or item,
-            "사업명": fields.get("사업명") or title,
-            "재원구분": fields.get("재원구분") or "합계",
+            "계획구분": _visual_explicit_value(observation, fields, "계획구분"),
+            "부문": _visual_explicit_value(observation, fields, "부문") or item,
+            "사업명": _visual_explicit_value(observation, fields, "사업명") or title,
+            "재원구분": _visual_explicit_value(observation, fields, "재원구분"),
             "연도": year,
             "예산액": value,
             "예산단위": unit,
@@ -1219,8 +1235,10 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
         sheet_key = str(observation.get("대상시트", "") or "").strip()
         fields = _visual_fields(observation)
         blockers: list[str] = []
-        if _visual_estimated_state(observation, fields) is not False:
-            blockers.append("G1 라벨 기반 비추정 메타데이터 없음")
+        if not fields:
+            blockers.append("G1 판독필드 없음")
+        elif _visual_estimated_state(observation, fields) is True:
+            blockers.append("G1 축 기반 추정값")
         if not _confidence_at_least(observation.get("신뢰도"), min_confidence):
             blockers.append(f"G2 신뢰도 기준 미달({observation.get('신뢰도') or ''} < {min_confidence})")
         if _is_reference_visual_observation(observation):
@@ -1233,15 +1251,21 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
         if raw_candidate is None or key_fields is None or value_field is None:
             blockers.append(f"G3 대상 시트 미지원 또는 키 정의 없음({sheet_key or '미지정'})")
         else:
-            candidate = _clean_visual_candidate(sheet_key, raw_candidate, municipality)
-            if candidate is None:
-                blockers.append("G3 정제 후 유효 행 없음")
-            else:
+            raw_missing = [field for field in key_fields if not _has_cell_value(raw_candidate.get(field))]
+            if raw_missing:
+                blockers.append(f"G3 1차 키 누락({', '.join(raw_missing)})")
+            if not _has_cell_value(raw_candidate.get(value_field)):
+                blockers.append(f"G3 비교값 누락({value_field})")
+            if not raw_missing and _has_cell_value(raw_candidate.get(value_field)):
+                candidate = _clean_visual_candidate(sheet_key, raw_candidate, municipality)
+            if candidate is not None:
                 missing = [field for field in key_fields if not _has_cell_value(candidate.get(field))]
                 if missing:
                     blockers.append(f"G3 1차 키 누락({', '.join(missing)})")
                 if not _has_cell_value(candidate.get(value_field)):
                     blockers.append(f"G3 비교값 누락({value_field})")
+            elif not raw_missing and _has_cell_value(raw_candidate.get(value_field)):
+                blockers.append("G3 정제 후 유효 행 없음")
 
         if blockers:
             _remember_visual_merge_issue(

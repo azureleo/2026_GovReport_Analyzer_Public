@@ -16,7 +16,6 @@ def _관리권한_관찰값(
     title: str = "관리권한 배출량",
 ):
     판독필드 = {
-        "estimated": False,
         "관리부문": "건물",
         "세부부문": "공공",
         "직간접구분": "직접",
@@ -53,7 +52,6 @@ def _텍스트_관리권한행(value: float):
 
 
 def _시각_관찰값(target_sheet: str, fields: dict, *, value: float = 100.0):
-    판독필드 = {"estimated": False} | fields
     return {
         "지자체명": "서울특별시",
         "페이지": 188,
@@ -66,7 +64,7 @@ def _시각_관찰값(target_sheet: str, fields: dict, *, value: float = 100.0):
         "값": value,
         "신뢰도": "high",
         "반영여부": "검토",
-        "근거": json.dumps(판독필드, ensure_ascii=False),
+        "근거": json.dumps(fields, ensure_ascii=False),
     }
 
 
@@ -111,6 +109,35 @@ def test_시각_라벨병합은_게이트_미충족_사유를_행단위로_기�
     assert all(row["항목"] == "차단" for row in visual_issues)
 
 
+def test_시각_라벨병합은_실스키마의_estimated_부재만으로_G1을_차단하지_않는다(monkeypatch) -> None:
+    # Given: 실제 라벨 판독처럼 estimated가 없거나, 추정값이거나, 판독필드 자체가 없는 관찰값이면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    라벨_판독 = _관리권한_관찰값(value=100.0)
+    축_추정 = _관리권한_관찰값(
+        value=200.0,
+        fields={"estimated": True, "관리부문": "건물", "세부부문": "공공", "직간접구분": "직접"},
+    )
+    판독필드_없음 = _관리권한_관찰값(value=300.0)
+    판독필드_없음["근거"] = "표 요약만 존재"
+    raw = {
+        "municipality_name": "서울특별시",
+        "chart_observations": [라벨_판독, 축_추정, 판독필드_없음],
+    }
+
+    # When: organizer가 G1을 판정하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: estimated 부재 관찰값만 병합되고 두 결함 관찰값은 각 사유로 차단된다.
+    assert [row["배출량"] for row in cleaned["emissions_management"]] == [100.0]
+    details = "\n".join(
+        row["문제내용"]
+        for row in cleaned["validation_report"]
+        if row.get("영역") == "시각병합" and row.get("항목") == "차단"
+    )
+    assert "G1 축 기반 추정값" in details
+    assert "G1 판독필드 없음" in details
+
+
 def test_시각_라벨병합은_텍스트가_없을_때_visual_only로_본시트에_반영한다(monkeypatch) -> None:
     # Given: G1~G4를 통과하고 같은 키의 텍스트 행이 없는 시각 판독값이면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
@@ -131,6 +158,70 @@ def test_시각_라벨병합은_텍스트가_없을_때_visual_only로_본시트
     allowed = set(config.EXCEL_HEADERS["04_배출현황_관리권한"])
     assert set(row) <= allowed
     assert any(issue.get("영역") == "시각병합" and issue.get("항목") == "병합" for issue in cleaned["validation_report"])
+
+
+def test_시각_라벨병합은_02_지표범주를_기본값으로_만들지_않는다(monkeypatch) -> None:
+    # Given: 지표명과 연도는 있지만 1차 키인 지표범주를 판독하지 못한 02 관찰값이면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _시각_관찰값("regional_conditions", {"지표명": "통행량", "연도": 2030})
+
+    # When: organizer가 후보 키를 검사하면
+    cleaned = OrganizerAgent().organize({"municipality_name": "서울특별시", "chart_observations": [observation]})
+
+    # Then: 시각자료 기본 범주를 합성하지 않고 지표범주 누락으로 G3 차단한다.
+    assert cleaned["regional_conditions"] == []
+    assert any(
+        issue.get("영역") == "시각병합"
+        and issue.get("항목") == "차단"
+        and "G3 1차 키 누락(지표범주)" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("text_value", "expected_item", "expected_text"),
+    [
+        (100.3, "생략", "교차일치"),
+        (120.0, "차단", "텍스트-시각 값 불일치"),
+    ],
+)
+def test_시각_라벨병합은_판독한_02_지표범주로_G5를_복구한다(
+    monkeypatch,
+    text_value: float,
+    expected_item: str,
+    expected_text: str,
+) -> None:
+    # Given: 판독필드에서 얻은 지표범주와 동일한 키의 텍스트 행이 있으면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _시각_관찰값(
+        "regional_conditions",
+        {"지표범주": "교통", "지표명": "통행량", "연도": 2030},
+        value=100.0,
+    )
+    raw = {
+        "municipality_name": "서울특별시",
+        "regional_conditions": [{
+            "지자체명": "서울특별시",
+            "지표범주": "교통",
+            "지표명": "통행량",
+            "연도": 2030,
+            "값": text_value,
+        }],
+        "chart_observations": [observation],
+    }
+
+    # When: organizer가 같은 실측 키로 교차검증하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 새 행을 병합하지 않고 값 차이에 따라 생략 또는 경고 차단을 기록한다.
+    assert len(cleaned["regional_conditions"]) == 1
+    assert cleaned["regional_conditions"][0]["값"] == text_value
+    assert any(
+        issue.get("영역") == "시각병합"
+        and issue.get("항목") == expected_item
+        and expected_text in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
 
 
 @pytest.mark.parametrize(
