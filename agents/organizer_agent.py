@@ -1200,6 +1200,15 @@ def _visual_text_rows(rows: list[dict], candidate: dict, key_fields: list[str]) 
     ]
 
 
+def _visual_only_rows(rows: list[dict], candidate: dict, key_fields: list[str]) -> list[dict]:
+    candidate_key = _visual_key(candidate, key_fields)
+    return [
+        row for row in rows
+        if _visual_key(row, key_fields) == candidate_key
+        and str(row.get("데이터상태", "") or "").strip() == "visual_only"
+    ]
+
+
 def _remember_visual_merge_issue(
     municipality: str,
     severity: str,
@@ -1283,8 +1292,33 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
         rows = cleaned.setdefault(sheet_key, [])
         if not isinstance(rows, list):
             continue
-        text_rows = _visual_text_rows(rows, candidate, key_fields)
         key_summary = _visual_key_summary(candidate, key_fields)
+        visual_rows = _visual_only_rows(rows, candidate, key_fields)
+        if visual_rows:
+            visual_row = visual_rows[0]
+            if _values_conflict(visual_row.get(value_field), candidate.get(value_field)):
+                _remember_visual_merge_issue(
+                    municipality,
+                    "경고",
+                    "경고",
+                    f"{sheet_key} {key_summary}: 동일 키 시각 행 존재, "
+                    f"기존 시각 {visual_row.get(value_field)} vs 신규 시각 {candidate.get(value_field)}",
+                    "기존 시각 행 유지 후 원문 차트 수동 확인",
+                    sheet_key,
+                )
+            else:
+                _remember_visual_merge_issue(
+                    municipality,
+                    "정보",
+                    "생략",
+                    f"{sheet_key} {key_summary}: 동일 키 시각 행 존재, "
+                    f"기존 시각 {visual_row.get(value_field)} vs 신규 시각 {candidate.get(value_field)}",
+                    "기존 시각 행 유지",
+                    sheet_key,
+                )
+            continue
+
+        text_rows = _visual_text_rows(rows, candidate, key_fields)
         if text_rows:
             matching_rows = [
                 row for row in text_rows

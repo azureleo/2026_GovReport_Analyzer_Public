@@ -306,3 +306,47 @@ def test_시각_라벨병합은_텍스트_불일치시_경고하고_병합하지
         and "시각 100.0" in issue.get("문제내용", "")
         for issue in cleaned["validation_report"]
     )
+
+
+def test_시각_라벨병합은_같은_키의_시각_관찰값을_한_번만_병합한다(monkeypatch) -> None:
+    # Given: 같은 키와 값을 가진 시각 관찰값이 두 번 들어오면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    raw = {
+        "municipality_name": "서울특별시",
+        "chart_observations": [_관리권한_관찰값(), _관리권한_관찰값()],
+    }
+
+    # When: organizer가 시각 전용 행을 순서대로 병합하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 첫 행만 유지하고 두 번째 관찰값은 동일 키 시각 행 존재 사유로 생략한다.
+    assert len(cleaned["emissions_management"]) == 1
+    visual_issues = [row for row in cleaned["validation_report"] if row.get("영역") == "시각병합"]
+    assert sum(row.get("항목") == "병합" for row in visual_issues) == 1
+    assert sum(row.get("항목") == "생략" for row in visual_issues) == 1
+    assert any("동일 키 시각 행 존재" in row.get("문제내용", "") for row in visual_issues)
+
+
+def test_시각_라벨병합은_같은_키의_시각값이_다르면_첫_행을_유지하고_경고한다(monkeypatch) -> None:
+    # Given: 같은 키의 두 시각 관찰값이 0.5% 넘게 다르면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    raw = {
+        "municipality_name": "서울특별시",
+        "chart_observations": [_관리권한_관찰값(value=100.0), _관리권한_관찰값(value=120.0)],
+    }
+
+    # When: organizer가 두 번째 관찰값을 비교하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 첫 시각 행을 유지하고 양쪽 값을 포함한 경고만 남긴다.
+    assert len(cleaned["emissions_management"]) == 1
+    assert cleaned["emissions_management"][0]["배출량"] == 100.0
+    assert any(
+        issue.get("영역") == "시각병합"
+        and issue.get("항목") == "경고"
+        and issue.get("심각도") == "경고"
+        and "동일 키 시각 행 존재" in issue.get("문제내용", "")
+        and "기존 시각 100.0" in issue.get("문제내용", "")
+        and "신규 시각 120.0" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
