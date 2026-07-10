@@ -321,6 +321,7 @@ _BLANK_ABSORB_FIELDS_BY_KEY = {
     tuple(_REGIONAL_EMISSIONS_KEY_FIELDS): ("세부부문", "배출유형"),
     tuple(_MANAGEMENT_EMISSIONS_KEY_FIELDS): ("세부부문", "직간접구분"),
 }
+_VISUAL_OPTIONAL_KEY_FIELDS = {"세부부문"}
 
 
 def _normalize_provenance_pages(value: Any) -> str:
@@ -1187,24 +1188,29 @@ def _clean_visual_candidate(sheet_key: str, row: dict, municipality: str) -> dic
     return {key: value for key, value in cleaned.items() if key in allowed}
 
 
-def _visual_key(row: dict, key_fields: list[str]) -> tuple[str, ...]:
-    return tuple(_dedup_key_text(row.get(field)) for field in key_fields)
+def _visual_keys_match(left: dict, right: dict, key_fields: list[str]) -> bool:
+    for field in key_fields:
+        left_value = _dedup_key_text(left.get(field))
+        right_value = _dedup_key_text(right.get(field))
+        if field in _VISUAL_OPTIONAL_KEY_FIELDS and (not left_value or not right_value):
+            continue
+        if left_value != right_value:
+            return False
+    return True
 
 
 def _visual_text_rows(rows: list[dict], candidate: dict, key_fields: list[str]) -> list[dict]:
-    candidate_key = _visual_key(candidate, key_fields)
     return [
         row for row in rows
-        if _visual_key(row, key_fields) == candidate_key
+        if _visual_keys_match(row, candidate, key_fields)
         and str(row.get("데이터상태", "") or "").strip() != "visual_only"
     ]
 
 
 def _visual_only_rows(rows: list[dict], candidate: dict, key_fields: list[str]) -> list[dict]:
-    candidate_key = _visual_key(candidate, key_fields)
     return [
         row for row in rows
-        if _visual_key(row, key_fields) == candidate_key
+        if _visual_keys_match(row, candidate, key_fields)
         and str(row.get("데이터상태", "") or "").strip() == "visual_only"
     ]
 
@@ -1260,7 +1266,8 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
         if raw_candidate is None or key_fields is None or value_field is None:
             blockers.append(f"G3 대상 시트 미지원 또는 키 정의 없음({sheet_key or '미지정'})")
         else:
-            raw_missing = [field for field in key_fields if not _has_cell_value(raw_candidate.get(field))]
+            required_key_fields = [field for field in key_fields if field not in _VISUAL_OPTIONAL_KEY_FIELDS]
+            raw_missing = [field for field in required_key_fields if not _has_cell_value(raw_candidate.get(field))]
             if raw_missing:
                 blockers.append(f"G3 1차 키 누락({', '.join(raw_missing)})")
             if not _has_cell_value(raw_candidate.get(value_field)):
@@ -1268,7 +1275,7 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
             if not raw_missing and _has_cell_value(raw_candidate.get(value_field)):
                 candidate = _clean_visual_candidate(sheet_key, raw_candidate, municipality)
             if candidate is not None:
-                missing = [field for field in key_fields if not _has_cell_value(candidate.get(field))]
+                missing = [field for field in required_key_fields if not _has_cell_value(candidate.get(field))]
                 if missing:
                     blockers.append(f"G3 1차 키 누락({', '.join(missing)})")
                 if not _has_cell_value(candidate.get(value_field)):

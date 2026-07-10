@@ -224,6 +224,41 @@ def test_시각_라벨병합은_판독한_02_지표범주로_G5를_복구한다(
     )
 
 
+def test_시각_라벨병합은_빈_세부부문을_기본값으로_채우지_않고_상세행과_교차검증한다(monkeypatch) -> None:
+    # Given: 필수 키는 판독했지만 absorb 대상 세부부문은 비어 있는 지역배출 관찰값이면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _시각_관찰값(
+        "emissions_regional",
+        {"배출유형": "직접배출", "부문": "건물", "연도": 2030},
+        value=100.0,
+    )
+    raw = {
+        "municipality_name": "서울특별시",
+        "emissions_regional": [{
+            "지자체명": "서울특별시",
+            "배출유형": "직접배출",
+            "부문": "건물",
+            "세부부문": "공공",
+            "연도": 2030,
+            "배출량": 100.3,
+        }],
+        "chart_observations": [observation],
+    }
+
+    # When: organizer가 빈 세부부문을 흡수 가능한 키로 비교하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 세부부문 기본값을 합성하지 않고 기존 상세 텍스트 행과 교차일치해 생략한다.
+    assert len(cleaned["emissions_regional"]) == 1
+    assert cleaned["emissions_regional"][0]["세부부문"] == "공공"
+    assert any(
+        issue.get("영역") == "시각병합"
+        and issue.get("항목") == "생략"
+        and "교차일치" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
+
+
 @pytest.mark.parametrize(
     ("target_sheet", "fields", "value_field", "excel_sheet"),
     [
