@@ -14,6 +14,14 @@ def test_summary_지역여건은_재추론하고_명시적_비전전략은_유�
         "target_sheet": "vision_strategy",
         "title": "장래인구추계",
     }) == "vision_strategy"
+    assert agent._infer_target_sheet({
+        "target_sheet": "summary",
+        "title": "공원 감축사업",
+    }) == "mitigation_projects"
+    assert agent._infer_target_sheet({
+        "target_sheet": "summary",
+        "title": "인구 통계 투자계획",
+    }) == "financial_plan"
 
 
 def test_summary_재추론은_관찰값_근거_끝에_판정근거를_남긴다() -> None:

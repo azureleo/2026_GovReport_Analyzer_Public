@@ -646,15 +646,15 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
             return "regional_conditions"
         if any(k in text for k in ["에너지", "전력", "도시가스", "석유", "신재생", "TJ", "toe"]):
             return "regional_conditions"
+        if any(k in text for k in ["감축사업", "성과지표", "이행", "계획(감축량)"]):
+            return "mitigation_projects"
+        if any(k in text for k in ["예산", "재정", "투자"]):
+            return "financial_plan"
         if any(k in text for k in [
             "인구", "기온", "강수", "기후", "폭염", "한파", "공원", "녹지", "건축물",
             "사업체", "산업구조", "가구",
         ]):
             return "regional_conditions"
-        if any(k in text for k in ["감축사업", "성과지표", "이행", "계획(감축량)"]):
-            return "mitigation_projects"
-        if any(k in text for k in ["예산", "재정", "투자"]):
-            return "financial_plan"
         if any(k in text for k in ["전망", "BAU"]):
             return "emissions_forecast"
         if any(k in text for k in ["감축목표", "목표배출량"]):
