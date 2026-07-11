@@ -28,6 +28,7 @@ from scripts.golden_score_contract import (  # noqa: E402
 )
 from scripts.golden_score_matching import (  # noqa: E402
     시트점수,
+    의미완화포함출처직렬화,
     없는골든요약,
     출처직렬화,
     출처집계반영,
@@ -58,6 +59,7 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
     excluded = 0
     page_pairs = 0
     page_hits = 0
+    전체의미완화매칭 = []
 
     for sheet_name in 데이터시트:
         golden_sheet = golden_sheets[sheet_name]
@@ -70,11 +72,12 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
         if golden_sheet.상태 == "형식 오류":
             skipped.append(sheet_name)
             format_errors.extend(golden_sheet.오류)
-        summary, missing_golden, missing_output, disagreements, matches, row_values = 시트점수(sheet_name, golden_sheet, output_sheet)
+        summary, missing_golden, missing_output, disagreements, matches, row_values, 의미완화매칭들 = 시트점수(sheet_name, golden_sheet, output_sheet)
         sheet_results[sheet_name] = summary
         all_missing_golden.extend(missing_golden)
         all_missing_output.extend(missing_output)
         all_disagreements.extend(disagreements)
+        전체의미완화매칭.extend(의미완화매칭들)
         if golden_sheet.상태 == "정상" and sheet_name != "00_문서메타":
             출처집계반영(all_source, golden_sheet.행들, matches, row_values)
             if sheet_name in 수치시트:
@@ -100,9 +103,22 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
         "시트별": sheet_results,
         "출처유형별_전체": 출처직렬화(all_source),
         "출처유형별_수치시트": 출처직렬화(numeric_source),
+        "출처유형별_전체_의미완화포함": 의미완화포함출처직렬화(all_source, 전체의미완화매칭),
+        "출처유형별_수치시트_의미완화포함": 의미완화포함출처직렬화(numeric_source, 전체의미완화매칭),
         "미매칭상세": {"골든": all_missing_golden, "출력": all_missing_output},
         "값불일치상세": all_disagreements,
         "출처페이지통계": {"비교쌍수": page_pairs, "교집합수": page_hits, "교집합비율": round(page_hits / page_pairs, 4) if page_pairs else None},
+        "의미완화매칭수": len(전체의미완화매칭),
+        "의미완화매칭쌍": [
+            {
+                "시트": "02_지역여건",
+                "매칭방식": match.방식,
+                "유사도": match.키,
+                "골든": {field: match.골든.값.get(field) for field in ("지표범주", "지표세부범주", "지표명", "연도", "값")},
+                "출력": {field: match.출력.값.get(field) for field in ("지표범주", "지표세부범주", "지표명", "값")},
+            }
+            for match in 전체의미완화매칭
+        ],
     }
     md_path = report_base / f"golden_score_{label_value}.md"
     md_path.write_text(마크다운(result), encoding="utf-8")

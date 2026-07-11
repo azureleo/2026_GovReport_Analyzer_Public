@@ -10,12 +10,15 @@ from scripts.golden_score_contract import (
     값있음,
     값필드,
     키,
+    키값,
     매칭,
     수치시트,
     시각유래,
     시트자료,
     이차키,
     일차키,
+    의미완화적용시트,
+    SEMANTIC_MATCH_MIN_JACCARD,
     텍스트값필드,
     텍스트유래,
     출처유형목록,
@@ -37,7 +40,81 @@ def _출력인덱스(rows: list, sheet_name: str, relaxed: bool, remaining: set[
     return indexed
 
 
-def 매칭하기(golden_rows: list, output_rows: list, sheet_name: str) -> tuple[list[매칭], set[int], set[int]]:
+def _지표토큰(row: Any) -> set[str]:
+    text = f"{row.값.get('지표명') or ''} {row.값.get('지표세부범주') or ''}"
+    parts = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE).split()
+    return {정규화토큰 for 토큰 in parts if (정규화토큰 := dedup_key_text(토큰))}
+
+
+def _자카드(left: set[str], right: set[str]) -> float:
+    union = left | right
+    return len(left & right) / len(union) if union else 0.0
+
+
+def _의미완화후보(golden_row: Any, output_row: Any) -> float | None:
+    골든연도 = 키값("연도", golden_row.값.get("연도"))
+    출력연도 = 키값("연도", output_row.값.get("연도"))
+    if not 골든연도 or not 출력연도 or 골든연도 != 출력연도:
+        return None
+    골든단위 = golden_row.값.get("단위")
+    출력단위 = output_row.값.get("단위")
+    if 값있음(골든단위) and 값있음(출력단위) and dedup_key_text(골든단위) != dedup_key_text(출력단위):
+        return None
+    골든값 = golden_row.값.get("값")
+    출력값 = output_row.값.get("값")
+    if not 값있음(골든값) or not 값있음(출력값) or not _상대오차일치(골든값, 출력값):
+        return None
+    유사도 = _자카드(_지표토큰(golden_row), _지표토큰(output_row))
+    return 유사도 if 유사도 >= SEMANTIC_MATCH_MIN_JACCARD else None
+
+
+def _의미완화매칭하기(
+    golden_rows: list, output_rows: list, remaining_golden: set[int], remaining_output: set[int]
+) -> list[매칭]:
+    의미완화매칭들: list[매칭] = []
+    의미완화골든잔여 = set(remaining_golden)
+    의미완화출력잔여 = set(remaining_output)
+    골든별후보: dict[int, list[tuple[float, int, Any]]] = {}
+    출력별골든: dict[int, list[tuple[int, float]]] = {}
+    for golden_idx in sorted(remaining_golden):
+        candidates: list[tuple[float, int, Any]] = []
+        for output_idx in sorted(remaining_output):
+            유사도 = _의미완화후보(golden_rows[golden_idx], output_rows[output_idx])
+            if 유사도 is None:
+                continue
+            candidates.append((유사도, output_idx, output_rows[output_idx]))
+            출력별골든.setdefault(output_idx, []).append((golden_idx, 유사도))
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        골든별후보[golden_idx] = candidates
+    for golden_idx, golden_row in enumerate(golden_rows):
+        if golden_idx not in 의미완화골든잔여:
+            continue
+        candidates = [item for item in 골든별후보[golden_idx] if item[1] in 의미완화출력잔여]
+        if not candidates:
+            continue
+        최고유사도 = candidates[0][0]
+        if sum(1 for 유사도, _, _ in candidates if 유사도 == 최고유사도) != 1:
+            continue
+        _, output_idx, output_row = candidates[0]
+        골든동률 = False
+        for other_golden_idx, 선택유사도 in 출력별골든.get(output_idx, []):
+            if other_golden_idx == golden_idx or other_golden_idx not in 의미완화골든잔여:
+                continue
+            다른후보 = [
+                item for item in 골든별후보[other_golden_idx] if item[1] in 의미완화출력잔여
+            ]
+            if 다른후보 and 선택유사도 == 다른후보[0][0] == 최고유사도:
+                골든동률 = True
+                break
+        if 골든동률:
+            continue
+        의미완화매칭들.append(매칭(golden_row, output_row, "의미완화", f"자카드={최고유사도:.4f}"))
+        의미완화골든잔여.remove(golden_idx)
+        의미완화출력잔여.remove(output_idx)
+    return 의미완화매칭들
+
+
+def 매칭하기(golden_rows: list, output_rows: list, sheet_name: str) -> tuple[list[매칭], set[int], set[int], list[매칭]]:
     matches: list[매칭] = []
     remaining_golden = set(range(len(golden_rows)))
     remaining_output = set(range(len(output_rows)))
@@ -57,7 +134,10 @@ def 매칭하기(golden_rows: list, output_rows: list, sheet_name: str) -> tuple
                     remaining_golden.remove(golden_idx)
                     remaining_output.remove(output_idx)
                     break
-    return matches, remaining_golden, remaining_output
+    의미완화매칭들 = []
+    if sheet_name in 의미완화적용시트:
+        의미완화매칭들 = _의미완화매칭하기(golden_rows, output_rows, remaining_golden, remaining_output)
+    return matches, remaining_golden, remaining_output, 의미완화매칭들
 
 
 def _상대오차일치(left: Any, right: Any) -> bool:
@@ -155,28 +235,46 @@ def 출처직렬화(stats: dict[str, 출처집계]) -> dict[str, dict[str, Any]]
     }
 
 
-def 시트점수(sheet_name: str, golden: 시트자료, output: 시트자료) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[매칭], dict[int, 값집계]]:
+def 의미완화포함출처직렬화(stats: dict[str, 출처집계], 의미완화매칭들: list[매칭]) -> dict[str, dict[str, Any]]:
+    serialized = 출처직렬화(stats)
+    additions = {"텍스트 유래": 0, "시각 유래": 0}
+    for match in 의미완화매칭들:
+        for source_key in _출처키들(match.골든.출처유형):
+            if source_key in additions:
+                additions[source_key] += 1
+    result: dict[str, dict[str, Any]] = {}
+    for source_key, added in additions.items():
+        row = dict(serialized[source_key])
+        row["매칭수"] += added
+        row["리콜"] = round(row["매칭수"] / row["골든행수"], 4) if row["골든행수"] else None
+        result[source_key] = row
+    return result
+
+
+def 시트점수(sheet_name: str, golden: 시트자료, output: 시트자료) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[매칭], dict[int, 값집계], list[매칭]]:
     if golden.상태 != "정상":
-        return ({"상태": golden.상태, "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "값일치율": None, "골든만있는값": 0, "출력만있는값": 0}, [], [], [], [], {})
+        return ({"상태": golden.상태, "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "값일치율": None, "골든만있는값": 0, "출력만있는값": 0, "의미완화매칭수": 0}, [], [], [], [], {}, [])
     if sheet_name == "00_문서메타":
         if golden.행들 and output.행들:
             matches = [매칭(golden.행들[0], output.행들[0], "엄격", "문서메타")]
             remaining_golden: set[int] = set(range(1, len(golden.행들)))
             remaining_output: set[int] = set(range(1, len(output.행들)))
+            의미완화매칭들: list[매칭] = []
         else:
             matches = []
             remaining_golden = set(range(len(golden.행들)))
             remaining_output = set(range(len(output.행들)))
+            의미완화매칭들 = []
     else:
-        matches, remaining_golden, remaining_output = 매칭하기(golden.행들, output.행들, sheet_name)
+        matches, remaining_golden, remaining_output, 의미완화매칭들 = 매칭하기(golden.행들, output.행들, sheet_name)
     value_stats, disagreements, row_values = 값비교(sheet_name, matches)
     recall = round(len(matches) / len(golden.행들), 4) if golden.행들 else None
     precision = round(len(matches) / len(output.행들), 4) if output.행들 else None
     missing_golden = [{"시트": sheet_name, "행번호": golden.행들[idx].번호, "키": 키(golden.행들[idx], sheet_name, False) or 키(golden.행들[idx], sheet_name, True) or "", "골든_출처유형": golden.행들[idx].출처유형, "골든_출처페이지": golden.행들[idx].출처페이지} for idx in sorted(remaining_golden)]
     missing_output = [{"시트": sheet_name, "행번호": output.행들[idx].번호, "키": 키(output.행들[idx], sheet_name, False) or 키(output.행들[idx], sheet_name, True) or ""} for idx in sorted(remaining_output)]
-    summary = {"상태": "정상", "골든행수": len(golden.행들), "출력행수": len(output.행들), "매칭수": len(matches), "엄격매칭수": sum(1 for match in matches if match.방식 == "엄격"), "완화매칭수": sum(1 for match in matches if match.방식 == "완화"), "리콜": recall, "정밀도": precision, "값일치율": value_stats.비율(), "골든만있는값": value_stats.골든만, "출력만있는값": value_stats.출력만}
-    return summary, missing_golden, missing_output, disagreements, matches, row_values
+    summary = {"상태": "정상", "골든행수": len(golden.행들), "출력행수": len(output.행들), "매칭수": len(matches), "엄격매칭수": sum(1 for match in matches if match.방식 == "엄격"), "완화매칭수": sum(1 for match in matches if match.방식 == "완화"), "리콜": recall, "정밀도": precision, "값일치율": value_stats.비율(), "골든만있는값": value_stats.골든만, "출력만있는값": value_stats.출력만, "의미완화매칭수": len(의미완화매칭들)}
+    return summary, missing_golden, missing_output, disagreements, matches, row_values, 의미완화매칭들
 
 
 def 없는골든요약(output: 시트자료) -> dict[str, Any]:
-    return {"상태": "골든 없음", "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "값일치율": None, "골든만있는값": 0, "출력만있는값": 0}
+    return {"상태": "골든 없음", "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "값일치율": None, "골든만있는값": 0, "출력만있는값": 0, "의미완화매칭수": 0}
