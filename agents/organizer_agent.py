@@ -1142,16 +1142,29 @@ def _visual_candidate_row(sheet_key: str, observation: dict, fields: dict, munic
         target_level = _visual_explicit_value(observation, fields, "목표수준")
         if not _has_cell_value(target_level) and item:
             target_level = "총괄" if item in {"합계", "총괄", "전체"} else "부문"
+        value_role = fields.get("값역할")
+        value_columns = ("목표배출량", "목표감축량", "기준배출량", "배출전망")
+        if _has_cell_value(value_role):
+            role_values = {column: fields.get(column) for column in value_columns}
+            if value_role in value_columns:
+                role_values[value_role] = value
+        else:
+            role_values = {
+                "기준배출량": _visual_explicit_value(observation, fields, "기준배출량"),
+                "배출전망": _visual_explicit_value(observation, fields, "배출전망"),
+                "목표감축량": _visual_explicit_value(observation, fields, "목표감축량"),
+                "목표배출량": value,
+            }
         return base | {
             "목표수준": target_level,
             "목표범위": _visual_explicit_value(observation, fields, "목표범위"),
             "부문": _visual_explicit_value(observation, fields, "부문") or item,
             "기준연도": _visual_explicit_value(observation, fields, "기준연도"),
-            "기준배출량": _visual_explicit_value(observation, fields, "기준배출량"),
+            "기준배출량": role_values["기준배출량"],
             "목표연도": _visual_explicit_value(observation, fields, "목표연도") or year,
-            "배출전망": _visual_explicit_value(observation, fields, "배출전망"),
-            "목표감축량": _visual_explicit_value(observation, fields, "목표감축량"),
-            "목표배출량": value,
+            "배출전망": role_values["배출전망"],
+            "목표감축량": role_values["목표감축량"],
+            "목표배출량": role_values["목표배출량"],
             "감축률": _visual_explicit_value(observation, fields, "감축률"),
         }
     if sheet_key == "financial_plan":
