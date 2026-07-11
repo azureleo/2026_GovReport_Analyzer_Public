@@ -1077,6 +1077,25 @@ def _visual_explicit_value(observation: dict, fields: dict, *keys: str) -> Any:
     return None
 
 
+def _infer_indicator_category(text: str) -> str | None:
+    """지역여건 관찰 텍스트가 한 범주에만 해당할 때 표준 지표범주를 반환한다."""
+    normalized = str(text or "").casefold()
+    category_keywords = {
+        "에너지": ["에너지", "전력", "도시가스", "석유", "신재생", "연료"],
+        "자연환경": ["기온", "강수", "기후", "폭염", "한파", "공원", "녹지", "산림", "하천"],
+        "인문사회": ["인구", "가구", "세대", "주택", "건축물"],
+        "경제산업": ["사업체", "산업", "GRDP", "종사자", "자동차", "차량", "수송", "교통"],
+    }
+    matched = {
+        category
+        for category, keywords in category_keywords.items()
+        if any(keyword.casefold() in normalized for keyword in keywords)
+    }
+    if len(matched) != 1:
+        return None
+    return matched.pop()
+
+
 def _visual_candidate_row(sheet_key: str, observation: dict, fields: dict, municipality: str) -> dict | None:
     page = observation.get("페이지")
     title = str(observation.get("제목", "") or "").strip()
@@ -1093,8 +1112,14 @@ def _visual_candidate_row(sheet_key: str, observation: dict, fields: dict, munic
         "데이터상태": "visual_only",
     }
     if sheet_key == "regional_conditions":
+        indicator_category = _visual_explicit_value(observation, fields, "지표범주")
+        if not _has_cell_value(indicator_category):
+            indicator_category = _infer_indicator_category(" ".join(
+                str(_visual_explicit_value(observation, fields, key) or "")
+                for key in ("캡션", "항목", "제목", "지표명")
+            ))
         return base | {
-            "지표범주": _visual_explicit_value(observation, fields, "지표범주"),
+            "지표범주": indicator_category,
             "지표세부범주": _visual_explicit_value(observation, fields, "지표세부범주") or "",
             "지표명": _visual_explicit_value(observation, fields, "지표명") or item,
             "연도": year,
