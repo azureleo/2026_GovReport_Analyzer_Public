@@ -631,7 +631,6 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
             "energy": "regional_conditions",
             "ghg": "emissions_regional",
             "strategy": "mitigation_projects",
-            "summary": "vision_strategy",
         }
         _VALID_KEYS = {
             "regional_conditions", "emissions_regional", "emissions_management",
@@ -646,6 +645,11 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         if any(k in text for k in ["자동차", "차량", "등록대수", "주행거리"]):
             return "regional_conditions"
         if any(k in text for k in ["에너지", "전력", "도시가스", "석유", "신재생", "TJ", "toe"]):
+            return "regional_conditions"
+        if any(k in text for k in [
+            "인구", "기온", "강수", "기후", "폭염", "한파", "공원", "녹지", "건축물",
+            "사업체", "산업구조", "가구",
+        ]):
             return "regional_conditions"
         if any(k in text for k in ["감축사업", "성과지표", "이행", "계획(감축량)"]):
             return "mitigation_projects"
@@ -686,7 +690,10 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         year_int = _chart_year_int(item.get("연도"))
         if year_int is None:
             reasons.append("연도 없음/비숫자")
-        if year_int is not None and year_int not in config.IMAGE_CHART_MERGE_YEARS:
+        allowed_years = config.IMAGE_CHART_MERGE_YEARS_BY_SHEET.get(
+            target_sheet, config.IMAGE_CHART_MERGE_YEARS
+        )
+        if year_int is not None and year_int not in allowed_years:
             reasons.append("연도 범위 외")
 
         chart_type = str(analysis.get("chart_type", "") or "")
@@ -719,6 +726,8 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         reason_text = "; ".join(reasons or [])
         base_evidence = json.dumps(fields, ensure_ascii=False) if fields else analysis.get("summary", "")
         evidence_text = f"{base_evidence} | {reason_text}" if reason_text else base_evidence
+        if analysis.get("target_sheet") == "summary":
+            evidence_text = f"{evidence_text}; 대상시트 재추론(summary)"
         evidence = {
             "지자체명": analysis.get("municipality", ""),
             "페이지": analysis.get("page_number"),

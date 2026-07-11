@@ -508,6 +508,11 @@ IMAGE_ANALYSIS_BATCH_SIZE = _env_int("IMAGE_ANALYSIS_BATCH_SIZE", 8)
 IMAGE_CHART_MERGE_MIN_CONFIDENCE = "medium"
 # 그래프 판독값 자동 반영 시 허용할 연도. 기준연도 2005 등은 판독결과 시트에만 남긴다.
 IMAGE_CHART_MERGE_YEARS = YEARS
+# 지역여건·배출현황은 과거 시계열이 본질이라 병합 연도 하한을 넓힌다.
+IMAGE_CHART_MERGE_YEARS_BY_SHEET = {
+    "regional_conditions": list(range(1990, 2051)),
+    "emissions_regional": list(range(1990, 2051)),
+}
 # 참고자료/해외사례/목차성 이미지는 판독결과에는 남기되 본 시트에는 자동 반영하지 않는다.
 IMAGE_CHART_REFERENCE_KEYWORDS = [
     "뉴욕시", "런던", "파리", "도쿄", "세계도시", "주요국", "국내외",
