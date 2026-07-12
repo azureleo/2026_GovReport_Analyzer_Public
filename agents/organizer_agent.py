@@ -1118,10 +1118,24 @@ def _visual_candidate_row(sheet_key: str, observation: dict, fields: dict, munic
                 str(_visual_explicit_value(observation, fields, key) or "")
                 for key in ("캡션", "항목", "제목", "지표명")
             ))
+        series_label = str(_visual_explicit_value(observation, fields, "항목") or "").strip()
+        chart_indicator_name = str(fields.get("지표명") or "").strip()
+        uses_series_label = bool(
+            series_label
+            and _dedup_key_text(series_label) != _dedup_key_text(chart_indicator_name)
+        )
+        indicator_name = (
+            series_label
+            if uses_series_label
+            else _visual_explicit_value(observation, fields, "지표명") or item
+        )
+        indicator_subcategory = _visual_explicit_value(observation, fields, "지표세부범주") or ""
+        if not _has_cell_value(indicator_subcategory) and uses_series_label:
+            indicator_subcategory = chart_indicator_name
         return base | {
             "지표범주": indicator_category,
-            "지표세부범주": _visual_explicit_value(observation, fields, "지표세부범주") or "",
-            "지표명": _visual_explicit_value(observation, fields, "지표명") or item,
+            "지표세부범주": indicator_subcategory,
+            "지표명": indicator_name,
             "연도": year,
             "값": value,
             "단위": unit,
