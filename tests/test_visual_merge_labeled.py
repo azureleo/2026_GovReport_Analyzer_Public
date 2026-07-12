@@ -224,6 +224,100 @@ def test_시각_라벨병합은_판독한_02_지표범주로_G5를_복구한다(
     )
 
 
+def test_시각_라벨병합은_다른_지표세부범주의_차트_관찰값을_모두_병합한다(monkeypatch) -> None:
+    # Given: 범주·지표명·연도는 같지만 차트 수준 세부범주가 다른 관찰값이면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    raw = {
+        "municipality_name": "서울특별시",
+        "chart_observations": [
+            _시각_관찰값(
+                "regional_conditions",
+                {"지표범주": "에너지", "지표세부범주": "2005 실적", "지표명": "도시가스", "연도": 2005},
+                value=100.0,
+            ),
+            _시각_관찰값(
+                "regional_conditions",
+                {"지표범주": "에너지", "지표세부범주": "2005 전망", "지표명": "도시가스", "연도": 2005},
+                value=120.0,
+            ),
+        ],
+    }
+
+    # When: organizer가 세부범주를 포함한 키로 시각 행을 비교하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 두 관찰값이 각각 병합되고 동일 키 시각 행 경고는 발생하지 않는다.
+    assert [(row["지표세부범주"], row["값"]) for row in cleaned["regional_conditions"]] == [
+        ("2005 실적", 100.0),
+        ("2005 전망", 120.0),
+    ]
+    visual_issues = [row for row in cleaned["validation_report"] if row.get("영역") == "시각병합"]
+    assert sum(row.get("항목") == "병합" for row in visual_issues) == 2
+    assert not any(
+        row.get("심각도") == "경고" or "동일 키 시각 행 존재" in row.get("문제내용", "")
+        for row in visual_issues
+    )
+
+
+def test_시각_라벨병합은_빈_지표세부범주를_와일드카드로_비교한다(monkeypatch) -> None:
+    # Given: 기존 시각 행에는 세부범주가 있고 같은 값의 신규 관찰값에는 세부범주가 없으면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    raw = {
+        "municipality_name": "서울특별시",
+        "chart_observations": [
+            _시각_관찰값(
+                "regional_conditions",
+                {"지표범주": "에너지", "지표세부범주": "에너지원별 소비", "지표명": "도시가스", "연도": 2030},
+            ),
+            _시각_관찰값(
+                "regional_conditions",
+                {"지표범주": "에너지", "지표명": "도시가스", "연도": 2030},
+            ),
+        ],
+    }
+
+    # When: organizer가 선택 키인 세부범주의 공란을 비교하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 공란을 와일드카드로 보아 기존 시각 행을 유지하고 신규 행을 생략한다.
+    assert len(cleaned["regional_conditions"]) == 1
+    assert cleaned["regional_conditions"][0]["지표세부범주"] == "에너지원별 소비"
+    assert any(
+        issue.get("영역") == "시각병합"
+        and issue.get("항목") == "생략"
+        and "동일 키 시각 행 존재" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
+
+
+def test_시각_라벨병합은_빈_지표세부범주를_G3에서_차단하지_않는다(monkeypatch) -> None:
+    # Given: 필수 키는 모두 있고 선택 키인 세부범주만 비어 있는 관찰값이면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _시각_관찰값(
+        "regional_conditions",
+        {"지표범주": "에너지", "지표명": "도시가스", "연도": 2030},
+    )
+
+    # When: organizer가 G3 1차 키를 검사하면
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    # Then: 세부범주 공란은 G3 누락이 아니므로 시각 전용 행으로 병합된다.
+    assert len(cleaned["regional_conditions"]) == 1
+    assert cleaned["regional_conditions"][0]["지표세부범주"] == ""
+    assert any(
+        issue.get("영역") == "시각병합" and issue.get("항목") == "병합"
+        for issue in cleaned["validation_report"]
+    )
+    assert not any(
+        issue.get("영역") == "시각병합"
+        and "G3 1차 키 누락(지표세부범주)" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
+
+
 def test_시각_라벨병합은_빈_세부부문을_기본값으로_채우지_않고_상세행과_교차검증한다(monkeypatch) -> None:
     # Given: 필수 키는 판독했지만 absorb 대상 세부부문은 비어 있는 지역배출 관찰값이면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)

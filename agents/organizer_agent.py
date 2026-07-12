@@ -302,7 +302,7 @@ _REGIONAL_EMISSIONS_KEY_FIELDS = ["지자체명", "배출유형", "부문", "세
 _MANAGEMENT_EMISSIONS_KEY_FIELDS = ["지자체명", "관리부문", "세부부문", "직간접구분", "연도"]
 _CONFIDENCE_RANK = {"low": 1, "medium": 2, "high": 3}
 _VISUAL_MERGE_KEY_FIELDS = {
-    "regional_conditions": ["지자체명", "지표범주", "지표명", "연도"],
+    "regional_conditions": ["지자체명", "지표범주", "지표세부범주", "지표명", "연도"],
     "emissions_regional": _REGIONAL_EMISSIONS_KEY_FIELDS,
     "emissions_management": _MANAGEMENT_EMISSIONS_KEY_FIELDS,
     "emissions_forecast": ["지자체명", "시나리오", "부문", "연도"],
@@ -321,7 +321,7 @@ _BLANK_ABSORB_FIELDS_BY_KEY = {
     tuple(_REGIONAL_EMISSIONS_KEY_FIELDS): ("세부부문", "배출유형"),
     tuple(_MANAGEMENT_EMISSIONS_KEY_FIELDS): ("세부부문", "직간접구분"),
 }
-_VISUAL_OPTIONAL_KEY_FIELDS = {"세부부문"}
+_VISUAL_OPTIONAL_KEY_FIELDS = {"세부부문", "지표세부범주"}
 
 
 def _normalize_provenance_pages(value: Any) -> str:
