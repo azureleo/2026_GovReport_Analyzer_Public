@@ -68,12 +68,23 @@ def _시각_관찰값(target_sheet: str, fields: dict, *, value: float = 100.0):
     }
 
 
-def test_시각_라벨병합은_기본값에서_본시트와_리포트를_바꾸지_않는다(monkeypatch) -> None:
-    # Given: 병합 가능한 라벨 기반 시각 판독값이 있지만 opt-in 플래그가 꺼져 있으면
+def test_시각_라벨병합은_기본_활성화되고_환경변수로_끌_수_있다(monkeypatch) -> None:
+    # Given/Then: 재로드 없이 읽은 설정의 기본값은 활성화 상태다.
+    assert config.VISUAL_MERGE_LABELED_ENABLED is True
+
+    # When: 기존 환경변수 경로에 0을 지정하면
+    monkeypatch.setenv("VISUAL_MERGE_LABELED_ENABLED", "0")
+
+    # Then: 같은 불리언 파서가 비활성 값을 반환한다.
+    assert config._env_bool("VISUAL_MERGE_LABELED_ENABLED", True) is False
+
+
+def test_시각_라벨병합은_플래그를_끄면_본시트와_리포트를_바꾸지_않는다(monkeypatch) -> None:
+    # Given: 병합 가능한 라벨 기반 시각 판독값이 있지만 플래그를 명시적으로 끄면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", False, raising=False)
     raw = {"municipality_name": "서울특별시", "chart_observations": [_관리권한_관찰값()]}
 
-    # When: organizer가 기본 설정으로 정제하면
+    # When: organizer가 비활성 설정으로 정제하면
     cleaned = OrganizerAgent().organize(raw)
 
     # Then: 기존 격리 정책처럼 본 시트와 검증리포트는 조용히 유지된다.
