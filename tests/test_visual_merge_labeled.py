@@ -150,8 +150,8 @@ def test_시각_라벨병합은_실스키마의_estimated_부재만으로_G1을_
 
 
 @pytest.mark.parametrize("title", ["온실가스 흡수 전망", "온실가스 BAU 산정"])
-def test_시각_라벨병합은_03_전망성_제목을_05로_재지정한다(monkeypatch, title: str) -> None:
-    # Given: 03 후보의 제목에 전망 키워드가 있고 05 필수 시나리오는 없으면
+def test_시각_라벨병합은_03_전망성_제목을_05로_재지정해_병합한다(monkeypatch, title: str) -> None:
+    # Given: 03 후보의 제목에 전망 키워드가 있고 시나리오 표기는 없으면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
     observation = _시각_관찰값(
         "emissions_regional",
@@ -165,12 +165,14 @@ def test_시각_라벨병합은_03_전망성_제목을_05로_재지정한다(mon
         "chart_observations": [observation],
     })
 
-    # Then: 03은 오염되지 않고 재지정 및 05 키 누락 사유가 함께 남는다.
+    # Then: 03은 오염되지 않고 시나리오 공란을 유지한 05 시각행으로 병합된다.
     assert cleaned["emissions_regional"] == []
-    assert cleaned["emissions_forecast"] == []
+    assert len(cleaned["emissions_forecast"]) == 1
+    assert cleaned["emissions_forecast"][0]["데이터상태"] == "visual_only"
+    assert not cleaned["emissions_forecast"][0].get("시나리오")
     assert any(
         issue.get("대상시트키") == "emissions_forecast"
-        and "G3 1차 키 누락(시나리오)" in issue.get("문제내용", "")
+        and issue.get("항목") == "병합"
         and "대상시트 재지정(전망 키워드)" in issue.get("문제내용", "")
         for issue in cleaned["validation_report"]
     )

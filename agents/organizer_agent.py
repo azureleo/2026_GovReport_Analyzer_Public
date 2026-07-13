@@ -321,7 +321,7 @@ _BLANK_ABSORB_FIELDS_BY_KEY = {
     tuple(_REGIONAL_EMISSIONS_KEY_FIELDS): ("세부부문", "배출유형"),
     tuple(_MANAGEMENT_EMISSIONS_KEY_FIELDS): ("세부부문", "직간접구분"),
 }
-_VISUAL_OPTIONAL_KEY_FIELDS = {"세부부문", "지표세부범주"}
+_VISUAL_OPTIONAL_KEY_FIELDS = {"세부부문", "지표세부범주", "시나리오"}
 _IPCC_GAS_NAMES = {
     "이산화탄소", "메탄", "아산화질소", "수소불화탄소", "과불화탄소", "육불화황",
     "CO2", "CH4", "N2O", "HFCs", "PFCs", "SF6",
