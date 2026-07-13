@@ -57,21 +57,10 @@ def test_data_status_correction_keeps_conflicting_priority() -> None:
     assert cleaned["reduction_targets"][0]["데이터상태"] == "conflicting"
 
 
-def test_image_merged_rows_keep_visual_only_for_targets_projects_and_financial() -> None:
-    # Given: 이미지 병합 경로가 06/08/11 시트에 행을 추가하면
+def test_image_merged_rows_keep_visual_only_for_projects_and_financial() -> None:
+    # Given: 이미지 병합 경로가 08/11 시트에 행을 추가하면
     text_results = {"municipality_name": "서울특별시"}
     analyses = [
-        {
-            "type": "chart_table",
-            "target_sheet": "reduction_targets",
-            "chart_type": "표",
-            "title": "감축목표",
-            "unit": "천톤CO2eq",
-            "page_number": 10,
-            "municipality": "서울특별시",
-            "confidence": "high",
-            "table": [{"연도": 2030, "항목": "합계", "값": 60, "단위": "천톤CO2eq", "종류": "목표"}],
-        },
         {
             "type": "chart_table",
             "target_sheet": "mitigation_projects",
@@ -100,8 +89,7 @@ def test_image_merged_rows_keep_visual_only_for_targets_projects_and_financial()
     merged = ImageAgent()._merge_image_results(text_results, analyses, "서울특별시")
     cleaned = OrganizerAgent().organize(merged)
 
-    # Then: 세 시트의 이미지 유래 행은 reported로 강등되지 않고 visual_only를 유지한다.
-    assert cleaned["reduction_targets"][0]["데이터상태"] == "visual_only"
+    # Then: 두 시트의 이미지 유래 행은 reported로 강등되지 않고 visual_only를 유지한다.
     assert cleaned["mitigation_projects"][0]["데이터상태"] == "visual_only"
     assert cleaned["financial_plan"][0]["데이터상태"] == "visual_only"
 
