@@ -354,6 +354,18 @@ def 의미완화포함출처직렬화(stats: dict[str, 출처집계], 의미완�
     return result
 
 
+def 문자유사포함출처직렬화(
+    stats: dict[str, 출처집계], 의미완화매칭들: list[매칭], 문자유사매칭들: list[매칭]
+) -> dict[str, dict[str, Any]]:
+    serialized = 의미완화포함출처직렬화(stats, 의미완화매칭들)
+    row = dict(serialized["시각 유래"])
+    row["매칭수"] += sum(
+        1 for match in 문자유사매칭들 if match.골든.출처유형 in 시각유래
+    )
+    row["리콜"] = round(row["매칭수"] / row["골든행수"], 4) if row["골든행수"] else None
+    return {"시각 유래": row}
+
+
 def 시트점수(sheet_name: str, golden: 시트자료, output: 시트자료) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[매칭], dict[int, 값집계], list[매칭], list[매칭], list[매칭]]:
     if golden.상태 != "정상":
         return ({"상태": golden.상태, "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "값일치율": None, "골든만있는값": 0, "출력만있는값": 0, "의미완화매칭수": 0, "문자유사매칭수": 0}, [], [], [], [], {}, [], [], [])

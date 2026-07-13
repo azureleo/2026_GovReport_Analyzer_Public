@@ -112,3 +112,74 @@ def test_의미완화가_소비한_행은_문자유사_후보에서_제외한다
 
     assert sheet["의미완화매칭수"] == 1
     assert sheet["문자유사매칭수"] == 0
+
+
+def test_문자유사는_기존_헤드라인을_바꾸지_않고_별도_누적_보고한다(tmp_path: Path) -> None:
+    char_golden = _지역여건행(
+        지표범주="경제산업",
+        지표세부범주="수송·교통",
+        지표명="자동차 등록 대수(휘발유)",
+        연도=2013,
+        값=1622,
+    )
+    char_output = _출력행(
+        지표범주="인문사회",
+        지표세부범주="연료별 자동차 등록대수",
+        지표명="휘발유 차량",
+        연도=2013,
+        값=1622,
+    )
+    observed_golden = _지역여건행(
+        지표범주="관찰",
+        지표세부범주="",
+        지표명="abcdef",
+        연도=2020,
+        값=99,
+    )
+    observed_output = _출력행(
+        지표범주="관찰후보",
+        지표세부범주="",
+        지표명="abcxyz",
+        연도=2020,
+        값=99,
+    )
+
+    result = _점수(
+        tmp_path,
+        {"02_지역여건": [char_output, observed_output]},
+        {"02_지역여건": [char_golden, observed_golden]},
+    )
+    sheet = result["시트별"]["02_지역여건"]
+
+    assert {
+        "매칭수": sheet["매칭수"],
+        "리콜": sheet["리콜"],
+        "정밀도": sheet["정밀도"],
+        "값일치율": sheet["값일치율"],
+        "완화매칭수": sheet["완화매칭수"],
+        "의미완화매칭수": sheet["의미완화매칭수"],
+    } == {
+        "매칭수": 0,
+        "리콜": 0.0,
+        "정밀도": 0.0,
+        "값일치율": None,
+        "완화매칭수": 0,
+        "의미완화매칭수": 0,
+    }
+    assert result["문자유사매칭수"] == 1
+    assert result["문자유사매칭쌍"][0]["유사도"].startswith("자카드=")
+    assert len(result["문자유사관찰쌍"]) == 1
+    assert result["문자유사관찰쌍"][0]["유사도"] == "자카드=0.2500"
+    assert result["출처유형별_전체"]["시각 유래"]["매칭수"] == 0
+    assert result["출처유형별_전체_의미완화포함"]["시각 유래"]["매칭수"] == 0
+    assert result["출처유형별_전체_문자유사포함"]["시각 유래"]["매칭수"] == 1
+    assert result["출처유형별_전체_문자유사포함"]["시각 유래"]["값일치율"] is None
+
+    report = Path(result["리포트"]["md"]).read_text(encoding="utf-8")
+    assert "문자유사 매칭: 1건(02_지역여건)" in report
+    assert "| 문자유사 |" in report
+    assert "| 시각 유래(문자유사 포함) | 2 | 1 | 0.5000 | 0 | - |" in report
+    assert "## 문자유사 매칭 쌍" in report
+    assert "자동차 등록 대수(휘발유)" in report
+    assert "## 문자유사 관찰(비매칭)" in report
+    assert "abcdef" in report
