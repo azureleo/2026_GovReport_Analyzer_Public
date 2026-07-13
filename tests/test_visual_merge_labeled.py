@@ -149,6 +149,151 @@ def test_시각_라벨병합은_실스키마의_estimated_부재만으로_G1을_
     assert "G1 판독필드 없음" in details
 
 
+@pytest.mark.parametrize("title", ["온실가스 흡수 전망", "온실가스 BAU 산정"])
+def test_시각_라벨병합은_03_전망성_제목을_05로_재지정한다(monkeypatch, title: str) -> None:
+    # Given: 03 후보의 제목에 전망 키워드가 있고 05 필수 시나리오는 없으면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _시각_관찰값(
+        "emissions_regional",
+        {"배출유형": "흡수원", "부문": "흡수원", "연도": 2040},
+    )
+    observation["제목"] = title
+
+    # When: 전망 시트로 재지정해 동일한 G3 심사를 수행하면
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    # Then: 03은 오염되지 않고 재지정 및 05 키 누락 사유가 함께 남는다.
+    assert cleaned["emissions_regional"] == []
+    assert cleaned["emissions_forecast"] == []
+    assert any(
+        issue.get("대상시트키") == "emissions_forecast"
+        and "G3 1차 키 누락(시나리오)" in issue.get("문제내용", "")
+        and "대상시트 재지정(전망 키워드)" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
+
+
+def test_시각_라벨병합은_근거의_전망_문자열로_03을_재지정하지_않는다(monkeypatch) -> None:
+    # Given: 제목은 현황이고 판독필드의 무관한 근거 문자열에만 전망이 있으면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _시각_관찰값(
+        "emissions_regional",
+        {"배출유형": "직접배출", "부문": "에너지", "연도": 2030, "메모": "전망 표와 비교"},
+    )
+    observation["제목"] = "온실가스 배출 현황"
+
+    # When: 제목만으로 재지정 여부를 판단하면
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    # Then: 근거 문자열 오탐 없이 03 후보로 병합된다.
+    assert len(cleaned["emissions_regional"]) == 1
+    assert cleaned["emissions_forecast"] == []
+
+
+@pytest.mark.parametrize(
+    ("target_sheet", "fields"),
+    [
+        ("emissions_regional", {"배출유형": "직접배출", "부문": "건물", "연도": 2030}),
+        ("emissions_management", {"관리부문": "건물", "직간접구분": "직접", "연도": 2030}),
+    ],
+)
+def test_시각_라벨병합은_03_04의_퍼센트_단위를_차단한다(
+    monkeypatch, target_sheet: str, fields: dict
+) -> None:
+    # Given: 03 또는 04 후보의 비교값 단위가 비율이면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _시각_관찰값(target_sheet, fields, value=88.4)
+    observation["단위"] = "%"
+
+    # When: 라벨 병합 게이트를 적용하면
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    # Then: 본 시트 병합 없이 단위 부적합 사유를 남긴다.
+    assert cleaned[target_sheet] == []
+    assert any(
+        "G3 비교값 단위 부적합(%)" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
+
+
+def test_시각_라벨병합은_02의_퍼센트_단위를_허용한다(monkeypatch) -> None:
+    # Given: 02 지역여건의 정당한 비율 지표이면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _시각_관찰값(
+        "regional_conditions",
+        {"지표범주": "에너지", "지표명": "재생에너지 비중", "연도": 2030},
+        value=88.4,
+    )
+    observation["단위"] = "%"
+
+    # When: 라벨 병합 게이트를 적용하면
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    # Then: 02의 비율값은 기존처럼 병합된다.
+    assert cleaned["regional_conditions"][0]["값"] == 88.4
+
+
+@pytest.mark.parametrize(
+    ("target_sheet", "fields"),
+    [
+        ("emissions_regional", {"배출유형": "직접배출", "부문": "이산화탄소", "연도": 2030}),
+        ("emissions_management", {"관리부문": "CO2", "직간접구분": "직접", "연도": 2030}),
+    ],
+)
+def test_시각_라벨병합은_03_04_부문의_IPCC_가스명을_차단한다(
+    monkeypatch, target_sheet: str, fields: dict
+) -> None:
+    # Given: 03 또는 04 부문 필드가 IPCC 표준 가스명과 전체일치하면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _시각_관찰값(target_sheet, fields)
+
+    # When: 스키마 적합성을 검사하면
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    # Then: 가스종을 부문으로 병합하지 않고 명시적 차단 사유를 남긴다.
+    assert cleaned[target_sheet] == []
+    assert any(
+        "G3 부문에 가스종(스키마 불일치)" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
+
+
+@pytest.mark.parametrize("sector", ["에너지", "기타", "이산화탄소 배출"])
+def test_시각_라벨병합은_IPCC_가스명과_전체일치하지_않는_부문을_허용한다(
+    monkeypatch, sector: str
+) -> None:
+    # Given: 03 부문이 일반 부문이거나 가스명이 더 긴 문구의 일부일 뿐이면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _시각_관찰값(
+        "emissions_regional",
+        {"배출유형": "직접배출", "부문": sector, "연도": 2030},
+    )
+
+    # When: 전체일치 규칙으로 검사하면
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    # Then: 허용 목록의 정확한 가스명이 아니므로 기존처럼 병합된다.
+    assert len(cleaned["emissions_regional"]) == 1
+
+
 def test_시각_라벨병합은_텍스트가_없을_때_visual_only로_본시트에_반영한다(monkeypatch) -> None:
     # Given: G1~G4를 통과하고 같은 키의 텍스트 행이 없는 시각 판독값이면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)

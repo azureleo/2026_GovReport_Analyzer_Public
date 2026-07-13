@@ -322,6 +322,10 @@ _BLANK_ABSORB_FIELDS_BY_KEY = {
     tuple(_MANAGEMENT_EMISSIONS_KEY_FIELDS): ("세부부문", "직간접구분"),
 }
 _VISUAL_OPTIONAL_KEY_FIELDS = {"세부부문", "지표세부범주"}
+_IPCC_GAS_NAMES = {
+    "이산화탄소", "메탄", "아산화질소", "수소불화탄소", "과불화탄소", "육불화황",
+    "CO2", "CH4", "N2O", "HFCs", "PFCs", "SF6",
+}
 
 
 def _normalize_provenance_pages(value: Any) -> str:
@@ -1304,6 +1308,12 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
         if str(observation.get("반영여부", "") or "").strip() != "검토":
             continue
         sheet_key = str(observation.get("대상시트", "") or "").strip()
+        decision_note = ""
+        if sheet_key == "emissions_regional":
+            title = str(observation.get("제목", "") or "")
+            if "전망" in title or "bau" in title.casefold():
+                sheet_key = "emissions_forecast"
+                decision_note = "; 대상시트 재지정(전망 키워드)"
         fields = _visual_fields(observation)
         blockers: list[str] = []
         if not fields:
@@ -1328,6 +1338,13 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
                 blockers.append(f"G3 1차 키 누락({', '.join(raw_missing)})")
             if not _has_cell_value(raw_candidate.get(value_field)):
                 blockers.append(f"G3 비교값 누락({value_field})")
+            if sheet_key in {"emissions_regional", "emissions_management"}:
+                if "%" in str(raw_candidate.get("단위", "") or ""):
+                    blockers.append("G3 비교값 단위 부적합(%)")
+                sector_field = "부문" if sheet_key == "emissions_regional" else "관리부문"
+                gas_names = {_dedup_key_text(name) for name in _IPCC_GAS_NAMES}
+                if _dedup_key_text(raw_candidate.get(sector_field)) in gas_names:
+                    blockers.append("G3 부문에 가스종(스키마 불일치)")
             if not raw_missing and _has_cell_value(raw_candidate.get(value_field)):
                 candidate = _clean_visual_candidate(sheet_key, raw_candidate, municipality)
             if candidate is not None:
@@ -1344,7 +1361,7 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
                 municipality,
                 "정보",
                 "차단",
-                f"{sheet_key or '미지정'} p{observation.get('페이지') or '?'}: {'; '.join(blockers)}",
+                f"{sheet_key or '미지정'} p{observation.get('페이지') or '?'}: {'; '.join(blockers)}{decision_note}",
                 "시각 판독 메타데이터와 원문 표기 확인",
                 sheet_key or None,
             )
@@ -1365,7 +1382,7 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
                     "경고",
                     "경고",
                     f"{sheet_key} {key_summary}: 동일 키 시각 행 존재, "
-                    f"기존 시각 {visual_row.get(value_field)} vs 신규 시각 {candidate.get(value_field)}",
+                    f"기존 시각 {visual_row.get(value_field)} vs 신규 시각 {candidate.get(value_field)}{decision_note}",
                     "기존 시각 행 유지 후 원문 차트 수동 확인",
                     sheet_key,
                 )
@@ -1375,7 +1392,7 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
                     "정보",
                     "생략",
                     f"{sheet_key} {key_summary}: 동일 키 시각 행 존재, "
-                    f"기존 시각 {visual_row.get(value_field)} vs 신규 시각 {candidate.get(value_field)}",
+                    f"기존 시각 {visual_row.get(value_field)} vs 신규 시각 {candidate.get(value_field)}{decision_note}",
                     "기존 시각 행 유지",
                     sheet_key,
                 )
@@ -1392,7 +1409,7 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
                     municipality,
                     "정보",
                     "생략",
-                    f"{sheet_key} {key_summary}: 교차일치, 텍스트 {matching_rows[0].get(value_field)} vs 시각 {candidate.get(value_field)}",
+                    f"{sheet_key} {key_summary}: 교차일치, 텍스트 {matching_rows[0].get(value_field)} vs 시각 {candidate.get(value_field)}{decision_note}",
                     "기존 텍스트 행 유지",
                     sheet_key,
                 )
@@ -1402,7 +1419,7 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
                 municipality,
                 "경고",
                 "차단",
-                f"{sheet_key} {key_summary}: 텍스트-시각 값 불일치, 텍스트 {conflict_row.get(value_field)} vs 시각 {candidate.get(value_field)}",
+                f"{sheet_key} {key_summary}: 텍스트-시각 값 불일치, 텍스트 {conflict_row.get(value_field)} vs 시각 {candidate.get(value_field)}{decision_note}",
                 "원문 표·차트와 텍스트 추출값 수동 확인",
                 sheet_key,
             )
@@ -1413,7 +1430,7 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
             municipality,
             "정보",
             "병합",
-            f"{sheet_key} {key_summary}: 텍스트 행 없음, 시각 전용 값 {candidate.get(value_field)} 병합",
+            f"{sheet_key} {key_summary}: 텍스트 행 없음, 시각 전용 값 {candidate.get(value_field)} 병합{decision_note}",
             "visual_only 행으로 출처페이지 확인",
             sheet_key,
         )
