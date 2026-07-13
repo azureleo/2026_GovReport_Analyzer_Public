@@ -380,6 +380,59 @@ def test_시각_라벨병합은_판독한_02_지표범주로_G5를_복구한다(
     )
 
 
+@pytest.mark.parametrize(
+    ("text_value", "expected_count", "expected_item", "expected_reason"),
+    [
+        (100.3, 1, "생략", "세부범주 완화 교차일치"),
+        (120.0, 2, "병합", "세부범주 상이 텍스트 값불일치 관찰"),
+    ],
+)
+def test_시각_라벨병합은_02_텍스트가_없을_때만_세부범주를_제외해_재탐색한다(
+    monkeypatch,
+    text_value: float,
+    expected_count: int,
+    expected_item: str,
+    expected_reason: str,
+) -> None:
+    # Given: 핵심 키는 같지만 세부범주가 다른 텍스트 행과 시각 관찰값이면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _시각_관찰값(
+        "regional_conditions",
+        {"지표범주": "에너지", "지표세부범주": "최종에너지", "지표명": "합계", "연도": 2021},
+        value=100.0,
+    )
+    raw = {
+        "municipality_name": "서울특별시",
+        "regional_conditions": [{
+            "지자체명": "서울특별시",
+            "지표범주": "에너지",
+            "지표세부범주": "에너지원별 소비",
+            "지표명": "합계",
+            "연도": 2021,
+            "값": text_value,
+        }],
+        "chart_observations": [observation],
+    }
+
+    # When: 세부범주 포함 키에 텍스트가 없어 완화 키로만 재탐색하면
+    cleaned = OrganizerAgent().organize(raw)
+
+    # Then: 값 동일은 생략하고 값 불일치는 경고 없이 병합을 유지하며 각각 사유를 남긴다.
+    assert len(cleaned["regional_conditions"]) == expected_count
+    assert any(
+        issue.get("영역") == "시각병합"
+        and issue.get("항목") == expected_item
+        and expected_reason in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
+    if expected_item == "병합":
+        assert cleaned["regional_conditions"][-1]["데이터상태"] == "visual_only"
+        assert not any(
+            issue.get("영역") == "시각병합" and issue.get("항목") in {"경고", "차단"}
+            for issue in cleaned["validation_report"]
+        )
+
+
 def test_시각_라벨병합은_다른_지표세부범주의_차트_관찰값을_모두_병합한다(monkeypatch) -> None:
     # Given: 범주·지표명·연도는 같지만 차트 수준 세부범주가 다른 관찰값이면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)

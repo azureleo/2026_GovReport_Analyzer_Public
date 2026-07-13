@@ -1425,12 +1425,36 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
             )
             continue
 
+        relaxed_conflict_note = ""
+        if sheet_key == "regional_conditions":
+            relaxed_key_fields = [field for field in key_fields if field != "지표세부범주"]
+            relaxed_text_rows = _visual_text_rows(rows, candidate, relaxed_key_fields)
+            if relaxed_text_rows:
+                relaxed_matching_rows = [
+                    row for row in relaxed_text_rows
+                    if not _values_conflict(row.get(value_field), candidate.get(value_field))
+                ]
+                if relaxed_matching_rows:
+                    relaxed_row = relaxed_matching_rows[0]
+                    _remember_visual_merge_issue(
+                        municipality,
+                        "정보",
+                        "생략",
+                        f"{sheet_key} {key_summary}: 세부범주 완화 교차일치, "
+                        f"텍스트 {relaxed_row.get(value_field)} vs 시각 {candidate.get(value_field)}{decision_note}",
+                        "기존 텍스트 행 유지",
+                        sheet_key,
+                    )
+                    continue
+                relaxed_conflict_note = "; 세부범주 상이 텍스트 값불일치 관찰"
+
         rows.append(candidate)
         _remember_visual_merge_issue(
             municipality,
             "정보",
             "병합",
-            f"{sheet_key} {key_summary}: 텍스트 행 없음, 시각 전용 값 {candidate.get(value_field)} 병합{decision_note}",
+            f"{sheet_key} {key_summary}: 텍스트 행 없음, 시각 전용 값 {candidate.get(value_field)} "
+            f"병합{relaxed_conflict_note}{decision_note}",
             "visual_only 행으로 출처페이지 확인",
             sheet_key,
         )
