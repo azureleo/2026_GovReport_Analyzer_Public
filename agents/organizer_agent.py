@@ -978,6 +978,10 @@ def _build_visual_inventory(observations: list[dict], municipality: str) -> list
         value_summary = " ".join(summary_bits).strip()
         if evidence:
             value_summary = f"{value_summary} | {evidence}" if value_summary else evidence
+        target_sheet_basis = str(obs.get("대상시트근거", "") or "").strip()
+        if target_sheet_basis:
+            marker = f"대상시트 {target_sheet_basis}"
+            value_summary = f"{value_summary} | {marker}" if value_summary else marker
 
         target_sheet = obs.get("대상시트", "") or ""
         related_sheet = sheet_key_to_name.get(target_sheet, target_sheet)

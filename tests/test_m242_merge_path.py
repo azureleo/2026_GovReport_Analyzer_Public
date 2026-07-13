@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+
 from agents.image_agent import ImageAgent
+from agents.organizer_agent import OrganizerAgent
 
 
 def test_summary_지역여건은_재추론하고_명시적_비전전략은_유지한다() -> None:
@@ -24,7 +27,7 @@ def test_summary_지역여건은_재추론하고_명시적_비전전략은_유�
     }) == "financial_plan"
 
 
-def test_summary_재추론은_관찰값_근거_끝에_판정근거를_남긴다() -> None:
+def test_summary_재추론은_근거와_대상시트근거를_분리하고_목록에_병기한다() -> None:
     agent = ImageAgent()
     results = agent._merge_image_results(
         {},
@@ -42,7 +45,13 @@ def test_summary_재추론은_관찰값_근거_끝에_판정근거를_남긴다(
 
     observation = results["chart_observations"][0]
     assert observation["대상시트"] == "regional_conditions"
-    assert observation["근거"].endswith("; 대상시트 재추론(summary)")
+    assert json.loads(observation["근거"]) == {"지표명": "인구"}
+    assert observation["대상시트근거"] == "재추론(summary)"
+
+    cleaned = OrganizerAgent().organize(results)
+    assert cleaned["visual_inventory"][0]["추출값요약"].endswith(
+        "| 대상시트 재추론(summary)"
+    )
 
 
 def test_병합_연도범위는_대상시트별로_적용한다() -> None:

@@ -726,8 +726,6 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         reason_text = "; ".join(reasons or [])
         base_evidence = json.dumps(fields, ensure_ascii=False) if fields else analysis.get("summary", "")
         evidence_text = f"{base_evidence} | {reason_text}" if reason_text else base_evidence
-        if analysis.get("target_sheet") == "summary":
-            evidence_text = f"{evidence_text}; 대상시트 재추론(summary)"
         evidence = {
             "지자체명": analysis.get("municipality", ""),
             "페이지": analysis.get("page_number"),
@@ -742,6 +740,8 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
             "반영여부": "반영" if merged else "검토",
             "근거": evidence_text,
         }
+        if analysis.get("target_sheet") == "summary":
+            evidence["대상시트근거"] = "재추론(summary)"
         text_results.setdefault("chart_observations", []).append(evidence)
 
     def _merge_image_results(self, text_results: dict, analyses: list[dict], municipality: str) -> dict:
