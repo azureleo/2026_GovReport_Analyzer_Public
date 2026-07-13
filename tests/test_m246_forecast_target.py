@@ -113,3 +113,25 @@ def test_배출전망은_시나리오_공란과_명시_모두_G5_교차일치한
         and "교차일치" in issue.get("문제내용", "")
         for issue in cleaned["validation_report"]
     )
+
+
+def test_시나리오_공란이어도_연도가_없으면_G3가_차단한다(monkeypatch) -> None:
+    # 시나리오 와일드카드가 G3 전체를 무력화하지 않음을 증명한다(명세 S4 짝 케이스).
+    # 부문은 항목·제목 폴백이 있어 누락이 실발생하지 않으므로 연도 누락으로 검증한다.
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _배출전망_관찰값(None)
+    observation.pop("연도")
+    observation["근거"] = json.dumps({"부문": "건물"}, ensure_ascii=False)
+
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "가상시",
+        "chart_observations": [observation],
+    })
+
+    assert cleaned["emissions_forecast"] == []
+    assert any(
+        issue.get("영역") == "시각병합"
+        and issue.get("항목") == "차단"
+        and "G3 1차 키 누락(연도)" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
