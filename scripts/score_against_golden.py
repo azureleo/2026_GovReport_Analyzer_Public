@@ -72,7 +72,17 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
         if golden_sheet.상태 == "형식 오류":
             skipped.append(sheet_name)
             format_errors.extend(golden_sheet.오류)
-        summary, missing_golden, missing_output, disagreements, matches, row_values, 의미완화매칭들 = 시트점수(sheet_name, golden_sheet, output_sheet)
+        (
+            summary,
+            missing_golden,
+            missing_output,
+            disagreements,
+            matches,
+            row_values,
+            의미완화매칭들,
+            _문자유사매칭들,
+            _문자유사관찰들,
+        ) = 시트점수(sheet_name, golden_sheet, output_sheet)
         sheet_results[sheet_name] = summary
         all_missing_golden.extend(missing_golden)
         all_missing_output.extend(missing_output)
