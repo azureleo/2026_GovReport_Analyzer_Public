@@ -300,6 +300,8 @@ _DATA_STATUS_PRIORITY = {
 }
 _REGIONAL_EMISSIONS_KEY_FIELDS = ["지자체명", "배출유형", "부문", "세부부문", "연도"]
 _MANAGEMENT_EMISSIONS_KEY_FIELDS = ["지자체명", "관리부문", "세부부문", "직간접구분", "연도"]
+_REDUCTION_TARGET_KEY_FIELDS = ["지자체명", "목표수준", "목표범위", "부문", "기준연도", "목표연도"]
+_REDUCTION_SCALE_FIELDS = ("기준배출량", "배출전망", "목표감축량", "목표배출량")
 _CONFIDENCE_RANK = {"low": 1, "medium": 2, "high": 3}
 _VISUAL_MERGE_KEY_FIELDS = {
     "regional_conditions": ["지자체명", "지표범주", "지표세부범주", "지표명", "연도"],
@@ -318,6 +320,7 @@ _VISUAL_MERGE_VALUE_FIELDS = {
 _BLANK_ABSORB_FIELDS_BY_KEY = {
     tuple(_REGIONAL_EMISSIONS_KEY_FIELDS): ("세부부문", "배출유형"),
     tuple(_MANAGEMENT_EMISSIONS_KEY_FIELDS): ("세부부문", "직간접구분"),
+    tuple(_REDUCTION_TARGET_KEY_FIELDS): ("기준연도",),
 }
 _VISUAL_OPTIONAL_KEY_FIELDS = {"세부부문", "지표세부범주"}
 _IPCC_GAS_NAMES = {
@@ -661,6 +664,47 @@ def _merge_missing_values(target: dict, source: dict) -> None:
             target[key] = value
 
 
+def _scale_ratio(left: Any, right: Any) -> float | None:
+    left_num = _to_float(left)
+    right_num = _to_float(right)
+    if left_num in (None, 0) or right_num in (None, 0):
+        return None
+    smaller = min(abs(left_num), abs(right_num))
+    return max(abs(left_num), abs(right_num)) / smaller if smaller else None
+
+
+def _reduction_scale_guard_kind(left: dict, right: dict) -> str | None:
+    common_fields = [
+        field for field in _REDUCTION_SCALE_FIELDS
+        if _has_cell_value(left.get(field)) and _has_cell_value(right.get(field))
+    ]
+    for field in common_fields:
+        ratio = _scale_ratio(left.get(field), right.get(field))
+        if ratio is not None and abs(ratio - 1000.0) / 1000.0 <= 0.005:
+            return "공통 필드"
+    if common_fields:
+        return None
+
+    left_values = [abs(value) for field in _REDUCTION_SCALE_FIELDS if (value := _to_float(left.get(field))) is not None]
+    right_values = [abs(value) for field in _REDUCTION_SCALE_FIELDS if (value := _to_float(right.get(field))) is not None]
+    if not left_values or not right_values:
+        return None
+    ratio = _scale_ratio(max(left_values), max(right_values))
+    return "스케일 서명" if ratio is not None and ratio >= 1000.0 else None
+
+
+def _remember_reduction_scale_warning(left: dict, right: dict, kind: str) -> None:
+    _remember_validation_issue(
+        str(left.get("지자체명") or right.get("지자체명") or ""),
+        "경고",
+        _sheet_area("reduction_targets"),
+        "스케일 표기 차 의심(톤↔천톤)",
+        f"{kind} 기준으로 06 감축목표 중복 후보의 1,000배 스케일 차이를 감지",
+        "자동 환산·교차 채움 없이 원문 단위를 수동 확인",
+        target_sheet_key="reduction_targets",
+    )
+
+
 def _source_has_table_marker(row: dict) -> bool:
     return bool(_TABLE_MARKER_RE.search(str(row.get("출처페이지", "") or "")))
 
@@ -713,6 +757,11 @@ def _absorb_blank_field_rows(rows: list[dict], key_fields: list[str], blank_fiel
         for candidate in retained:
             if not _same_except_field(blank, candidate, key_fields, blank_field):
                 continue
+            if tuple(key_fields) == tuple(_REDUCTION_TARGET_KEY_FIELDS):
+                scale_guard_kind = _reduction_scale_guard_kind(candidate, blank)
+                if scale_guard_kind is not None:
+                    _remember_reduction_scale_warning(candidate, blank, scale_guard_kind)
+                    continue
             conflicts = _row_conflicts(candidate, blank)
             if conflicts:
                 _remember_dedup_conflict(key_fields, candidate, blank, conflicts)
@@ -734,6 +783,7 @@ def _absorb_blank_key_rows(rows: list[dict], key_fields: list[str]) -> list[dict
 
 def _deduplicate_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
     seen: dict[tuple, dict] = {}
+    scale_guarded_rows: list[dict] = []
     for source_row in rows:
         row = _normalize_row_provenance(dict(source_row))
         row[_DEDUP_TABLE_MARKER_FIELD] = _source_has_table_marker(source_row)
@@ -743,6 +793,13 @@ def _deduplicate_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
             seen[key] = row
             continue
         kept = seen[key]
+        if tuple(key_fields) == tuple(_REDUCTION_TARGET_KEY_FIELDS):
+            scale_guard_kind = _reduction_scale_guard_kind(kept, row)
+            if scale_guard_kind is not None:
+                _remember_reduction_scale_warning(kept, row, scale_guard_kind)
+                if scale_guard_kind == "스케일 서명":
+                    scale_guarded_rows.append(row)
+                continue
         conflicts = _row_conflicts(kept, row)
         if conflicts:
             winner, loser, reason = _choose_conflict_row(kept, row)
@@ -751,7 +808,8 @@ def _deduplicate_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
             _merge_missing_values(winner, loser)
             continue
         _merge_missing_values(kept, row)
-    return _strip_dedup_internal_fields(_absorb_blank_key_rows(list(seen.values()), key_fields))
+    deduped = _absorb_blank_key_rows([*seen.values(), *scale_guarded_rows], key_fields)
+    return _strip_dedup_internal_fields(deduped)
 
 
 def _filter_empty_rows(rows: list[dict], required_fields: list[str]) -> list[dict]:
@@ -861,7 +919,7 @@ def _clean_reduction_targets(rows: list[dict], municipality: str) -> list[dict]:
         row["목표감축량"] = _to_float(row.get("목표감축량"))
         row["목표배출량"] = _to_float(row.get("목표배출량"))
         row["감축률"] = _to_float(row.get("감축률"))
-    return _deduplicate_rows(rows, ["지자체명", "목표수준", "목표범위", "부문", "목표연도"])
+    return _deduplicate_rows(rows, _REDUCTION_TARGET_KEY_FIELDS)
 
 
 def _clean_vision_strategy(rows: list[dict], municipality: str) -> list[dict]:
