@@ -165,3 +165,29 @@ def test_S6_시트03은_잡음제거후_가스명과_다르면_허용한다(monk
     })
 
     assert len(cleaned["emissions_regional"]) == 1
+
+
+def test_S7_IPCC_단독_대분류코드는_기존처럼_정규화한다() -> None:
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "테스트시",
+        "emissions_regional": [{
+            "배출유형": "직접배출", "부문": "1 에너지", "연도": 2020, "배출량": 10
+        }],
+    })
+
+    row = cleaned["emissions_regional"][0]
+    assert row["부문"] == "에너지"
+    assert row["세부부문"] == "1 에너지"
+
+
+def test_S7_연도는_IPCC_부문코드로_오인하지_않는다() -> None:
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "테스트시",
+        "emissions_regional": [{
+            "배출유형": "직접배출", "부문": "2018 에너지", "연도": 2020, "배출량": 10
+        }],
+    })
+
+    row = cleaned["emissions_regional"][0]
+    assert row["부문"] == "2018 에너지"
+    assert row.get("부문원문") is None
