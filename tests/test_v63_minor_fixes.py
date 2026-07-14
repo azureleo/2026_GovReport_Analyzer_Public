@@ -222,6 +222,8 @@ def test_S8_시트03은_문서메타_연도가_없으면_현행_범위를_유지
 
     assert [row["연도"] for row in cleaned["emissions_regional"]] == [2033]
     assert not any(issue["항목"] == "검토 강등" for issue in cleaned["validation_report"])
+
+
 def test_S8_연도상한은_기존_신뢰도_차단을_우선순위에서_바꾸지_않는다(monkeypatch) -> None:
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True)
     observation = _시트03_관찰값(item="에너지", year=2033)
@@ -234,3 +236,48 @@ def test_S8_연도상한은_기존_신뢰도_차단을_우선순위에서_바꾸
 
     assert any("G2 신뢰도 기준 미달" in issue["문제내용"] for issue in cleaned["validation_report"])
     assert not any(issue["항목"] == "검토 강등" for issue in cleaned["validation_report"])
+
+
+def _시트02_관찰값(indicator_name: str) -> dict:
+    return {
+        "지자체명": "테스트시",
+        "페이지": 20,
+        "대상시트": "regional_conditions",
+        "제목": "최종에너지소비",
+        "항목": indicator_name,
+        "단위": "TJ",
+        "연도": 2020,
+        "값": 100,
+        "신뢰도": "high",
+        "반영여부": "검토",
+        "근거": json.dumps({
+            "지표범주": "에너지", "지표명": indicator_name, "연도": 2020
+        }, ensure_ascii=False),
+    }
+
+
+def test_S9_시각병합키는_밑줄과_공백을_동치로_접는다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True)
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "테스트시",
+        "chart_observations": [
+            _시트02_관찰값("석탄_최종에너지소비"),
+            _시트02_관찰값("석탄 최종에너지소비"),
+        ],
+    })
+
+    assert len(cleaned["regional_conditions"]) == 1
+    assert cleaned["regional_conditions"][0]["지표명"] == "석탄_최종에너지소비"
+    assert any("동일 키 시각 행 존재" in issue["문제내용"] for issue in cleaned["validation_report"])
+
+
+def test_S9_텍스트_dedup키는_밑줄을_기존처럼_보존한다() -> None:
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "테스트시",
+        "regional_conditions": [
+            {"지표범주": "에너지", "지표명": "석탄_최종에너지소비", "연도": 2020, "값": 100},
+            {"지표범주": "에너지", "지표명": "석탄 최종에너지소비", "연도": 2020, "값": 100},
+        ],
+    })
+
+    assert len(cleaned["regional_conditions"]) == 2

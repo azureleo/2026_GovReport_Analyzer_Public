@@ -393,6 +393,11 @@ def _dedup_key_text(val: Any) -> str:
     return normalise_key_text(val).replace(" ", "")
 
 
+def _visual_key_text(val: Any) -> str:
+    """시각 병합 키에서만 밑줄과 공백 표기를 같은 값으로 접는다."""
+    return _dedup_key_text(val).replace("_", "")
+
+
 def _gas_sector_key(value: Any) -> str:
     text = normalise_key_text(value)
     tokens = text.split()
@@ -1339,8 +1344,8 @@ def _clean_visual_candidate(sheet_key: str, row: dict, municipality: str) -> dic
 
 def _visual_keys_match(left: dict, right: dict, key_fields: list[str]) -> bool:
     for field in key_fields:
-        left_value = _dedup_key_text(left.get(field))
-        right_value = _dedup_key_text(right.get(field))
+        left_value = _visual_key_text(left.get(field))
+        right_value = _visual_key_text(right.get(field))
         if field in _VISUAL_OPTIONAL_KEY_FIELDS and (not left_value or not right_value):
             continue
         if left_value != right_value:
