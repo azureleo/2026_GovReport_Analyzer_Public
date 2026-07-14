@@ -46,7 +46,15 @@ def _세부부문완화후보허용(sheet_name: str, golden_row: Any, output_row
         return True
     golden_subsector = dedup_key_text(golden_row.값.get("세부부문"))
     output_subsector = dedup_key_text(output_row.값.get("세부부문"))
-    return not golden_subsector or not output_subsector or golden_subsector == output_subsector
+    if not golden_subsector or not output_subsector or golden_subsector == output_subsector:
+        return True
+    golden_value = golden_row.값.get("배출량")
+    output_value = output_row.값.get("배출량")
+    return (
+        값있음(golden_value)
+        and 값있음(output_value)
+        and _상대오차일치(golden_value, output_value)
+    )
 
 
 def _지표토큰(row: Any) -> set[str]:
