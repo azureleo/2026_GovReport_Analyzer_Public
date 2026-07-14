@@ -766,10 +766,7 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
                     fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
                     merged_item = {**fields, **item}
                     can_merge, final_confidence, merge_reasons = self._chart_merge_decision(analysis, item, target_sheet)
-                    auto_merge = can_merge and target_sheet not in {
-                        "emissions_forecast",
-                        "reduction_targets",
-                    }
+                    auto_merge = can_merge and target_sheet != "reduction_targets"
                     self._append_chart_observation(
                         text_results, analysis, item, target_sheet,
                         auto_merge, final_confidence, merge_reasons
