@@ -3,7 +3,8 @@
 import json
 
 import config
-from agents.organizer_agent import OrganizerAgent
+import pytest
+from agents.organizer_agent import OrganizerAgent, normalize_direct_indirect_type
 
 
 def _감축목표행(**overrides):
@@ -129,3 +130,38 @@ def test_S4_시트03은_항목이_있으면_기존처럼_부문으로_병합한�
 
     assert len(cleaned["emissions_regional"]) == 1
     assert cleaned["emissions_regional"][0]["부문"] == "에너지"
+
+
+def test_S5_직간접구분의_흡수와_복합배출_표기를_정규화한다() -> None:
+    assert normalize_direct_indirect_type("sink") == "흡수"
+    assert normalize_direct_indirect_type("absorption") == "흡수"
+    assert normalize_direct_indirect_type("DIRECT+INDIRECT") == "직접+간접"
+    assert normalize_direct_indirect_type("Direct + Indirect Emissions") == "직접+간접"
+
+
+@pytest.mark.parametrize("sector", ["총 메탄 배출량", "메탄"])
+def test_S6_시트03은_잡음토큰_제거후_가스명과_전체일치하면_차단한다(
+    monkeypatch, sector: str
+) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True)
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "테스트시",
+        "chart_observations": [_시트03_관찰값(item=sector)],
+    })
+
+    assert cleaned["emissions_regional"] == []
+    assert any(
+        "G3 부문에 가스종(스키마 불일치)" in issue["문제내용"]
+        for issue in cleaned["validation_report"]
+    )
+
+
+@pytest.mark.parametrize("sector", ["메탄가스화시설", "에너지"])
+def test_S6_시트03은_잡음제거후_가스명과_다르면_허용한다(monkeypatch, sector: str) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True)
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "테스트시",
+        "chart_observations": [_시트03_관찰값(item=sector)],
+    })
+
+    assert len(cleaned["emissions_regional"]) == 1

@@ -274,11 +274,11 @@ def test_시각_라벨병합은_03_04_부문의_IPCC_가스명을_차단한다(
     )
 
 
-@pytest.mark.parametrize("sector", ["에너지", "기타", "이산화탄소 배출"])
+@pytest.mark.parametrize("sector", ["에너지", "기타", "메탄가스화시설"])
 def test_시각_라벨병합은_IPCC_가스명과_전체일치하지_않는_부문을_허용한다(
     monkeypatch, sector: str
 ) -> None:
-    # Given: 03 부문이 일반 부문이거나 가스명이 더 긴 문구의 일부일 뿐이면
+    # Given: 03 부문이 일반 부문이거나 잡음 제거 뒤에도 가스명과 전체일치하지 않으면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
     observation = _시각_관찰값(
         "emissions_regional",

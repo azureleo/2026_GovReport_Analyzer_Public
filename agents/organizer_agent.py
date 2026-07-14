@@ -60,6 +60,12 @@ _DIRECT_INDIRECT_TYPE_MAP = {
     "직접배출": "직접",
     "indirect": "간접",
     "간접배출": "간접",
+    "sink": "흡수",
+    "absorption": "흡수",
+    "direct+indirect": "직접+간접",
+    "direct+indirect emissions": "직접+간접",
+    "direct + indirect": "직접+간접",
+    "direct + indirect emissions": "직접+간접",
 }
 
 # 달성여부 정규화
@@ -327,6 +333,7 @@ _IPCC_GAS_NAMES = {
     "이산화탄소", "메탄", "아산화질소", "수소불화탄소", "과불화탄소", "육불화황",
     "CO2", "CH4", "N2O", "HFCs", "PFCs", "SF6",
 }
+_GAS_SECTOR_NOISE_TOKENS = {"총", "배출량", "흡수량", "배출", "부문"}
 
 
 def _normalize_provenance_pages(value: Any) -> str:
@@ -384,6 +391,31 @@ def _row_source_pages(row: dict) -> set[int]:
 def _dedup_key_text(val: Any) -> str:
     """dedup 키 생성 전용 텍스트 정규화. 원본 셀 값은 바꾸지 않는다."""
     return normalise_key_text(val).replace(" ", "")
+
+
+def _gas_sector_key(value: Any) -> str:
+    text = normalise_key_text(value)
+    tokens = text.split()
+    while tokens and tokens[0] in _GAS_SECTOR_NOISE_TOKENS:
+        tokens.pop(0)
+    while tokens and tokens[-1] in _GAS_SECTOR_NOISE_TOKENS:
+        tokens.pop()
+    compact = "".join(tokens)
+    noise_by_length = sorted(_GAS_SECTOR_NOISE_TOKENS, key=len, reverse=True)
+    changed = True
+    while compact and changed:
+        changed = False
+        for noise in noise_by_length:
+            if compact.startswith(noise):
+                compact = compact[len(noise):]
+                changed = True
+                break
+        for noise in noise_by_length:
+            if compact.endswith(noise):
+                compact = compact[:-len(noise)]
+                changed = True
+                break
+    return compact
 
 
 def _normalize_project_id(value: Any) -> str:
@@ -1400,7 +1432,7 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
                     blockers.append("G3 비교값 단위 부적합(%)")
                 sector_field = "부문" if sheet_key == "emissions_regional" else "관리부문"
                 gas_names = {_dedup_key_text(name) for name in _IPCC_GAS_NAMES}
-                if _dedup_key_text(raw_candidate.get(sector_field)) in gas_names:
+                if _gas_sector_key(raw_candidate.get(sector_field)) in gas_names:
                     blockers.append("G3 부문에 가스종(스키마 불일치)")
             if not raw_missing and _has_cell_value(raw_candidate.get(value_field)):
                 candidate = _clean_visual_candidate(sheet_key, raw_candidate, municipality)
