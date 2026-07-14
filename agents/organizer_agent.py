@@ -1163,7 +1163,8 @@ def _infer_indicator_category(text: str) -> str | None:
 def _visual_candidate_row(sheet_key: str, observation: dict, fields: dict, municipality: str) -> dict | None:
     page = observation.get("페이지")
     title = str(observation.get("제목", "") or "").strip()
-    item = str(_visual_explicit_value(observation, fields, "항목") or title).strip()
+    explicit_item = str(_visual_explicit_value(observation, fields, "항목") or "").strip()
+    item = explicit_item or title
     unit = _visual_explicit_value(observation, fields, "단위") or ""
     year = _visual_explicit_value(observation, fields, "연도")
     value_field = _VISUAL_MERGE_VALUE_FIELDS.get(sheet_key)
@@ -1211,7 +1212,7 @@ def _visual_candidate_row(sheet_key: str, observation: dict, fields: dict, munic
             "인벤토리출처": "이미지",
             "배출범위": _visual_explicit_value(observation, fields, "배출범위") or emission_type,
             "배출유형": emission_type,
-            "부문": _visual_explicit_value(observation, fields, "부문") or item,
+            "부문": _visual_explicit_value(observation, fields, "부문") or explicit_item,
             "세부부문": _visual_explicit_value(observation, fields, "세부부문") or "",
             "연도": year,
             "배출량": value,
@@ -1221,7 +1222,7 @@ def _visual_candidate_row(sheet_key: str, observation: dict, fields: dict, munic
     if sheet_key == "emissions_management":
         return base | {
             "인벤토리출처": "이미지",
-            "관리부문": _visual_explicit_value(observation, fields, "관리부문", "부문") or item,
+            "관리부문": _visual_explicit_value(observation, fields, "관리부문", "부문") or explicit_item,
             "세부부문": _visual_explicit_value(observation, fields, "세부부문") or "",
             "직간접구분": _visual_explicit_value(observation, fields, "직간접구분") or "",
             "연도": year,
@@ -1234,7 +1235,7 @@ def _visual_candidate_row(sheet_key: str, observation: dict, fields: dict, munic
             "시나리오": _visual_explicit_value(observation, fields, "시나리오"),
             "전망방법코드": _visual_explicit_value(observation, fields, "전망방법코드") or "",
             "전망방법원문": _visual_explicit_value(observation, fields, "전망방법원문") or "",
-            "부문": _visual_explicit_value(observation, fields, "부문") or item,
+            "부문": _visual_explicit_value(observation, fields, "부문") or explicit_item,
             "세부부문": _visual_explicit_value(observation, fields, "세부부문") or "",
             "연도": year,
             "전망값": value,

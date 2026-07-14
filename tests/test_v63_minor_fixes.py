@@ -1,5 +1,8 @@
 """소수정 v6.3 결정론 회귀 테스트."""
 
+import json
+
+import config
 from agents.organizer_agent import OrganizerAgent
 
 
@@ -86,3 +89,43 @@ def test_S1_감축목표의_일반_수치충돌은_기존_충돌경로를_유지
     assert len(cleaned["reduction_targets"]) == 1
     assert cleaned["reduction_targets"][0]["데이터상태"] == "conflicting"
     assert any("중복 키 값 충돌" in issue["항목"] for issue in cleaned["validation_report"])
+
+
+def _시트03_관찰값(*, item: str | None) -> dict:
+    observation = {
+        "지자체명": "테스트시",
+        "페이지": 10,
+        "대상시트": "emissions_regional",
+        "제목": "에너지 배출량 현황",
+        "단위": "천톤CO2eq",
+        "연도": 2020,
+        "값": 100,
+        "신뢰도": "high",
+        "반영여부": "검토",
+        "근거": json.dumps({"배출유형": "직접배출", "연도": 2020}, ensure_ascii=False),
+    }
+    if item is not None:
+        observation["항목"] = item
+    return observation
+
+
+def test_S4_시트03은_항목이_없으면_차트제목을_부문으로_쓰지_않는다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True)
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "테스트시",
+        "chart_observations": [_시트03_관찰값(item=None)],
+    })
+
+    assert cleaned["emissions_regional"] == []
+    assert any("G3 1차 키 누락(부문)" in issue["문제내용"] for issue in cleaned["validation_report"])
+
+
+def test_S4_시트03은_항목이_있으면_기존처럼_부문으로_병합한다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True)
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "테스트시",
+        "chart_observations": [_시트03_관찰값(item="에너지")],
+    })
+
+    assert len(cleaned["emissions_regional"]) == 1
+    assert cleaned["emissions_regional"][0]["부문"] == "에너지"
