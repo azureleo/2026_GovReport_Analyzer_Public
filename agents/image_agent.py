@@ -13,6 +13,7 @@ import json
 import re
 
 import config
+from agents.organizer_agent import _IPCC_GAS_NAMES, _gas_sector_key
 from utils.pdf_reader import PageContent
 from utils import llm_client
 from utils.parallel import parallel_map_collect
@@ -766,6 +767,19 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
                     fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
                     merged_item = {**fields, **item}
                     can_merge, final_confidence, merge_reasons = self._chart_merge_decision(analysis, item, target_sheet)
+                    if can_merge and target_sheet in {"emissions_regional", "emissions_management"}:
+                        if target_sheet == "emissions_regional":
+                            sector = merged_item.get("부문") or merged_item.get("항목")
+                        else:
+                            sector = (
+                                merged_item.get("관리부문")
+                                or merged_item.get("부문")
+                                or merged_item.get("항목")
+                            )
+                        gas_sector_keys = {_gas_sector_key(name) for name in _IPCC_GAS_NAMES}
+                        if _gas_sector_key(sector) in gas_sector_keys:
+                            can_merge = False
+                            merge_reasons = [*merge_reasons, "G3 부문에 가스종(스키마 불일치)"]
                     auto_merge = can_merge and target_sheet != "reduction_targets"
                     self._append_chart_observation(
                         text_results, analysis, item, target_sheet,

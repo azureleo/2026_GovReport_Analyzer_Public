@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 import config
 from agents.image_agent import ImageAgent
 from agents.organizer_agent import OrganizerAgent
@@ -25,6 +27,27 @@ def _chart_analysis(target_sheet: str, fields: dict) -> dict:
             "값": 100.0,
             "단위": "천톤CO2eq",
             "fields": fields,
+        }],
+    }
+
+
+def _배출현황_표분석(target_sheet: str, sector: str) -> dict:
+    sector_field = "부문" if target_sheet == "emissions_regional" else "관리부문"
+    return {
+        "type": "chart_table",
+        "target_sheet": target_sheet,
+        "chart_type": "표",
+        "title": "온실가스 배출 현황",
+        "unit": "천톤CO2eq",
+        "page_number": 10,
+        "municipality": "가상시",
+        "confidence": "high",
+        "table": [{
+            "연도": 2018,
+            "항목": sector,
+            "값": 100.0,
+            "단위": "천톤CO2eq",
+            "fields": {sector_field: sector},
         }],
     }
 
@@ -72,6 +95,29 @@ def test_regional_conditions_chart_rows는_기존대로_자동_반영한다() ->
 
     assert len(merged["regional_conditions"]) == 1
     assert merged["regional_conditions"][0]["값"] == 100.0
+    assert merged["chart_observations"][0]["반영여부"] == "반영"
+
+
+@pytest.mark.parametrize("target_sheet", ["emissions_regional", "emissions_management"])
+def test_V2_시트03_04_가스종_부문은_자동반영하지_않고_관찰값으로_남긴다(
+    target_sheet: str,
+) -> None:
+    analysis = _배출현황_표분석(target_sheet, "총 메탄 배출량")
+
+    merged = ImageAgent()._merge_image_results({}, [analysis], "가상시")
+
+    assert merged["emissions_regional"] == []
+    assert merged["chart_observations"][0]["대상시트"] == target_sheet
+    assert merged["chart_observations"][0]["반영여부"] == "검토"
+    assert "G3 부문에 가스종(스키마 불일치)" in merged["chart_observations"][0]["근거"]
+
+
+def test_V2_시트03_에너지_부문은_기존대로_자동반영한다() -> None:
+    analysis = _배출현황_표분석("emissions_regional", "에너지")
+
+    merged = ImageAgent()._merge_image_results({}, [analysis], "가상시")
+
+    assert merged["emissions_regional"][0]["부문"] == "에너지"
     assert merged["chart_observations"][0]["반영여부"] == "반영"
 
 
