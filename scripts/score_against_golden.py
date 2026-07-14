@@ -63,6 +63,7 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
     전체의미완화매칭 = []
     전체문자유사매칭 = []
     전체문자유사관찰 = []
+    전체스케일동치: list[dict[str, Any]] = []
 
     for sheet_name in 데이터시트:
         golden_sheet = golden_sheets[sheet_name]
@@ -85,6 +86,7 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
             의미완화매칭들,
             문자유사매칭들,
             문자유사관찰들,
+            스케일동치쌍들,
         ) = 시트점수(sheet_name, golden_sheet, output_sheet)
         sheet_results[sheet_name] = summary
         all_missing_golden.extend(missing_golden)
@@ -93,6 +95,7 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
         전체의미완화매칭.extend(의미완화매칭들)
         전체문자유사매칭.extend(문자유사매칭들)
         전체문자유사관찰.extend(문자유사관찰들)
+        전체스케일동치.extend(스케일동치쌍들)
         if golden_sheet.상태 == "정상" and sheet_name != "00_문서메타":
             출처집계반영(all_source, golden_sheet.행들, matches, row_values)
             if sheet_name in 수치시트:
@@ -173,6 +176,8 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
             }
             for match in 전체문자유사관찰
         ],
+        "스케일동치쌍수": len(전체스케일동치),
+        "스케일동치쌍": 전체스케일동치,
     }
     md_path = report_base / f"golden_score_{label_value}.md"
     md_path.write_text(마크다운(result), encoding="utf-8")

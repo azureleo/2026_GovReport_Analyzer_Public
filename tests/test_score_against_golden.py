@@ -174,6 +174,41 @@ def test_수치_허용오차와_불일치_상세를_구분한다(tmp_path: Path)
     assert len(result["값불일치상세"]) == 1
     assert result["값불일치상세"][0]["필드"] == "배출량"
 
+
+def test_S2_시트06의_천배_값은_헤드라인을_유지하고_스케일동치로_병기한다(tmp_path: Path) -> None:
+    key = {"목표수준": "총괄", "목표범위": "지역전체", "부문": "합계", "목표연도": 2030}
+    result = _점수(
+        tmp_path,
+        {"06_감축목표": [key | {"기준배출량": 52_342_000}]},
+        {"06_감축목표": [key | {"기준배출량": 52_342, "골든_출처유형": "텍스트표"}]},
+    )
+
+    sheet = result["시트별"]["06_감축목표"]
+    assert sheet["값일치율"] == 0.0
+    assert sheet["값일치율(스케일동치 포함)"] == 1.0
+    assert sheet["스케일동치쌍수"] == 1
+    assert result["스케일동치쌍수"] == 1
+    assert result["스케일동치쌍"][0]["배율"] == 1000
+    assert len(result["값불일치상세"]) == 1
+    report = Path(result["리포트"]["md"]).read_text(encoding="utf-8")
+    assert "## 스케일동치 값 쌍" in report
+    assert "골든=52342 / 출력=52342000 (배율=1000)" in report
+
+
+def test_S2_시트06의_천배가_아닌_값은_기존_불일치로만_남는다(tmp_path: Path) -> None:
+    key = {"목표수준": "총괄", "목표범위": "지역전체", "부문": "합계", "목표연도": 2030}
+    result = _점수(
+        tmp_path,
+        {"06_감축목표": [key | {"목표배출량": 120_000}]},
+        {"06_감축목표": [key | {"목표배출량": 100, "골든_출처유형": "텍스트표"}]},
+    )
+
+    sheet = result["시트별"]["06_감축목표"]
+    assert sheet["값일치율"] == 0.0
+    assert sheet["값일치율(스케일동치 포함)"] == 0.0
+    assert sheet["스케일동치쌍수"] == 0
+    assert result["스케일동치쌍"] == []
+
 def test_출처유형_분해와_채점제외를_반영한다(tmp_path: Path) -> None:
     result = _점수(
         tmp_path,

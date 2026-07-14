@@ -254,6 +254,18 @@ def _상대오차일치(left: Any, right: Any) -> bool:
     return abs(left_num - right_num) / scale <= 0.005
 
 
+def _스케일동치배율(left: Any, right: Any) -> int | None:
+    left_num = to_float(left)
+    right_num = to_float(right)
+    if left_num in (None, 0) or right_num in (None, 0):
+        return None
+    ratio = max(abs(left_num), abs(right_num)) / min(abs(left_num), abs(right_num))
+    for multiplier in (10**3, 10**6):
+        if abs(ratio - multiplier) / multiplier <= 0.005:
+            return multiplier
+    return None
+
+
 def _다중값집합(value: Any) -> set[str]:
     text = "" if value is None else str(value).strip()
     if not text:
@@ -270,13 +282,16 @@ def _필드일치(field_name: str, golden_value: Any, output_value: Any) -> bool
     return _상대오차일치(golden_value, output_value)
 
 
-def 값비교(sheet_name: str, matches: list[매칭]) -> tuple[값집계, list[dict[str, Any]], dict[int, 값집계]]:
+def 값비교(
+    sheet_name: str, matches: list[매칭]
+) -> tuple[값집계, list[dict[str, Any]], dict[int, 값집계], list[dict[str, Any]]]:
     fields = 값필드.get(sheet_name, [])
     if sheet_name == "00_문서메타":
         fields = [field for field in 계약헤더(sheet_name) if field != "지자체명"]
     total = 값집계()
     by_row: dict[int, 값집계] = {}
     disagreements: list[dict[str, Any]] = []
+    scale_equivalents: list[dict[str, Any]] = []
     for match in matches:
         row_stats = 값집계()
         for field_name in fields:
@@ -301,8 +316,21 @@ def 값비교(sheet_name: str, matches: list[매칭]) -> tuple[값집계, list[d
                 row_stats.일치 += 1
             else:
                 disagreements.append({"시트": sheet_name, "키": match.키, "필드": field_name, "골든값": golden_value, "출력값": output_value, "매칭방식": match.방식})
+                if sheet_name == "06_감축목표" and field_name in {
+                    "기준배출량", "배출전망", "목표감축량", "목표배출량"
+                }:
+                    multiplier = _스케일동치배율(golden_value, output_value)
+                    if multiplier is not None:
+                        scale_equivalents.append({
+                            "시트": sheet_name,
+                            "키": match.키,
+                            "필드": field_name,
+                            "골든값": golden_value,
+                            "출력값": output_value,
+                            "배율": multiplier,
+                        })
         by_row[match.골든.번호] = row_stats
-    return total, disagreements, by_row
+    return total, disagreements, by_row, scale_equivalents
 
 
 def 출처집계초기화() -> dict[str, 출처집계]:
@@ -366,9 +394,9 @@ def 문자유사포함출처직렬화(
     return {"시각 유래": row}
 
 
-def 시트점수(sheet_name: str, golden: 시트자료, output: 시트자료) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[매칭], dict[int, 값집계], list[매칭], list[매칭], list[매칭]]:
+def 시트점수(sheet_name: str, golden: 시트자료, output: 시트자료) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[매칭], dict[int, 값집계], list[매칭], list[매칭], list[매칭], list[dict[str, Any]]]:
     if golden.상태 != "정상":
-        return ({"상태": golden.상태, "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "값일치율": None, "골든만있는값": 0, "출력만있는값": 0, "의미완화매칭수": 0, "문자유사매칭수": 0}, [], [], [], [], {}, [], [], [])
+        return ({"상태": golden.상태, "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "값일치율": None, "값일치율(스케일동치 포함)": None, "스케일동치쌍수": 0, "골든만있는값": 0, "출력만있는값": 0, "의미완화매칭수": 0, "문자유사매칭수": 0}, [], [], [], [], {}, [], [], [], [])
     if sheet_name == "00_문서메타":
         if golden.행들 and output.행들:
             matches = [매칭(golden.행들[0], output.행들[0], "엄격", "문서메타")]
@@ -393,14 +421,18 @@ def 시트점수(sheet_name: str, golden: 시트자료, output: 시트자료) ->
             문자유사매칭들,
             문자유사관찰들,
         ) = 매칭하기(golden.행들, output.행들, sheet_name)
-    value_stats, disagreements, row_values = 값비교(sheet_name, matches)
+    value_stats, disagreements, row_values, scale_equivalents = 값비교(sheet_name, matches)
     recall = round(len(matches) / len(golden.행들), 4) if golden.행들 else None
     precision = round(len(matches) / len(output.행들), 4) if output.행들 else None
     missing_golden = [{"시트": sheet_name, "행번호": golden.행들[idx].번호, "키": 키(golden.행들[idx], sheet_name, False) or 키(golden.행들[idx], sheet_name, True) or "", "골든_출처유형": golden.행들[idx].출처유형, "골든_출처페이지": golden.행들[idx].출처페이지} for idx in sorted(remaining_golden)]
     missing_output = [{"시트": sheet_name, "행번호": output.행들[idx].번호, "키": 키(output.행들[idx], sheet_name, False) or 키(output.행들[idx], sheet_name, True) or ""} for idx in sorted(remaining_output)]
-    summary = {"상태": "정상", "골든행수": len(golden.행들), "출력행수": len(output.행들), "매칭수": len(matches), "엄격매칭수": sum(1 for match in matches if match.방식 == "엄격"), "완화매칭수": sum(1 for match in matches if match.방식 == "완화"), "리콜": recall, "정밀도": precision, "값일치율": value_stats.비율(), "골든만있는값": value_stats.골든만, "출력만있는값": value_stats.출력만, "의미완화매칭수": len(의미완화매칭들), "문자유사매칭수": len(문자유사매칭들)}
-    return summary, missing_golden, missing_output, disagreements, matches, row_values, 의미완화매칭들, 문자유사매칭들, 문자유사관찰들
+    inclusive_value_rate = (
+        round((value_stats.일치 + len(scale_equivalents)) / value_stats.전체, 4)
+        if value_stats.전체 else None
+    )
+    summary = {"상태": "정상", "골든행수": len(golden.행들), "출력행수": len(output.행들), "매칭수": len(matches), "엄격매칭수": sum(1 for match in matches if match.방식 == "엄격"), "완화매칭수": sum(1 for match in matches if match.방식 == "완화"), "리콜": recall, "정밀도": precision, "값일치율": value_stats.비율(), "값일치율(스케일동치 포함)": inclusive_value_rate, "스케일동치쌍수": len(scale_equivalents), "골든만있는값": value_stats.골든만, "출력만있는값": value_stats.출력만, "의미완화매칭수": len(의미완화매칭들), "문자유사매칭수": len(문자유사매칭들)}
+    return summary, missing_golden, missing_output, disagreements, matches, row_values, 의미완화매칭들, 문자유사매칭들, 문자유사관찰들, scale_equivalents
 
 
 def 없는골든요약(output: 시트자료) -> dict[str, Any]:
-    return {"상태": "골든 없음", "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "값일치율": None, "골든만있는값": 0, "출력만있는값": 0, "의미완화매칭수": 0, "문자유사매칭수": 0}
+    return {"상태": "골든 없음", "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "값일치율": None, "값일치율(스케일동치 포함)": None, "스케일동치쌍수": 0, "골든만있는값": 0, "출력만있는값": 0, "의미완화매칭수": 0, "문자유사매칭수": 0}
