@@ -85,7 +85,7 @@ def _감축목표_관찰값(value_role: str, value: float = 100.0) -> dict:
     }
 
 
-def test_목표감축량_역할은_해당_컬럼에_배치하고_비교값_누락으로_차단한다(monkeypatch) -> None:
+def test_목표감축량_역할은_후보_컬럼에_배치하되_라벨_경로는_미지원으로_차단한다(monkeypatch) -> None:
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
     observation = _감축목표_관찰값("목표감축량")
     fields = json.loads(observation["근거"])
@@ -104,24 +104,30 @@ def test_목표감축량_역할은_해당_컬럼에_배치하고_비교값_누�
     assert any(
         issue.get("영역") == "시각병합"
         and issue.get("항목") == "차단"
-        and "G3 비교값 누락(목표배출량)" in issue.get("문제내용", "")
+        and "G3 대상 시트 미지원" in issue.get("문제내용", "")
         for issue in cleaned["validation_report"]
     )
 
 
-def test_목표배출량_역할은_기존_병합_경로로_반영한다(monkeypatch) -> None:
+def test_목표배출량_역할도_후보_컬럼에_배치하되_라벨_경로는_미지원으로_차단한다(monkeypatch) -> None:
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    observation = _감축목표_관찰값("목표배출량")
+    fields = json.loads(observation["근거"])
+
+    candidate = _visual_candidate_row("reduction_targets", observation, fields, "가상시")
 
     cleaned = OrganizerAgent().organize({
         "municipality_name": "가상시",
-        "chart_observations": [_감축목표_관찰값("목표배출량")],
+        "chart_observations": [observation],
     })
 
-    assert len(cleaned["reduction_targets"]) == 1
-    row = cleaned["reduction_targets"][0]
-    assert row["목표배출량"] == 100.0
-    assert row.get("목표감축량") is None
+    assert candidate is not None
+    assert candidate["목표배출량"] == 100.0
+    assert candidate.get("목표감축량") is None
+    assert cleaned["reduction_targets"] == []
     assert any(
-        issue.get("영역") == "시각병합" and issue.get("항목") == "병합"
+        issue.get("영역") == "시각병합"
+        and issue.get("항목") == "차단"
+        and "G3 대상 시트 미지원" in issue.get("문제내용", "")
         for issue in cleaned["validation_report"]
     )

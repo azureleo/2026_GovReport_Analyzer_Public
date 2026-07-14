@@ -305,8 +305,6 @@ _VISUAL_MERGE_KEY_FIELDS = {
     "regional_conditions": ["지자체명", "지표범주", "지표세부범주", "지표명", "연도"],
     "emissions_regional": _REGIONAL_EMISSIONS_KEY_FIELDS,
     "emissions_management": _MANAGEMENT_EMISSIONS_KEY_FIELDS,
-    "emissions_forecast": ["지자체명", "시나리오", "부문", "연도"],
-    "reduction_targets": ["지자체명", "목표수준", "목표범위", "부문", "목표연도"],
     "financial_plan": ["지자체명", "계획구분", "부문", "사업명", "재원구분", "연도"],
 }
 _VISUAL_MERGE_VALUE_FIELDS = {
@@ -321,7 +319,7 @@ _BLANK_ABSORB_FIELDS_BY_KEY = {
     tuple(_REGIONAL_EMISSIONS_KEY_FIELDS): ("세부부문", "배출유형"),
     tuple(_MANAGEMENT_EMISSIONS_KEY_FIELDS): ("세부부문", "직간접구분"),
 }
-_VISUAL_OPTIONAL_KEY_FIELDS = {"세부부문", "지표세부범주", "시나리오"}
+_VISUAL_OPTIONAL_KEY_FIELDS = {"세부부문", "지표세부범주"}
 _IPCC_GAS_NAMES = {
     "이산화탄소", "메탄", "아산화질소", "수소불화탄소", "과불화탄소", "육불화황",
     "CO2", "CH4", "N2O", "HFCs", "PFCs", "SF6",

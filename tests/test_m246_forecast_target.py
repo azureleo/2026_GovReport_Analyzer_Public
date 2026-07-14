@@ -65,7 +65,7 @@ def _배출전망_관찰값(scenario: str | None) -> dict:
     }
 
 
-def test_시나리오_공란_배출전망은_G3를_통과해_시각행으로_병합한다(monkeypatch) -> None:
+def test_시나리오_공란_배출전망은_G3_대상시트_미지원으로_차단한다(monkeypatch) -> None:
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
 
     cleaned = OrganizerAgent().organize({
@@ -73,19 +73,18 @@ def test_시나리오_공란_배출전망은_G3를_통과해_시각행으로_병
         "chart_observations": [_배출전망_관찰값(None)],
     })
 
-    assert len(cleaned["emissions_forecast"]) == 1
-    assert cleaned["emissions_forecast"][0]["데이터상태"] == "visual_only"
-    assert not cleaned["emissions_forecast"][0].get("시나리오")
+    assert cleaned["emissions_forecast"] == []
     assert any(
         issue.get("영역") == "시각병합"
-        and issue.get("항목") == "병합"
+        and issue.get("항목") == "차단"
         and issue.get("대상시트키") == "emissions_forecast"
+        and "G3 대상 시트 미지원" in issue.get("문제내용", "")
         for issue in cleaned["validation_report"]
     )
 
 
 @pytest.mark.parametrize("scenario", [None, "BAU"])
-def test_배출전망은_시나리오_공란과_명시_모두_G5_교차일치한다(
+def test_배출전망은_시나리오_유무와_무관하게_G3_대상시트_미지원으로_차단한다(
     monkeypatch,
     scenario: str | None,
 ) -> None:
@@ -109,15 +108,13 @@ def test_배출전망은_시나리오_공란과_명시_모두_G5_교차일치한
     assert cleaned["emissions_forecast"][0]["데이터상태"] != "visual_only"
     assert any(
         issue.get("영역") == "시각병합"
-        and issue.get("항목") == "생략"
-        and "교차일치" in issue.get("문제내용", "")
+        and issue.get("항목") == "차단"
+        and "G3 대상 시트 미지원" in issue.get("문제내용", "")
         for issue in cleaned["validation_report"]
     )
 
 
-def test_시나리오_공란이어도_연도가_없으면_G3가_차단한다(monkeypatch) -> None:
-    # 시나리오 와일드카드가 G3 전체를 무력화하지 않음을 증명한다(명세 S4 짝 케이스).
-    # 부문은 항목·제목 폴백이 있어 누락이 실발생하지 않으므로 연도 누락으로 검증한다.
+def test_시나리오_공란과_연도_누락이어도_G3_대상시트_미지원으로_차단한다(monkeypatch) -> None:
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
     observation = _배출전망_관찰값(None)
     observation.pop("연도")
@@ -132,6 +129,6 @@ def test_시나리오_공란이어도_연도가_없으면_G3가_차단한다(mon
     assert any(
         issue.get("영역") == "시각병합"
         and issue.get("항목") == "차단"
-        and "G3 1차 키 누락(연도)" in issue.get("문제내용", "")
+        and "G3 대상 시트 미지원" in issue.get("문제내용", "")
         for issue in cleaned["validation_report"]
     )

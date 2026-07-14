@@ -150,7 +150,7 @@ def test_시각_라벨병합은_실스키마의_estimated_부재만으로_G1을_
 
 
 @pytest.mark.parametrize("title", ["온실가스 흡수 전망", "온실가스 BAU 산정"])
-def test_시각_라벨병합은_03_전망성_제목을_05로_재지정해_병합한다(monkeypatch, title: str) -> None:
+def test_시각_라벨병합은_03_전망성_제목을_05로_재지정한_뒤_G3에서_차단한다(monkeypatch, title: str) -> None:
     # Given: 03 후보의 제목에 전망 키워드가 있고 시나리오 표기는 없으면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
     observation = _시각_관찰값(
@@ -165,14 +165,13 @@ def test_시각_라벨병합은_03_전망성_제목을_05로_재지정해_병합
         "chart_observations": [observation],
     })
 
-    # Then: 03은 오염되지 않고 시나리오 공란을 유지한 05 시각행으로 병합된다.
+    # Then: 03은 오염되지 않고 미지원 시트인 05 라벨 후보도 차단된다.
     assert cleaned["emissions_regional"] == []
-    assert len(cleaned["emissions_forecast"]) == 1
-    assert cleaned["emissions_forecast"][0]["데이터상태"] == "visual_only"
-    assert not cleaned["emissions_forecast"][0].get("시나리오")
+    assert cleaned["emissions_forecast"] == []
     assert any(
         issue.get("대상시트키") == "emissions_forecast"
-        and issue.get("항목") == "병합"
+        and issue.get("항목") == "차단"
+        and "G3 대상 시트 미지원" in issue.get("문제내용", "")
         and "대상시트 재지정(전망 키워드)" in issue.get("문제내용", "")
         for issue in cleaned["validation_report"]
     )
@@ -565,22 +564,23 @@ def test_시각_라벨병합은_빈_세부부문을_기본값으로_채우지_�
 
 
 @pytest.mark.parametrize(
-    ("target_sheet", "fields", "value_field", "excel_sheet"),
+    ("target_sheet", "fields", "value_field", "excel_sheet", "supported"),
     [
-        ("regional_conditions", {"지표범주": "교통", "지표명": "통행량", "연도": 2030}, "값", "02_지역여건"),
-        ("emissions_regional", {"배출유형": "직접배출", "부문": "건물", "세부부문": "공공", "연도": 2030}, "배출량", "03_배출현황_지역"),
-        ("emissions_management", {"관리부문": "건물", "세부부문": "공공", "직간접구분": "직접", "연도": 2030}, "배출량", "04_배출현황_관리권한"),
-        ("emissions_forecast", {"시나리오": "BAU", "부문": "건물", "연도": 2030}, "전망값", "05_배출전망"),
-        ("reduction_targets", {"목표수준": "부문", "목표범위": "지역전체", "부문": "건물", "목표연도": 2030}, "목표배출량", "06_감축목표"),
-        ("financial_plan", {"계획구분": "온실가스감축대책", "부문": "건물", "사업명": "효율화", "재원구분": "합계", "연도": 2030}, "예산액", "11_재정투자계획"),
+        ("regional_conditions", {"지표범주": "교통", "지표명": "통행량", "연도": 2030}, "값", "02_지역여건", True),
+        ("emissions_regional", {"배출유형": "직접배출", "부문": "건물", "세부부문": "공공", "연도": 2030}, "배출량", "03_배출현황_지역", True),
+        ("emissions_management", {"관리부문": "건물", "세부부문": "공공", "직간접구분": "직접", "연도": 2030}, "배출량", "04_배출현황_관리권한", True),
+        ("emissions_forecast", {"시나리오": "BAU", "부문": "건물", "연도": 2030}, "전망값", "05_배출전망", False),
+        ("reduction_targets", {"목표수준": "부문", "목표범위": "지역전체", "부문": "건물", "목표연도": 2030}, "목표배출량", "06_감축목표", False),
+        ("financial_plan", {"계획구분": "온실가스감축대책", "부문": "건물", "사업명": "효율화", "재원구분": "합계", "연도": 2030}, "예산액", "11_재정투자계획", True),
     ],
 )
-def test_시각_라벨병합은_지원_수치시트의_계약컬럼만_사용한다(
+def test_시각_라벨병합은_지원_수치시트만_계약컬럼을_사용한다(
     monkeypatch,
     target_sheet: str,
     fields: dict,
     value_field: str,
     excel_sheet: str,
+    supported: bool,
 ) -> None:
     # Given: 지원 대상 수치 시트별 1차 키가 모두 채워진 라벨 기반 시각 판독값이면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
@@ -588,6 +588,16 @@ def test_시각_라벨병합은_지원_수치시트의_계약컬럼만_사용한
 
     # When: organizer가 opt-in 병합을 수행하면
     cleaned = OrganizerAgent().organize(raw)
+
+    if not supported:
+        assert cleaned[target_sheet] == []
+        assert any(
+            issue.get("영역") == "시각병합"
+            and issue.get("항목") == "차단"
+            and "G3 대상 시트 미지원" in issue.get("문제내용", "")
+            for issue in cleaned["validation_report"]
+        )
+        return
 
     # Then: 각 대상 시트는 기존 엑셀 계약 컬럼만 가진 visual_only 행을 받는다.
     assert len(cleaned[target_sheet]) == 1
