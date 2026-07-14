@@ -92,18 +92,18 @@ def test_S1_감축목표의_일반_수치충돌은_기존_충돌경로를_유지
     assert any("중복 키 값 충돌" in issue["항목"] for issue in cleaned["validation_report"])
 
 
-def _시트03_관찰값(*, item: str | None) -> dict:
+def _시트03_관찰값(*, item: str | None, year: int = 2020) -> dict:
     observation = {
         "지자체명": "테스트시",
         "페이지": 10,
         "대상시트": "emissions_regional",
         "제목": "에너지 배출량 현황",
         "단위": "천톤CO2eq",
-        "연도": 2020,
+        "연도": year,
         "값": 100,
         "신뢰도": "high",
         "반영여부": "검토",
-        "근거": json.dumps({"배출유형": "직접배출", "연도": 2020}, ensure_ascii=False),
+        "근거": json.dumps({"배출유형": "직접배출", "연도": year}, ensure_ascii=False),
     }
     if item is not None:
         observation["항목"] = item
@@ -191,3 +191,46 @@ def test_S7_연도는_IPCC_부문코드로_오인하지_않는다() -> None:
     row = cleaned["emissions_regional"][0]
     assert row["부문"] == "2018 에너지"
     assert row.get("부문원문") is None
+
+
+def test_S8_시트03은_문서메타_기준_상한초과_연도를_검토강등한다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True)
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "테스트시",
+        "document_meta": [{"작성연도": 2021, "승인연도": 2022, "계획시작연도": 2023}],
+        "chart_observations": [
+            _시트03_관찰값(item="에너지", year=2033),
+            _시트03_관찰값(item="에너지", year=2020),
+        ],
+    })
+
+    assert [row["연도"] for row in cleaned["emissions_regional"]] == [2020]
+    assert len(cleaned["visual_inventory"]) == 2
+    assert any(
+        issue["항목"] == "검토 강등"
+        and "G3 현황 연도 상한 초과(작성연도 기준)" in issue["문제내용"]
+        for issue in cleaned["validation_report"]
+    )
+
+
+def test_S8_시트03은_문서메타_연도가_없으면_현행_범위를_유지한다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True)
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "테스트시",
+        "chart_observations": [_시트03_관찰값(item="에너지", year=2033)],
+    })
+
+    assert [row["연도"] for row in cleaned["emissions_regional"]] == [2033]
+    assert not any(issue["항목"] == "검토 강등" for issue in cleaned["validation_report"])
+def test_S8_연도상한은_기존_신뢰도_차단을_우선순위에서_바꾸지_않는다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True)
+    observation = _시트03_관찰값(item="에너지", year=2033)
+    observation["신뢰도"] = "low"
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "테스트시",
+        "document_meta": [{"작성연도": 2021}],
+        "chart_observations": [observation],
+    })
+
+    assert any("G2 신뢰도 기준 미달" in issue["문제내용"] for issue in cleaned["validation_report"])
+    assert not any(issue["항목"] == "검토 강등" for issue in cleaned["validation_report"])

@@ -1387,10 +1387,30 @@ def _visual_key_summary(row: dict, key_fields: list[str]) -> str:
     return ", ".join(f"{field}={row.get(field) or ''}" for field in key_fields)
 
 
+def _document_status_year_limit(cleaned: dict) -> int | None:
+    years: list[int] = []
+    rows = cleaned.get("document_meta", [])
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for field in ("작성연도", "승인연도", "계획시작연도"):
+            value = row.get(field)
+            parsed = _to_int(value)
+            if parsed is None:
+                match = re.search(r"(?:19|20)\d{2}", str(value or ""))
+                parsed = int(match.group()) if match is not None else None
+            if parsed is not None:
+                years.append(parsed)
+    return min(years) + 1 if years else None
+
+
 def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municipality: str) -> None:
     if not getattr(config, "VISUAL_MERGE_LABELED_ENABLED", False):
         return
     min_confidence = getattr(config, "IMAGE_CHART_MERGE_MIN_CONFIDENCE", "medium")
+    document_status_year_limit = _document_status_year_limit(cleaned)
     for observation in observations:
         if not isinstance(observation, dict):
             continue
@@ -1418,6 +1438,13 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
         key_fields = _VISUAL_MERGE_KEY_FIELDS.get(sheet_key)
         value_field = _VISUAL_MERGE_VALUE_FIELDS.get(sheet_key)
         raw_candidate = _visual_candidate_row(sheet_key, observation, fields, municipality)
+        exceeds_document_status_year = bool(
+            sheet_key == "emissions_regional"
+            and raw_candidate is not None
+            and document_status_year_limit is not None
+            and (candidate_year := _to_int(raw_candidate.get("연도"))) is not None
+            and candidate_year > document_status_year_limit
+        )
         if raw_candidate is None or key_fields is None or value_field is None:
             blockers.append(f"G3 대상 시트 미지원 또는 키 정의 없음({sheet_key or '미지정'})")
         else:
@@ -1457,6 +1484,18 @@ def _apply_visual_labeled_merge(cleaned: dict, observations: list[dict], municip
             continue
 
         if candidate is None or key_fields is None or value_field is None:
+            continue
+        if exceeds_document_status_year:
+            _remember_visual_merge_issue(
+                municipality,
+                "정보",
+                "검토 강등",
+                f"emissions_regional p{observation.get('페이지') or '?'}: "
+                f"G3 현황 연도 상한 초과(작성연도 기준); "
+                f"연도 {candidate_year} > 상한 {document_status_year_limit}{decision_note}",
+                "16_시각자료목록에서 원문 시계열 성격을 확인",
+                "emissions_regional",
+            )
             continue
         rows = cleaned.setdefault(sheet_key, [])
         if not isinstance(rows, list):
