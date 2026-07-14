@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import openpyxl
+import pytest
 
 import config
 from agents import organizer_agent
@@ -150,6 +151,63 @@ def test_시트04_완화키는_직간접구분이_다른_행을_섞지_않는다
     assert sheet["매칭수"] == 0
     assert sheet["완화매칭수"] == 0
     assert sheet["리콜"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("sheet_name", "base"),
+    [
+        ("03_배출현황_지역", {"배출유형": "직접배출", "부문": "폐기물", "연도": 2020, "배출량": 10, "단위": "톤"}),
+        ("04_배출현황_관리권한", {"관리부문": "폐기물", "직간접구분": "직접", "연도": 2020, "배출량": 10, "단위": "톤"}),
+    ],
+)
+def test_S3_시트03_04_완화는_양쪽_세부부문이_다르면_후보에서_제외한다(
+    tmp_path: Path, sheet_name: str, base: dict
+) -> None:
+    result = _점수(
+        tmp_path,
+        {sheet_name: [base | {"세부부문": "매립"}]},
+        {sheet_name: [base | {"세부부문": "총계", "골든_출처유형": "텍스트표"}]},
+    )
+
+    assert result["시트별"][sheet_name]["매칭수"] == 0
+
+
+@pytest.mark.parametrize(
+    ("sheet_name", "base"),
+    [
+        ("03_배출현황_지역", {"배출유형": "직접배출", "부문": "폐기물", "연도": 2020, "배출량": 10, "단위": "톤"}),
+        ("04_배출현황_관리권한", {"관리부문": "폐기물", "직간접구분": "직접", "연도": 2020, "배출량": 10, "단위": "톤"}),
+    ],
+)
+def test_S3_시트03_04_완화는_한쪽_세부부문이_비면_기존_매칭을_유지한다(
+    tmp_path: Path, sheet_name: str, base: dict
+) -> None:
+    result = _점수(
+        tmp_path,
+        {sheet_name: [base | {"세부부문": ""}]},
+        {sheet_name: [base | {"세부부문": "총계", "골든_출처유형": "텍스트표"}]},
+    )
+
+    assert result["시트별"][sheet_name]["완화매칭수"] == 1
+
+
+@pytest.mark.parametrize(
+    ("sheet_name", "base"),
+    [
+        ("03_배출현황_지역", {"배출유형": "직접배출", "부문": "폐기물", "연도": 2020, "배출량": 10, "단위": "톤"}),
+        ("04_배출현황_관리권한", {"관리부문": "폐기물", "직간접구분": "직접", "연도": 2020, "배출량": 10, "단위": "톤"}),
+    ],
+)
+def test_S3_시트03_04는_세부부문이_같으면_기존_엄격매칭을_유지한다(
+    tmp_path: Path, sheet_name: str, base: dict
+) -> None:
+    result = _점수(
+        tmp_path,
+        {sheet_name: [base | {"세부부문": "매립"}]},
+        {sheet_name: [base | {"세부부문": "매립", "골든_출처유형": "텍스트표"}]},
+    )
+
+    assert result["시트별"][sheet_name]["엄격매칭수"] == 1
 
 
 def test_수치_허용오차와_불일치_상세를_구분한다(tmp_path: Path) -> None:

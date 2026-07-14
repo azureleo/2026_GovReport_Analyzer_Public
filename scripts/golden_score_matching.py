@@ -41,6 +41,14 @@ def _출력인덱스(rows: list, sheet_name: str, relaxed: bool, remaining: set[
     return indexed
 
 
+def _세부부문완화후보허용(sheet_name: str, golden_row: Any, output_row: Any) -> bool:
+    if sheet_name not in {"03_배출현황_지역", "04_배출현황_관리권한"}:
+        return True
+    golden_subsector = dedup_key_text(golden_row.값.get("세부부문"))
+    output_subsector = dedup_key_text(output_row.값.get("세부부문"))
+    return not golden_subsector or not output_subsector or golden_subsector == output_subsector
+
+
 def _지표토큰(row: Any) -> set[str]:
     text = f"{row.값.get('지표명') or ''} {row.값.get('지표세부범주') or ''}"
     parts = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE).split()
@@ -216,11 +224,14 @@ def 매칭하기(
             candidates = output_index.get(row_key, [])
             while candidates:
                 output_idx, candidate = candidates.pop(0)
-                if output_idx in remaining_output:
-                    matches.append(매칭(golden_row, candidate, label, row_key))
-                    remaining_golden.remove(golden_idx)
-                    remaining_output.remove(output_idx)
-                    break
+                if output_idx not in remaining_output:
+                    continue
+                if relaxed and not _세부부문완화후보허용(sheet_name, golden_row, candidate):
+                    continue
+                matches.append(매칭(golden_row, candidate, label, row_key))
+                remaining_golden.remove(golden_idx)
+                remaining_output.remove(output_idx)
+                break
     의미완화매칭들 = []
     문자유사매칭들 = []
     문자유사관찰들 = []
