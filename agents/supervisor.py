@@ -2,22 +2,27 @@
 에이전트 5: 감독·검수 에이전트
 
 전체 파이프라인을 조율하고 결과의 품질을 검수합니다.
+carbon_guideline.md 기반 16개 시트 구조에 맞춰 동작합니다.
 """
+# noqa: SIZE_OK — 파이프라인 단계 조율을 한 파일에 유지하는 기존 supervisor.
 
 import json
 import logging
+import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import config
-from utils.pdf_reader import extract_pdf, PDFContent
+from utils.pdf_reader import extract_pdf, PDFContent, PageContent
 from utils.hwp_reader import extract_hwp, is_hwp_file
-from utils import llm_client
+from utils import llm_cache, llm_client
 from agents.guideline_agent import GuidelineAgent
 from agents.extractor_agent import ExtractorAgent
 from agents.image_agent import ImageAgent
-from agents.organizer_agent import OrganizerAgent
+from agents.organizer_agent import OrganizerAgent, detect_prior_plan_pages
 from agents.gap_fill_agent import GapFillAgent
+from agents.hybrid_review_agent import HybridReviewAgent, reconcile_reflected_merge_log
 from agents.excel_agent import ExcelAgent
 
 logger = logging.getLogger(__name__)
@@ -26,75 +31,201 @@ QUALITY_SYSTEM = """당신은 지자체 탄소중립 기본계획 데이터 품�
 반드시 JSON만 반환하세요."""
 
 
+_TIMING_ORDER = [
+    "문서 파싱",
+    "가이드라인 로드",
+    "텍스트 추출",
+    "이미지 분석",
+    "정리·정제",
+    "빈칸 보완",
+    "시트 단위 보조검수·병합",
+    "보조 모델 검수",
+    "보조 후보 판정·병합",
+    "엑셀 작성",
+    "LLM 최종 검수",
+]
+
+
+def _fmt_seconds(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}초"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}분 {sec:.1f}초"
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{hours}시간 {minutes}분 {sec:.1f}초"
+
+
+def _safe_stage_provider(stage: str) -> str:
+    try:
+        return llm_client._resolve_provider(stage)
+    except RuntimeError:
+        configured = getattr(config, "STAGE_PROVIDERS", {}).get(stage, "") or getattr(config, "LLM_PROVIDER", "")
+        return str(configured or "미상")
+
+
+def _safe_stage_model(provider: str, stage: str) -> str:
+    try:
+        return llm_client._model_identity(provider, stage) or "기본값"
+    except RuntimeError:
+        configured = getattr(config, "STAGE_MODELS", {}).get(stage, "") or getattr(config, "LOCAL_AGENT_MODEL", "")
+        return str(configured or "기본값")
+
+
+def _git_commit_hash() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "미상"
+    return result.stdout.strip() or "미상"
+
+
+def _execution_info(input_path: Path, started_at: datetime) -> dict[str, str]:
+    text_provider = _safe_stage_provider("extraction")
+    vision_provider = _safe_stage_provider("vision")
+    return {
+        "git_commit": _git_commit_hash(),
+        "text_backend": text_provider,
+        "text_model": _safe_stage_model(text_provider, "extraction"),
+        "vision_backend": vision_provider,
+        "vision_model": _safe_stage_model(vision_provider, "vision"),
+        "run_started_at": started_at.isoformat(timespec="seconds"),
+        "input_file": input_path.name,
+        "pipeline_version": str(getattr(config, "PIPELINE_VERSION", "v5.3")),
+    }
+
+
 def _quality_score(final_data: dict) -> tuple[float, list[str]]:
     issues = []
     score = 100.0
 
-    if not final_data.get("municipality_name") or final_data.get("municipality_name") == "알 수 없음":
+    municipality = final_data.get("municipality_name", "알 수 없음")
+    if not municipality or municipality == "알 수 없음":
         issues.append("지자체명 미확인")
         score -= 20
 
-    ghg = final_data.get("ghg", [])
-    if len(ghg) == 0:
-        issues.append("온실가스 데이터 없음 (중요)")
-        score -= 30
-    else:
-        if not any(g.get("종류") == "현황" for g in ghg):
-            issues.append("온실가스 현황 데이터 없음")
-            score -= 15
-        if not any(g.get("종류") == "목표" for g in ghg):
-            issues.append("온실가스 감축 목표 데이터 없음")
-            score -= 10
-        total_cells = len(ghg) * len(config.YEARS)
-        filled = sum(
-            1 for g in ghg for y in config.YEARS
-            if g.get("연도별", {}).get(str(y)) is not None
-        )
-        fill_rate = filled / total_cells if total_cells > 0 else 0
-        if fill_rate < 0.2:
-            issues.append(f"GHG 연도별 채움률 낮음 ({fill_rate:.0%})")
-            score -= 10
+    # 핵심 시트 데이터 존재 확인
+    emissions = final_data.get("emissions_regional", []) + final_data.get("emissions_management", [])
+    if not emissions:
+        issues.append("온실가스 배출 데이터 없음 (중요)")
+        score -= 25
 
-    if len(final_data.get("strategy", [])) == 0:
-        issues.append("감축 전략 데이터 없음")
+    targets = final_data.get("reduction_targets", [])
+    if not targets:
+        issues.append("감축목표 데이터 없음")
+        score -= 15
+
+    projects = final_data.get("mitigation_projects", [])
+    if not projects:
+        issues.append("감축사업 목록 없음")
         score -= 10
-    qualitative_strategy = final_data.get("strategy_qualitative", [])
-    if qualitative_strategy:
-        issues.append(f"정성/연도값 미기재 감축전략 별도 분리 ({len(qualitative_strategy)}건)")
 
-    vehicle = final_data.get("vehicle", [])
-    if vehicle:
-        count_filled = sum(1 for row in vehicle if row.get("대수") is not None)
-        if count_filled / len(vehicle) < 0.5:
-            issues.append("자동차 대수 채움률 낮음")
-            score -= 5
+    forecast = final_data.get("emissions_forecast", [])
+    if not forecast:
+        issues.append("배출전망 데이터 없음")
+        score -= 5
 
-    empty_summary = [s for s in final_data.get("summary", []) if not s.get("내용")]
-    if empty_summary:
-        issues.append(f"요약카드 빈 항목: {', '.join(s['항목'] for s in empty_summary)}")
-        score -= len(empty_summary) * 3
+    regional = final_data.get("regional_conditions", [])
+    if not regional:
+        issues.append("지역여건 데이터 없음")
+        score -= 5
+
+    vision = final_data.get("vision_strategy", [])
+    if not vision:
+        issues.append("비전·전략 없음")
+        score -= 5
+
+    # 채움률 확인
+    total_rows = sum(len(v) for v in final_data.values() if isinstance(v, list))
+    if total_rows < 10:
+        issues.append(f"전체 추출 행 수 매우 적음 ({total_rows}행)")
+        score -= 15
 
     return max(0.0, score), issues
+
+
+def _document_text_chars(pdf_content: PDFContent) -> int:
+    return len("".join(page.text or "" for page in pdf_content.pages).strip())
 
 
 class Supervisor:
     """에이전트 5: 감독·검수 에이전트"""
 
-    QUALITY_THRESHOLD = 50.0
+    QUALITY_THRESHOLD = 40.0
 
     def __init__(self):
         self._reports: list[str] = []
+        self._timings: dict[str, float] = {}
 
     def _log(self, msg: str):
         print(msg)
         self._reports.append(msg)
 
+    def _add_timing(self, label: str, elapsed: float):
+        self._timings[label] = self._timings.get(label, 0.0) + elapsed
+
+    def _append_text_layer_warning(self, final_data: dict) -> None:
+        report = final_data.setdefault("validation_report", [])
+        if not isinstance(report, list):
+            return
+        if any(isinstance(row, dict) and row.get("항목") == "텍스트 레이어 부족" for row in report):
+            return
+        municipality = final_data.get("municipality_name", "알 수 없음")
+        report.append({
+            "지자체명": municipality,
+            "심각도": "정보",
+            "영역": "문서파싱",
+            "항목": "텍스트 레이어 부족",
+            "문제내용": "텍스트 레이어가 거의 없습니다 — 스캔본 PDF일 수 있으며 추출 결과가 비어 있을 수 있습니다",
+            "권장조치": "OCR 또는 텍스트 레이어가 있는 PDF로 다시 실행 후 결과를 비교",
+        })
+
+    def _log_timing_summary(self, total_elapsed: float):
+        self._log("\n[감독관] 단계별 소요 시간")
+        for label in _TIMING_ORDER:
+            if label in self._timings:
+                self._log(f"  - {label}: {_fmt_seconds(self._timings[label])}")
+        other_elapsed = sum(
+            elapsed for label, elapsed in self._timings.items()
+            if label not in _TIMING_ORDER
+        )
+        if other_elapsed > 0:
+            self._log(f"  - 기타: {_fmt_seconds(other_elapsed)}")
+        self._log(f"  - 전체: {_fmt_seconds(total_elapsed)}")
+
+        stats = llm_cache.get_cache_stats()
+        if stats:
+            self._log(
+                "  - LLM 캐시: "
+                f"hit {stats.get('hit', 0)}, "
+                f"miss {stats.get('miss', 0)}, "
+                f"write {stats.get('write', 0)}, "
+                f"disabled {stats.get('disabled', 0)}"
+            )
+        llm_stats = llm_client.get_llm_stats()
+        if llm_stats:
+            wait_seconds = llm_stats.get("quota_wait_seconds", 0.0)
+            self._log(
+                "  - LLM 호출: "
+                f"{llm_stats.get('total_calls', 0)}회"
+                f"(실패 {llm_stats.get('failures', 0)}, "
+                f"재시도 {llm_stats.get('retries', 0)}, "
+                f"타임아웃 {llm_stats.get('timeouts', 0)}), "
+                f"quota 대기 누적 {_fmt_seconds(float(wait_seconds))}"
+            )
+
     def _llm_quality_review(self, final_data: dict) -> dict:
-        summary_text = json.dumps(final_data.get("summary", []), ensure_ascii=False)
-        prompt = f"""다음은 '{final_data.get('municipality_name', '?')}' 탄소중립 계획 추출 결과 요약입니다:
-- GHG 데이터 행 수: {len(final_data.get('ghg', []))}
-- 감축전략 데이터 행 수: {len(final_data.get('strategy', []))}
-- 요약카드: {summary_text}
+        municipality = final_data.get("municipality_name", "?")
+        sheet_counts = {k: len(v) for k, v in final_data.items() if isinstance(v, list) and v}
+        prompt = f"""다음은 '{municipality}' 탄소중립 계획 추출 결과 요약입니다:
+- 시트별 행 수: {json.dumps(sheet_counts, ensure_ascii=False)}
+- 총 추출 행: {sum(sheet_counts.values())}
 
 이 추출 결과의 완성도를 평가하고 JSON으로 반환하세요:
 {{
@@ -102,8 +233,118 @@ class Supervisor:
   "quality_level": "우수|보통|미흡",
   "key_issues": ["이슈1", "이슈2"]
 }}"""
-        resp = llm_client.call_text(prompt, system=QUALITY_SYSTEM)
+        try:
+            resp = llm_client.call_text(prompt, system=QUALITY_SYSTEM)
+        except llm_client.LLMQuotaExceededError:
+            raise
+        except llm_client.LLMCallError as exc:
+            logger.warning("LLM 최종 품질 검수 실패. 규칙 기반 점수만 사용: %s", exc)
+            score, issues = _quality_score(final_data)
+            return {
+                "assessment": f"LLM 검수 호출이 실패하여 규칙 기반 품질 점수({score:.1f}/100)만 기록했습니다.",
+                "quality_level": "보통" if score >= self.QUALITY_THRESHOLD else "미흡",
+                "key_issues": issues,
+            }
         return llm_client.parse_json(resp)
+
+    def _run_sheet_closed_loop(
+        self,
+        *,
+        pages: list[PageContent],
+        full_text: str,
+        extraction_prompts: dict[str, str],
+    ) -> tuple[dict, ExtractorAgent, list[dict], list[dict]]:
+        """
+        시트별 추출·정제·검수 폐루프.
+
+        이미지 분석과 빈칸 보완은 이 폐루프 이후 실행되므로 보조검수가 본 기준본과
+        최종본은 다를 수 있다. 최종 organize 검증 패스가 최종본 기준 정합성을 다시 점검한다.
+        """
+        extractor = ExtractorAgent()
+        organizer = OrganizerAgent()
+        hybrid_agent = HybridReviewAgent() if getattr(config, "HYBRID_REVIEW_ENABLED", False) else None
+        municipality = extractor._extract_municipality_name(full_text)
+        raw_data: dict = {"municipality_name": municipality}
+        review_candidates: list[dict] = []
+        merge_log: list[dict] = []
+
+        self._log(f"[감독관] 시트별 폐루프 지자체명: {municipality}")
+        routed_pages = extractor.route_pages(pages)
+        route_summary = {key: len(value) for key, value in routed_pages.items() if value}
+        self._log(f"[감독관] 시트별 폐루프 라우팅 완료: {route_summary}")
+
+        review_sheets = set(getattr(config, "HYBRID_REVIEW_SHEETS", []))
+        review_enabled = bool(hybrid_agent)
+        adjudication_limit = max(0, getattr(config, "HYBRID_ADJUDICATION_MAX_CANDIDATES", 0))
+        remaining_candidates: int | None = None if adjudication_limit <= 0 else adjudication_limit
+
+        for sheet_key in config.EXTRACTION_SHEETS:
+            sheet_pages = routed_pages.get(sheet_key, [])
+            if not sheet_pages:
+                continue
+            sheet_name = config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key)
+            self._log(f"[감독관] 폐루프 {sheet_name}: 추출→정제 시작")
+            try:
+                rows = extractor.extract_sheet_pages(
+                    sheet_key,
+                    sheet_pages,
+                    municipality,
+                    extraction_prompts,
+                )
+            except llm_client.LLMQuotaExceededError as exc:
+                logger.warning("시트별 폐루프 추출 quota/한도 문제로 부분 결과를 보존하고 종료: %s", exc)
+                self._log(f"[감독관] 폐루프 {sheet_name}: 추출 quota 발생, 완료 시트만 보존")
+                break
+            raw_data[sheet_key] = organizer.organize_sheet(sheet_key, rows, municipality)
+
+            if not review_enabled or sheet_key not in review_sheets:
+                continue
+            if remaining_candidates is not None and remaining_candidates <= 0:
+                self._log(f"[감독관] 폐루프 {sheet_name}: 전역 판정 상한 도달로 검수 건너뜀")
+                continue
+
+            sheet_basis = {
+                "municipality_name": municipality,
+                sheet_key: [dict(row) for row in raw_data.get(sheet_key, []) if isinstance(row, dict)],
+            }
+            try:
+                reviewed_data, sheet_candidates, sheet_merge_log = hybrid_agent.review_and_adjudicate_by_sheet(
+                    pages=pages,
+                    final_data=sheet_basis,
+                    extraction_prompts=extraction_prompts,
+                    progress=self._log,
+                    target_sheets=[sheet_key],
+                    routed_pages={sheet_key: sheet_pages},
+                    max_candidates_override=remaining_candidates,
+                )
+            except llm_client.LLMQuotaExceededError as exc:
+                sheet_candidates = list(getattr(hybrid_agent, "_last_review_candidates", []))
+                sheet_merge_log = list(getattr(hybrid_agent, "_last_merge_log", []))
+                review_candidates.extend(sheet_candidates)
+                merge_log.extend(sheet_merge_log)
+                if isinstance(sheet_basis.get(sheet_key), list):
+                    raw_data[sheet_key] = sheet_basis[sheet_key]
+                review_enabled = False
+                logger.warning("시트별 폐루프 검수 quota/한도 문제로 남은 시트 검수 건너뜀: %s", exc)
+                self._log(f"[감독관] 폐루프 {sheet_name}: quota 발생, 남은 시트 검수 비활성")
+                continue
+
+            review_candidates.extend(sheet_candidates)
+            merge_log.extend(sheet_merge_log)
+            if remaining_candidates is not None:
+                remaining_candidates = max(0, remaining_candidates - len(sheet_merge_log))
+
+            sheet_rows = reviewed_data.get(sheet_key, [])
+            if isinstance(sheet_rows, list):
+                raw_data[sheet_key] = [dict(row) for row in sheet_rows if isinstance(row, dict)]
+            if any(row.get("최종반영여부") == "반영" for row in sheet_merge_log):
+                raw_data[sheet_key] = organizer.organize_sheet(sheet_key, raw_data[sheet_key], municipality)
+                reconcile_reflected_merge_log(
+                    {"municipality_name": municipality, sheet_key: raw_data[sheet_key]},
+                    sheet_merge_log,
+                )
+
+        return raw_data, extractor, review_candidates, merge_log
 
     def run(
         self,
@@ -112,9 +353,8 @@ class Supervisor:
         hwp_path: str | None = None,
         max_pipeline_retries: int = 2,
         include_images: bool = True,
-        pdf_path: str | Path = None,  # 하위 호환성
+        pdf_path: str | Path = None,
     ) -> Path:
-        # 하위 호환성: pdf_path가 전달되면 input_path로 사용
         if input_path is None and pdf_path is not None:
             input_path = pdf_path
         if input_path is None:
@@ -124,69 +364,251 @@ class Supervisor:
         output_path = Path(output_path)
 
         file_type = "HWP" if is_hwp_file(input_path) else "PDF"
+        pipeline_start = time.time()
+        run_started_at = datetime.now(timezone.utc).astimezone()
+        execution_info = _execution_info(input_path, run_started_at)
+        self._timings = {}
+        llm_cache.reset_cache_stats()
+        llm_client.reset_llm_stats()
 
         self._log("=" * 60)
-        self._log("[감독관] 파이프라인 시작")
+        self._log("[감독관] 파이프라인 시작 (가이드라인 기반 16개 시트)")
         self._log(f"  - 입력 {file_type}: {input_path}")
         self._log(f"  - 출력 경로: {output_path}")
         self._log("=" * 60)
 
-        # STEP 0: 문서 파싱 (PDF 또는 HWP)
+        # STEP 0: 문서 파싱
         self._log(f"\n[감독관] STEP 0: {file_type} 파싱 중...")
         t0 = time.time()
         if is_hwp_file(input_path):
             pdf_content: PDFContent = extract_hwp(input_path)
         else:
             pdf_content: PDFContent = extract_pdf(input_path, render_graph_pages=include_images)
-        self._log(f"[감독관] {file_type} 파싱 완료: {pdf_content.total_pages}페이지 ({time.time()-t0:.1f}초)")
+        elapsed = time.time() - t0
+        self._add_timing("문서 파싱", elapsed)
+        self._log(f"[감독관] {file_type} 파싱 완료: {pdf_content.total_pages}페이지 ({elapsed:.1f}초)")
+        text_layer_warning = _document_text_chars(pdf_content) < int(getattr(config, "MIN_DOCUMENT_TEXT_CHARS", 500))
+        if text_layer_warning:
+            self._log("[감독관] 경고: 텍스트 레이어가 거의 없습니다 — 스캔본 PDF일 수 있으며 추출 결과가 비어 있을 수 있습니다")
+        prior_plan_pages = detect_prior_plan_pages(pdf_content.pages)
+        if prior_plan_pages:
+            self._log(
+                "[감독관] 기존계획 평가 장 감지: "
+                f"p{min(prior_plan_pages)}~p{max(prior_plan_pages)}"
+            )
 
-        # STEP 1: 가이드라인
+        # STEP 1: 가이드라인 (carbon_guideline.md 우선, HWP fallback)
         self._log("\n[감독관] STEP 1: 가이드라인 에이전트 실행...")
+        t0 = time.time()
         guideline_agent = GuidelineAgent(hwp_path=hwp_path)
         extraction_prompts = guideline_agent.get_all_prompts()
+        elapsed = time.time() - t0
+        self._add_timing("가이드라인 로드", elapsed)
         self._log(guideline_agent.report())
+        self._log(f"[감독관] STEP 1 완료: {elapsed:.1f}초")
 
         # STEP 2~3: 추출·정제 (품질 미달 시 재시도)
         final_data = None
         for attempt in range(1, max_pipeline_retries + 1):
             self._log(f"\n[감독관] STEP 2~3: 추출·정제 시도 {attempt}/{max_pipeline_retries}")
 
-            extractor = ExtractorAgent()
-            raw_data = extractor.extract(
-                pages=pdf_content.pages,
-                full_text=pdf_content.full_text,
-                extraction_prompts=extraction_prompts,
-            )
+            closed_loop_candidates: list[dict] = []
+            closed_loop_merge_log: list[dict] = []
+            t0 = time.time()
+            if getattr(config, "SHEET_CLOSED_LOOP_ENABLED", False):
+                try:
+                    raw_data, extractor, closed_loop_candidates, closed_loop_merge_log = self._run_sheet_closed_loop(
+                        pages=pdf_content.pages,
+                        full_text=pdf_content.full_text,
+                        extraction_prompts=extraction_prompts,
+                    )
+                except llm_client.LLMQuotaExceededError as exc:
+                    extractor = ExtractorAgent()
+                    raw_data = extractor.partial_results()
+                    logger.warning("시트별 폐루프 추출 quota/한도 문제로 부분 결과로 계속 진행: %s", exc)
+            else:
+                extractor = ExtractorAgent()
+                try:
+                    raw_data = extractor.extract(
+                        pages=pdf_content.pages,
+                        full_text=pdf_content.full_text,
+                        extraction_prompts=extraction_prompts,
+                    )
+                except llm_client.LLMQuotaExceededError as exc:
+                    raw_data = extractor.partial_results()
+                    logger.warning("텍스트 추출 quota/한도 문제로 부분 결과로 계속 진행: %s", exc)
+            elapsed = time.time() - t0
+            self._add_timing("텍스트 추출", elapsed)
             self._log(extractor.report())
+            self._log(extractor.ledger_summary())
+            self._log(f"[감독관] 텍스트 추출 완료: {elapsed:.1f}초")
 
+            ledger_records = list(extractor.ledger)
             municipality = raw_data.get("municipality_name", "알 수 없음")
+            raw_data["execution_info"] = execution_info
+
             if include_images:
                 image_agent = ImageAgent()
-                raw_data = image_agent.extract(
-                    pages=pdf_content.pages,
-                    text_results=raw_data,
-                    municipality=municipality,
-                )
+                t0 = time.time()
+                try:
+                    raw_data = image_agent.extract(
+                        pages=pdf_content.pages,
+                        text_results=raw_data,
+                        municipality=municipality,
+                    )
+                except llm_client.LLMQuotaExceededError as exc:
+                    logger.warning("이미지 분석 quota/한도 문제로 기존 텍스트 결과로 계속 진행: %s", exc)
+                elapsed = time.time() - t0
+                self._add_timing("이미지 분석", elapsed)
                 self._log(image_agent.report())
+                self._log(f"[감독관] 이미지 분석 완료: {elapsed:.1f}초")
             else:
                 self._log("[에이전트2b 이미지분석] 비활성화 (--no-images)")
 
+            raw_data["execution_info"] = execution_info
             organizer = OrganizerAgent()
-            final_data = organizer.organize(raw_data, pdf_content.full_text[:6000])
-
-            if config.GAP_FILL_ENABLED:
-                gap_fill_agent = GapFillAgent()
-                gap_filled_raw = gap_fill_agent.enhance(
-                    raw_data=raw_data,
-                    cleaned=final_data,
-                    pages=pdf_content.pages,
-                )
-                self._log(gap_fill_agent.report())
-                if gap_filled_raw is not raw_data:
-                    organizer = OrganizerAgent()
-                    final_data = organizer.organize(gap_filled_raw, pdf_content.full_text[:6000])
-
+            t0 = time.time()
+            final_data = organizer.organize(
+                raw_data,
+                ledger=ledger_records,
+                routed_page_nums=getattr(extractor, "routed_page_nums", None),
+                prior_plan_pages=prior_plan_pages,
+            )
+            elapsed = time.time() - t0
+            self._add_timing("정리·정제", elapsed)
             self._log(organizer.report())
+            self._log(f"[감독관] 정리·정제 완료: {elapsed:.1f}초")
+
+            # STEP 3b: 빈칸 보완 (비어 있거나 채움률 낮은 시트만 재추출)
+            if getattr(config, "GAP_FILL_ENABLED", True):
+                self._log("\n[감독관] STEP 3b: 빈칸 보완 에이전트 실행...")
+                gap_agent = GapFillAgent()
+                t0 = time.time()
+                try:
+                    enhanced_raw = gap_agent.enhance(
+                        raw_data=raw_data,
+                        cleaned=final_data,
+                        pages=pdf_content.pages,
+                        extracted_page_nums=getattr(extractor, "extracted_page_nums", None),
+                    )
+                except llm_client.LLMQuotaExceededError as exc:
+                    enhanced_raw = raw_data
+                    logger.warning("빈칸 보완 quota/한도 문제로 건너뜀: %s", exc)
+                elapsed = time.time() - t0
+                self._add_timing("빈칸 보완", elapsed)
+                self._log(gap_agent.report())
+                self._log(f"[감독관] 빈칸 보완 완료: {elapsed:.1f}초")
+
+                ledger_records = list(extractor.ledger) + list(getattr(gap_agent, "ledger", []))
+
+                # 보완 후보가 추가됐거나 보완 실패 원장이 생기면 같은 organizer로 재정제해 검증리포트를 갱신한다.
+                if enhanced_raw is not raw_data or getattr(gap_agent, "ledger", []):
+                    raw_data = enhanced_raw
+                    raw_data["execution_info"] = execution_info
+                    t0 = time.time()
+                    final_data = organizer.organize(
+                        raw_data,
+                        ledger=ledger_records,
+                        routed_page_nums=getattr(extractor, "routed_page_nums", None),
+                        prior_plan_pages=prior_plan_pages,
+                    )
+                    elapsed = time.time() - t0
+                    self._add_timing("정리·정제", elapsed)
+                    self._log(f"[감독관] 빈칸 보완 후 재정제 완료: {elapsed:.1f}초")
+
+            if text_layer_warning:
+                self._append_text_layer_warning(final_data)
+
+            if closed_loop_candidates:
+                final_data.setdefault("hybrid_review_candidates", []).extend(closed_loop_candidates)
+            if closed_loop_merge_log:
+                reconcile_reflected_merge_log(final_data, closed_loop_merge_log)
+                final_data.setdefault("hybrid_merge_log", []).extend(closed_loop_merge_log)
+
+            if getattr(config, "HYBRID_REVIEW_ENABLED", False):
+                hybrid_agent = HybridReviewAgent()
+                if getattr(config, "HYBRID_REVIEW_TARGETED", True):
+                    self._log("\n[감독관] STEP 3c: 검증리포트 기반 타깃 보조검수 실행...")
+                    t0 = time.time()
+                    try:
+                        review_candidates = hybrid_agent.review_targeted(
+                            pages=pdf_content.pages,
+                            final_data=final_data,
+                            extraction_prompts=extraction_prompts,
+                        )
+                    except llm_client.LLMQuotaExceededError as exc:
+                        review_candidates = []
+                        logger.warning("타깃 보조검수 quota/한도 문제로 건너뜀: %s", exc)
+                    elapsed = time.time() - t0
+                    self._add_timing("타깃 보조검수", elapsed)
+                    if review_candidates:
+                        final_data.setdefault("hybrid_review_candidates", []).extend(review_candidates)
+                    self._log(hybrid_agent.report())
+                    self._log(f"[감독관] 타깃 보조검수 완료: {elapsed:.1f}초")
+                elif getattr(config, "SHEET_CLOSED_LOOP_ENABLED", False):
+                    self._log("\n[감독관] STEP 3c/3d: 시트별 폐루프에서 보조검수·병합을 이미 수행해 재실행하지 않음")
+                elif getattr(config, "HYBRID_SHEETWISE_FLOW_ENABLED", True):
+                    self._log("\n[감독관] STEP 3c/3d: 시트 단위 보조검수·병합 실행...")
+                    t0 = time.time()
+                    try:
+                        final_data, review_candidates, merge_log = hybrid_agent.review_and_adjudicate_by_sheet(
+                            pages=pdf_content.pages,
+                            final_data=final_data,
+                            extraction_prompts=extraction_prompts,
+                            progress=self._log,
+                        )
+                    except llm_client.LLMQuotaExceededError as exc:
+                        review_candidates = []
+                        merge_log = []
+                        logger.warning("시트 단위 보조검수·병합 quota/한도 문제로 건너뜀: %s", exc)
+                    elapsed = time.time() - t0
+                    self._add_timing("시트 단위 보조검수·병합", elapsed)
+                    if review_candidates:
+                        final_data.setdefault("hybrid_review_candidates", []).extend(review_candidates)
+                    if merge_log:
+                        reconcile_reflected_merge_log(final_data, merge_log)
+                        final_data.setdefault("hybrid_merge_log", []).extend(merge_log)
+                    self._log(hybrid_agent.report())
+                    self._log(hybrid_agent.adjudication_report())
+                    self._log(f"[감독관] 시트 단위 보조검수·병합 완료: {elapsed:.1f}초")
+                else:
+                    self._log("\n[감독관] STEP 3c: 보조 모델 타깃 검수 실행...")
+                    t0 = time.time()
+                    try:
+                        review_candidates = hybrid_agent.review(
+                            pages=pdf_content.pages,
+                            final_data=final_data,
+                            extraction_prompts=extraction_prompts,
+                        )
+                    except llm_client.LLMQuotaExceededError as exc:
+                        review_candidates = []
+                        logger.warning("보조 모델 검수 quota/한도 문제로 건너뜀: %s", exc)
+                    elapsed = time.time() - t0
+                    self._add_timing("보조 모델 검수", elapsed)
+                    if review_candidates:
+                        final_data.setdefault("hybrid_review_candidates", []).extend(review_candidates)
+                    self._log(hybrid_agent.report())
+                    self._log(f"[감독관] 보조 모델 검수 완료: {elapsed:.1f}초")
+
+                    if review_candidates and getattr(config, "HYBRID_ADJUDICATION_ENABLED", True):
+                        self._log("\n[감독관] STEP 3d: 보조 후보 판정·병합 실행...")
+                        t0 = time.time()
+                        try:
+                            final_data, merge_log = hybrid_agent.adjudicate_and_merge(
+                                candidates=review_candidates,
+                                final_data=final_data,
+                                pages=pdf_content.pages,
+                            )
+                        except llm_client.LLMQuotaExceededError as exc:
+                            merge_log = []
+                            logger.warning("보조 후보 판정 quota/한도 문제로 건너뜀: %s", exc)
+                        elapsed = time.time() - t0
+                        self._add_timing("보조 후보 판정·병합", elapsed)
+                        if merge_log:
+                            reconcile_reflected_merge_log(final_data, merge_log)
+                            final_data.setdefault("hybrid_merge_log", []).extend(merge_log)
+                        self._log(hybrid_agent.adjudication_report())
+                        self._log(f"[감독관] 보조 후보 판정·병합 완료: {elapsed:.1f}초")
 
             score, issues = _quality_score(final_data)
             self._log(f"\n[감독관] 품질 점수: {score:.1f}/100")
@@ -194,33 +616,52 @@ class Supervisor:
                 self._log(f"[감독관] 이슈: {', '.join(issues)}")
 
             if score >= self.QUALITY_THRESHOLD:
-                self._log(f"[감독관] 품질 기준 통과")
+                self._log("[감독관] 품질 기준 통과")
                 break
             elif attempt < max_pipeline_retries:
-                self._log(f"[감독관] 품질 미달. 재시도합니다...")
+                self._log("[감독관] 품질 미달. 재시도합니다...")
             else:
-                self._log(f"[감독관] 최대 재시도 도달. 현재 결과로 진행합니다.")
+                self._log("[감독관] 최대 재시도 도달. 현재 결과로 진행합니다.")
 
         # STEP 4: 엑셀 작성
         self._log("\n[감독관] STEP 4: 엑셀 작성 에이전트 실행...")
         excel_agent = ExcelAgent()
-        organizer_final = OrganizerAgent()
-        organizer_final._final_data = final_data
-        result_path = excel_agent.write(organizer_final.get_excel_ready(), output_path)
+        t0 = time.time()
+        excel_data = organizer.get_excel_ready()
+        if final_data and final_data.get("hybrid_review_candidates"):
+            excel_data["hybrid_review_candidates"] = final_data["hybrid_review_candidates"]
+        if final_data and final_data.get("hybrid_merge_log"):
+            excel_data["hybrid_merge_log"] = final_data["hybrid_merge_log"]
+        result_path = excel_agent.write(excel_data, output_path)
+        elapsed = time.time() - t0
+        self._add_timing("엑셀 작성", elapsed)
         self._log(excel_agent.report())
+        self._log(f"[감독관] 엑셀 작성 완료: {elapsed:.1f}초")
 
         # LLM 최종 검수
         self._log("\n[감독관] LLM 최종 품질 검수 중...")
-        review = self._llm_quality_review(final_data)
-        self._log(f"[감독관] 검수 결과: {review.get('quality_level', '?')}")
-        self._log(f"  평가: {review.get('assessment', '')}")
-        if review.get("key_issues"):
-            self._log(f"  주요 이슈: {', '.join(review.get('key_issues', []))}")
+        t0 = time.time()
+        try:
+            review = self._llm_quality_review(final_data)
+        except llm_client.LLMQuotaExceededError as exc:
+            elapsed = time.time() - t0
+            self._add_timing("LLM 최종 검수", elapsed)
+            logger.warning("저장 후 LLM 최종 검수 quota/한도 문제로 생략: %s", exc)
+            self._log(f"한도 초과로 최종 검수는 생략했습니다. 결과 파일은 저장되어 있습니다: {result_path}")
+        else:
+            elapsed = time.time() - t0
+            self._add_timing("LLM 최종 검수", elapsed)
+            self._log(f"[감독관] 검수 결과: {review.get('quality_level', '?')}")
+            self._log(f"  평가: {review.get('assessment', '')}")
+            if review.get("key_issues"):
+                self._log(f"  주요 이슈: {', '.join(review.get('key_issues', []))}")
+            self._log(f"[감독관] LLM 최종 검수 완료: {elapsed:.1f}초")
 
         self._log("\n" + "=" * 60)
         self._log("[감독관] 파이프라인 완료")
         self._log(f"  출력 파일: {result_path}")
         self._log(f"  최종 품질 점수: {_quality_score(final_data)[0]:.1f}/100")
+        self._log_timing_summary(time.time() - pipeline_start)
         self._log("=" * 60)
 
         return result_path

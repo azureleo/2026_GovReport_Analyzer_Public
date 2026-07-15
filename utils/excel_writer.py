@@ -1,28 +1,44 @@
 """
 구조화된 데이터를 엑셀 파일로 작성하는 유틸리티
 
-추출 결과를 여러 시트의 Excel 파일로 생성합니다.
+carbon_guideline.md 기반 16개 시트 구조의 Excel 파일을 생성합니다.
 """
 
+from datetime import datetime
+import json
 from pathlib import Path
 
 import openpyxl
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import (
-    Alignment, Font, PatternFill, Border, Side, numbers
+    Alignment, Font, PatternFill, Border, Side,
 )
 from openpyxl.utils import get_column_letter
 
 import config
 
 
-# ──────────────────────────────────────────────
-#  색상 팔레트
-# ──────────────────────────────────────────────
-COLOR_HEADER_BG   = "2E75B6"   # 헤더 배경 (진파랑)
-COLOR_HEADER_FONT = "FFFFFF"   # 헤더 글꼴 (흰색)
-COLOR_YEAR_BG     = "D9E1F2"   # 연도 행 배경 (연파랑)
-COLOR_ALT_ROW     = "F2F2F2"   # 짝수 행 배경 (연회색)
-COLOR_NOTE_BG     = "FFF2CC"   # 가이드라인 안내 셀 배경 (연노랑)
+COLOR_HEADER_BG = "2E75B6"
+COLOR_HEADER_FONT = "FFFFFF"
+COLOR_ALT_ROW = "F2F2F2"
+
+# 엑셀 헤더 라벨과 데이터 dict 키가 다른 경우의 별칭 매핑.
+# 예: 헤더는 "감축률(%)"로 표기하지만 추출·정제 단계의 dict 키는 "감축률"이다.
+# 별칭이 없으면 header == key 로 간주한다.
+HEADER_KEY_ALIASES = {
+    "감축률(%)": "감축률",
+}
+
+
+def _headers_for_output(sheet_name: str, headers: list[str]) -> list[str]:
+    """출처페이지·데이터상태 opt-out을 엑셀 쓰기 직전에 적용한다."""
+    output = list(headers)
+    if sheet_name[:2].isdigit() and int(sheet_name[:2]) <= 15:
+        if not getattr(config, "PROVENANCE_ENABLED", True):
+            output = [header for header in output if header != "출처페이지"]
+        if not getattr(config, "DATA_STATUS_ENABLED", True):
+            output = [header for header in output if header != "데이터상태"]
+    return output
 
 
 def _thin_border() -> Border:
@@ -34,20 +50,11 @@ def _header_fill() -> PatternFill:
     return PatternFill("solid", fgColor=COLOR_HEADER_BG)
 
 
-def _year_fill() -> PatternFill:
-    return PatternFill("solid", fgColor=COLOR_YEAR_BG)
-
-
 def _alt_fill() -> PatternFill:
     return PatternFill("solid", fgColor=COLOR_ALT_ROW)
 
 
-def _note_fill() -> PatternFill:
-    return PatternFill("solid", fgColor=COLOR_NOTE_BG)
-
-
 def _apply_header_row(ws, headers: list, row: int = 1):
-    """헤더 행 스타일 적용"""
     for col_idx, header in enumerate(headers, start=1):
         cell = ws.cell(row=row, column=col_idx, value=header)
         cell.font = Font(bold=True, color=COLOR_HEADER_FONT, name="맑은 고딕", size=10)
@@ -56,14 +63,7 @@ def _apply_header_row(ws, headers: list, row: int = 1):
         cell.border = _thin_border()
 
 
-def _set_column_widths(ws, widths: dict[int, float]):
-    """열 너비 설정 (열 인덱스 → 너비)"""
-    for col_idx, width in widths.items():
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-
-
-def _auto_column_widths(ws):
-    """내용 기준으로 열 너비 자동 설정 (최대 40)"""
+def _auto_column_widths(ws, min_width: float = 10, max_width: float = 45):
     for col in ws.columns:
         max_len = 0
         col_letter = get_column_letter(col[0].column)
@@ -73,293 +73,64 @@ def _auto_column_widths(ws):
                 max_len = max(max_len, cell_len)
             except Exception:
                 pass
-        ws.column_dimensions[col_letter].width = min(max_len * 1.4 + 2, 40)
+        ws.column_dimensions[col_letter].width = max(min(max_len * 1.3 + 2, max_width), min_width)
 
 
-def _freeze_panes(ws, cell: str = "E2"):
-    """틀 고정"""
-    ws.freeze_panes = cell
+def _fallback_output_path(output_path: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = output_path.suffix or ".xlsx"
+    return output_path.with_name(f"{output_path.stem}_{timestamp}{suffix}")
 
 
-# ──────────────────────────────────────────────
-#  시트별 작성 함수
-# ──────────────────────────────────────────────
+def _sanitize_cell_value(value):
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, str):
+        return ILLEGAL_CHARACTERS_RE.sub("", value)
+    return value
 
-def _write_vehicle_sheet(wb: openpyxl.Workbook, data: list[dict]):
-    """
-    시트: 용도별 자동차(현황)
-    data 항목 키: 지자체명, 용도, 차종, 대수, 주행거리
-    """
-    ws = wb["용도별 자동차(현황)"]
-    headers = config.EXCEL_HEADERS["용도별 자동차(현황)"]
+
+def _write_cell(ws, row: int, column: int, value):
+    sanitized = _sanitize_cell_value(value)
+    cell = ws.cell(row=row, column=column, value=sanitized)
+    if isinstance(sanitized, str) and sanitized.startswith(("=", "+", "@")):
+        cell.data_type = "s"
+    return cell
+
+
+def _write_generic_sheet(ws, headers: list[str], data: list[dict]):
+    """범용 시트 작성: 헤더 기반으로 데이터를 행에 씀"""
     _apply_header_row(ws, headers)
-    _freeze_panes(ws, "A2")
+    ws.freeze_panes = "B2"
 
     for row_idx, row_data in enumerate(data, start=2):
-        values = [
-            row_data.get("지자체명", ""),
-            row_data.get("용도", ""),
-            row_data.get("차종", ""),
-            row_data.get("대수", None),
-            row_data.get("주행거리", None),
-        ]
-        for col_idx, val in enumerate(values, start=1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+        for col_idx, header in enumerate(headers, start=1):
+            val = row_data.get(header, None)
+            if val is None and header in HEADER_KEY_ALIASES:
+                val = row_data.get(HEADER_KEY_ALIASES[header], None)
+            if isinstance(val, bool):
+                val = "Y" if val else "N"
+            cell = _write_cell(ws, row_idx, col_idx, val)
             cell.border = _thin_border()
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.alignment = Alignment(
+                horizontal="center" if col_idx <= 4 else "left",
+                vertical="center",
+                wrap_text=True,
+            )
             if row_idx % 2 == 0:
                 cell.fill = _alt_fill()
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                cell.number_format = "#,##0.##"
 
-    _set_column_widths(ws, {1: 20, 2: 12, 3: 12, 4: 14, 5: 22})
+    _auto_column_widths(ws)
 
-
-def _write_energy_sheet(wb: openpyxl.Workbook, data: list[dict]):
-    """
-    시트: 용도별 에너지(현황)
-    data 항목 키: 지자체명, 용도, 석유_에너지유, 석유_LPG, 석유_비에너지유,
-                  가스, 전력, 열, 신재생
-    """
-    ws = wb["용도별 에너지(현황)"]
-    headers = config.EXCEL_HEADERS["용도별 에너지(현황)"]
-    _apply_header_row(ws, headers)
-    _freeze_panes(ws, "C2")
-
-    key_map = [
-        "지자체명", "용도",
-        "석유_에너지유", "석유_LPG", "석유_비에너지유",
-        "가스", "전력", "열", "신재생",
-    ]
-
-    for row_idx, row_data in enumerate(data, start=2):
-        for col_idx, key in enumerate(key_map, start=1):
-            val = row_data.get(key, None)
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.border = _thin_border()
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            if row_idx % 2 == 0:
-                cell.fill = _alt_fill()
-
-    _set_column_widths(ws, {1: 20, 2: 12, **{i: 14 for i in range(3, 10)}})
-
-
-def _write_ghg_sheet(wb: openpyxl.Workbook, data: list[dict]):
-    """
-    시트: 온실가스(현황전망목표)
-    data 항목 키: 지자체명, 배출유형, 종류, 부문, {연도: 값, ...}
-    """
-    ws = wb["온실가스(현황전망목표)"]
-    headers = config.EXCEL_HEADERS["온실가스(현황전망목표)"]
-    _apply_header_row(ws, headers)
-    _freeze_panes(ws, "E2")
-
-    # 연도 헤더 셀 스타일
-    for col_idx in range(5, len(headers) + 1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.fill = _year_fill()
-        cell.font = Font(bold=True, name="맑은 고딕", size=9)
-
-    for row_idx, row_data in enumerate(data, start=2):
-        base_vals = [
-            row_data.get("지자체명", ""),
-            row_data.get("배출유형", ""),
-            row_data.get("종류", ""),
-            row_data.get("부문", ""),
-        ]
-        for col_idx, val in enumerate(base_vals, start=1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.border = _thin_border()
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            if row_idx % 2 == 0:
-                cell.fill = _alt_fill()
-
-        for year_offset, year in enumerate(config.YEARS):
-            col_idx = 5 + year_offset
-            val = row_data.get("연도별", {}).get(str(year), None)
-            # 중첩 dict 방어: {"가정": 13043, ...} → 합산 또는 None
-            if isinstance(val, dict):
-                try:
-                    val = float(sum(v for v in val.values() if isinstance(v, (int, float))))
-                except Exception:
-                    val = None
-            if val is not None:
-                try:
-                    val = float(val)
-                except (ValueError, TypeError):
-                    val = None
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.border = _thin_border()
-            cell.alignment = Alignment(horizontal="right", vertical="center")
-            if row_idx % 2 == 0:
-                cell.fill = _alt_fill()
-            if isinstance(val, (int, float)):
-                cell.number_format = "#,##0.00"
-
-    _set_column_widths(ws, {1: 20, 2: 12, 3: 8, 4: 10, **{i: 10 for i in range(5, 5 + len(config.YEARS))}})
-
-
-def _write_strategy_sheet(wb: openpyxl.Workbook, data: list[dict]):
-    """
-    시트: 감축전략(계획실적)
-    data 항목 키: 지자체명, 배출유형, 감축전략_부문, 감축사업명, 감축사업명_세부,
-                  구분, 성과지표, 종류, 연도별: {연도: 값}
-    """
-    ws = wb["감축전략(계획실적)"]
-    headers = config.EXCEL_HEADERS["감축전략(계획실적)"]
-    _apply_header_row(ws, headers)
-    _freeze_panes(ws, "I2")
-
-    for col_idx in range(9, len(headers) + 1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.fill = _year_fill()
-        cell.font = Font(bold=True, name="맑은 고딕", size=9)
-
-    base_keys = [
-        "지자체명", "배출유형", "감축전략_부문",
-        "감축사업명", "감축사업명_세부", "구분", "성과지표", "종류",
-    ]
-
-    for row_idx, row_data in enumerate(data, start=2):
-        for col_idx, key in enumerate(base_keys, start=1):
-            val = row_data.get(key, "")
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.border = _thin_border()
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            if row_idx % 2 == 0:
-                cell.fill = _alt_fill()
-
-        for year_offset, year in enumerate(config.YEARS):
-            col_idx = 9 + year_offset
-            val = row_data.get("연도별", {}).get(str(year), None)
-            # 중첩 dict 방어: {"계획": 100, ...} → 합산 또는 None
-            if isinstance(val, dict):
-                try:
-                    val = float(sum(v for v in val.values() if isinstance(v, (int, float))))
-                except Exception:
-                    val = None
-            if val is not None and val != "비예산":
-                try:
-                    val = float(val)
-                except (ValueError, TypeError):
-                    pass
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.border = _thin_border()
-            cell.alignment = Alignment(horizontal="right", vertical="center")
-            if row_idx % 2 == 0:
-                cell.fill = _alt_fill()
-            if isinstance(val, (int, float)):
-                cell.number_format = "#,##0.00"
-
-    _set_column_widths(ws, {
-        1: 20, 2: 10, 3: 10, 4: 20, 5: 25, 6: 8, 7: 20, 8: 14,
-        **{i: 10 for i in range(9, 9 + len(config.YEARS))}
-    })
-
-
-def _write_strategy_qualitative_sheet(wb: openpyxl.Workbook, data: list[dict]):
-    """
-    시트: 감축전략(정성사업)
-    연도별 수치가 없거나 정성사업으로 판단된 감축전략 행을 분리 보관합니다.
-    """
-    ws = wb["감축전략(정성사업)"]
-    headers = config.EXCEL_HEADERS["감축전략(정성사업)"]
-    _apply_header_row(ws, headers)
-    _freeze_panes(ws, "I2")
-
-    base_keys = [
-        "지자체명", "배출유형", "감축전략_부문",
-        "감축사업명", "감축사업명_세부", "구분", "성과지표", "종류",
-    ]
-
-    for row_idx, row_data in enumerate(data, start=2):
-        for col_idx, key in enumerate(base_keys, start=1):
-            val = row_data.get(key, "")
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.border = _thin_border()
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            if row_idx % 2 == 0:
-                cell.fill = _alt_fill()
-
-    _set_column_widths(ws, {
-        1: 20, 2: 10, 3: 14, 4: 28, 5: 28, 6: 8, 7: 28, 8: 14,
-    })
-
-
-def _write_chart_observations_sheet(wb: openpyxl.Workbook, data: list[dict]):
-    """
-    시트: 이미지·그래프 판독결과
-    그래프에서 읽은 값과 본 시트 반영 여부를 추적합니다.
-    """
-    ws = wb["이미지·그래프 판독결과"]
-    headers = config.EXCEL_HEADERS["이미지·그래프 판독결과"]
-    _apply_header_row(ws, headers)
-    _freeze_panes(ws, "G2")
-
-    keys = [
-        "지자체명", "페이지", "대상시트", "그래프유형", "제목", "단위",
-        "항목", "연도", "값", "신뢰도", "반영여부", "근거",
-    ]
-
-    for row_idx, row_data in enumerate(data, start=2):
-        for col_idx, key in enumerate(keys, start=1):
-            val = row_data.get(key, "")
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.border = _thin_border()
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            if row_idx % 2 == 0:
-                cell.fill = _alt_fill()
-            if key == "값" and isinstance(val, (int, float)):
-                cell.number_format = "#,##0.00"
-
-    _set_column_widths(ws, {
-        1: 18, 2: 8, 3: 12, 4: 10, 5: 36, 6: 14,
-        7: 22, 8: 8, 9: 12, 10: 10, 11: 10, 12: 45,
-    })
-
-
-def _write_summary_sheet(wb: openpyxl.Workbook, data: list[dict]):
-    """
-    시트: 지자체별 요약카드
-    data 항목 키: 지자체명, 항목, 내용, 근거
-    """
-    ws = wb["지자체별 요약카드"]
-    headers = config.EXCEL_HEADERS["지자체별 요약카드"]
-    _apply_header_row(ws, headers)
-    _freeze_panes(ws, "B2")
-
-    for row_idx, row_data in enumerate(data, start=2):
-        values = [
-            row_data.get("지자체명", ""),
-            row_data.get("항목", ""),
-            row_data.get("내용", ""),
-            row_data.get("근거", ""),
-        ]
-        for col_idx, val in enumerate(values, start=1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.border = _thin_border()
-            cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-            if row_idx % 2 == 0:
-                cell.fill = _alt_fill()
-        ws.row_dimensions[row_idx].height = 40
-
-    _set_column_widths(ws, {1: 20, 2: 22, 3: 60, 4: 20})
-
-
-# ──────────────────────────────────────────────
-#  메인 작성 함수
-# ──────────────────────────────────────────────
 
 def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
     """
-    추출된 데이터 딕셔너리를 받아 엑셀 파일을 생성합니다.
+    추출·정제된 데이터 딕셔너리를 받아 16개 시트 엑셀 파일을 생성합니다.
 
     Args:
-        extracted_data: {
-            "vehicle": [...],       # 용도별 자동차
-            "energy": [...],        # 용도별 에너지
-            "ghg": [...],           # 온실가스 현황전망목표
-            "strategy": [...],      # 감축전략 계획실적
-            "summary": [...],       # 지자체별 요약카드
-        }
+        extracted_data: 시트키 → list[dict] 매핑
         output_path: 저장할 엑셀 파일 경로
 
     Returns:
@@ -368,18 +139,38 @@ def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
     output_path = Path(output_path)
 
     wb = openpyxl.Workbook()
-    # 기본 시트 제거 후 설정된 출력 시트 생성
     del wb[wb.sheetnames[0]]
-    for sheet_name in config.EXCEL_HEADERS:
-        wb.create_sheet(sheet_name)
 
-    _write_vehicle_sheet(wb, extracted_data.get("vehicle", []))
-    _write_energy_sheet(wb, extracted_data.get("energy", []))
-    _write_ghg_sheet(wb, extracted_data.get("ghg", []))
-    _write_strategy_sheet(wb, extracted_data.get("strategy", []))
-    _write_strategy_qualitative_sheet(wb, extracted_data.get("strategy_qualitative", []))
-    _write_chart_observations_sheet(wb, extracted_data.get("chart_observations", []))
-    _write_summary_sheet(wb, extracted_data.get("summary", []))
+    optional_sheets = getattr(config, "OPTIONAL_EXCEL_SHEETS", set())
 
-    wb.save(str(output_path))
-    return output_path
+    for sheet_name, headers in config.EXCEL_HEADERS.items():
+        if sheet_name == "90_코드북" and not getattr(config, "CODEBOOK_SHEET_ENABLED", True):
+            continue
+
+        # config.SHEET_KEY_TO_NAME 역매핑으로 데이터 키 찾기
+        data_key = None
+        for key, name in config.SHEET_KEY_TO_NAME.items():
+            if name == sheet_name:
+                data_key = key
+                break
+
+        data = extracted_data.get(data_key, []) if data_key else []
+        if not isinstance(data, list):
+            data = []
+
+        # 선택 시트(보조검수후보·병합로그 등)는 데이터가 있을 때만 생성한다.
+        # 하이브리드 검수를 끄면 항상 비므로 빈 헤더 시트를 만들지 않는다.
+        if sheet_name in optional_sheets and not data:
+            continue
+
+        ws = wb.create_sheet(sheet_name)
+        _write_generic_sheet(ws, _headers_for_output(sheet_name, headers), data)
+
+    try:
+        wb.save(str(output_path))
+        return output_path
+    except (PermissionError, OSError):
+        fallback_path = _fallback_output_path(output_path)
+        wb.save(str(fallback_path))
+        print(f"원본 경로가 잠겨 있어 대체 경로에 저장했습니다: {fallback_path}")
+        return fallback_path

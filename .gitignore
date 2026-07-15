@@ -1,14 +1,33 @@
-.env
-node_modules/
 __pycache__/
-*.pyc
-*.log
-*.tmp
+*.py[cod]
+*$py.class
 
-# 입력/출력 데이터
-*.pdf
-*.hwp
-*.hwpx
+.env
+
+node_modules/
+npm-debug.log*
+
+.claude/
+.omc/
+.omx/
+.DS_Store
+
 *.xlsx
-outputs/
-data/
+*_결과*.xlsx
+탄소중립_추출결과_*.xlsx
+
+*.tmp
+*.log
+
+# 내부 작업 문서
+16guide.md
+CLAUDE.md
+excel_source_verification*.json
+*.hwp
+# 참고용 원본 가이드라인은 예외로 추적
+!docs/references/가이드라인.hwp
+
+.cache/
+
+# 골든셋·인벤토리는 측정 기준 자산이라 추적한다
+!data/golden/*.xlsx

@@ -1,451 +1,318 @@
 """
-에이전트 3-b: 빈칸 보완 에이전트
+에이전트 3-b: 빈칸 보완 에이전트 (가이드라인 기반 16개 시트)
 
-1차 정제 결과에서 값이 많이 비어 있는 행을 찾아, 관련 원문 페이지만 좁게
-다시 조회해 raw_data에 보완 후보를 추가합니다.
+1차 추출·정제 결과에서 비어 있거나 값 채움률이 낮은 시트를 찾아, 해당 시트와
+관련성이 높은 페이지만 다시 좁게 모아 재추출하여 raw_data에 보완 후보를 추가한다.
+
+설계 포인트:
+- 추출/라우팅 1차 패스가 놓친 페이지를 다시 잡기 위해, 재추출 시 라우팅 점수
+  임계값을 1차(config.DOCUMENT_ROUTE_MIN_SCORE)보다 낮게 둔다(recall 우선).
+- 추가된 행은 그대로 OrganizerAgent.organize()를 다시 거쳐 정규화·중복 제거되므로
+  중복으로 인한 오염 위험은 dedup이 흡수한다.
+- 추정값을 만들지 않도록 프롬프트에서 '원문에 명확히 보이는 값만' 추출을 강제한다.
 """
 
-import json
-import re
+import logging
 
 import config
 from utils import llm_client
+from utils.parallel import parallel_map_collect
 from utils.pdf_reader import PageContent
+from agents.extractor_agent import (
+    _SHEET_CONFIGS,
+    _score_page_for_sheet,
+    _build_page_text,
+    _build_semantic_batches,
+    _page_nums_from_batch_text,
+    _attach_row_context,
+    _PROVENANCE_INSTRUCTION,
+    _ROUTE_CONFIGS,
+    BatchRecord,
+    EXTRACTION_SYSTEM,
+)
+
+logger = logging.getLogger(__name__)
 
 
-GAP_FILL_SYSTEM = """당신은 한국 지자체 탄소중립 계획 보고서의 누락값을 보완하는 데이터 검수자입니다.
-반드시 JSON만 반환하세요.
-원문에 명확히 있는 값만 채우고, 추정이 필요한 값은 null로 두세요."""
+GAP_FILL_SYSTEM = (
+    EXTRACTION_SYSTEM
+    + "\n\n추가 규칙: 이것은 1차 추출에서 값이 누락된 시트를 보완하는 재추출입니다. "
+    "원문(배치 텍스트)에 명확히 보이는 값만 추출하고, 추정·보간·일반상식 채움은 금지합니다."
+)
 
 
-def _yearly_count(row: dict) -> int:
-    yearly = row.get("연도별") or {}
-    return sum(1 for year in config.YEARS if yearly.get(str(year)) is not None)
-
-
-def _compact(text: str, limit: int = 9000) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    return text[:limit]
-
-
-def _row_terms(row: dict, fields: list[str]) -> list[str]:
-    terms = []
-    for field in fields:
-        value = row.get(field)
-        if isinstance(value, str) and value.strip():
-            terms.append(value.strip())
-    return list(dict.fromkeys(terms))
-
-
-def _chunks(rows: list[dict], size: int) -> list[list[dict]]:
-    size = max(size, 1)
-    return [rows[i:i + size] for i in range(0, len(rows), size)]
-
-
-_FOCUSED_CONFIGS = {
-    "vehicle": {
-        "strong": [
-            "자동차 등록대수", "자동차 등록 대수", "등록 자동차", "등록대수",
-            "연료별 자동차", "차종별 자동차", "차종별 주행거리",
-            "연료별 자동차 등록 대수", "주행거리",
-        ],
-        "weak": [
-            "자동차", "차량", "승용차", "화물차", "승합차", "특수차",
-            "휘발유", "경유", "LPG", "전기차", "수소차", "하이브리드",
-        ],
-        "negative": ["전기차 보급", "충전기", "투자계획", "감축효과", "예산", "설문"],
-    },
-    "energy": {
-        "strong": [
-            "최종에너지 원별 소비량", "부문별 최종에너지 소비량",
-            "최종에너지 소비량", "에너지원별 소비량", "용도별 전력 소비량",
-            "서울시 최종에너지", "전력소비량",
-        ],
-        "weak": [
-            "에너지", "소비량", "석유", "도시가스", "전력", "열에너지",
-            "신재생", "가정·상업", "공공·기타", "산업", "수송", "toe", "TOE",
-        ],
-        "negative": ["투자계획", "감축효과", "예산", "설문", "교육"],
-    },
+# 시트별로 '값이 채워진 의미 있는 행'인지 판단하는 핵심 필드.
+# 이 필드 중 하나라도 값이 있으면 채워진 행으로 본다.
+_VALUE_FIELDS = {
+    "regional_conditions": ["값"],
+    "emissions_regional": ["배출량"],
+    "emissions_management": ["배출량"],
+    "emissions_forecast": ["전망값"],
+    "reduction_targets": ["기준배출량", "목표배출량", "목표감축량", "감축률"],
+    "quantitative_reductions": ["예상감축량", "활동량"],
+    "financial_plan": ["예산액"],
+    "annual_implementation": ["목표물량", "연간계획"],
 }
 
-
-def _score_focused_page(page: PageContent, sheet_key: str) -> int:
-    cfg = _FOCUSED_CONFIGS[sheet_key]
-    body = (page.text or "") + "\n" + "\n".join(page.tables or [])
-    score = 0
-    score += sum(4 for kw in cfg["strong"] if kw in body)
-    score += sum(1 for kw in cfg["weak"] if kw in body)
-    score -= sum(3 for kw in cfg["negative"] if kw in body)
-    if page.tables:
-        score += 2
-    if page.images:
-        score += 1
-    if re.search(r"\b20(0[5-9]|1[0-9]|2[0-9]|3[0-4])\b", body):
-        score += 1
-    return score
+# 빈칸보완 대상 시트(수치/표 중심으로 누락이 잦은 시트). 위 _VALUE_FIELDS 키와 일치.
+_GAP_FILL_SHEETS = list(_VALUE_FIELDS.keys())
 
 
 class GapFillAgent:
-    """빈칸이 큰 행만 보완 재추출."""
+    """비어 있거나 채움률이 낮은 시트를 재추출로 보완."""
 
     def __init__(self):
-        self._stats = {"targets": {}, "updates": {}}
+        self._stats: dict[str, dict] = {}
+        self._total_added = 0
+        self.ledger: list[BatchRecord] = []
 
-    def _page_text(self, page: PageContent) -> str:
-        text = page.text or ""
-        if page.tables:
-            text += "\n\n[표 데이터]\n" + "\n\n".join(page.tables)
-        return text
+    def _rows_for(self, sheet_key: str, cleaned: dict | list[dict]) -> list[dict]:
+        if isinstance(cleaned, list):
+            return cleaned
+        rows = cleaned.get(sheet_key, [])
+        return rows if isinstance(rows, list) else []
 
-    def _find_context(self, pages: list[PageContent], terms: list[str], fallback_terms: list[str]) -> str:
-        scored = []
-        for page in pages:
-            body = self._page_text(page)
-            score = 0
-            for term in terms:
-                if term and term in body:
-                    score += 5
-            for term in fallback_terms:
-                if term and term in body:
-                    score += 1
-            if score > 0:
-                scored.append((score, page.page_number, body))
+    def _needs_backfill(self, sheet_key: str, cleaned: dict | list[dict]) -> tuple[bool, str]:
+        rows = self._rows_for(sheet_key, cleaned)
+        if not rows:
+            return True, "빈 시트"
+        thresholds = getattr(config, "GAP_FILL_COVERAGE_THRESHOLDS", {})
 
-        scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
-        selected = scored[: config.GAP_FILL_CONTEXT_PAGES]
-        return "\n\n".join(
-            f"=== 페이지 {page_num} ===\n{body[:2500]}"
-            for _, page_num, body in selected
+        if sheet_key == "emissions_regional":
+            sectors = {r.get("부문") for r in rows if isinstance(r, dict) and r.get("부문")}
+            years = {r.get("연도") for r in rows if isinstance(r, dict) and r.get("연도")}
+            min_sectors = int(thresholds.get("emissions_regional_min_sectors", 4))
+            min_years = int(thresholds.get("emissions_regional_min_years", 2))
+            reasons = []
+            if len(sectors) < min_sectors:
+                reasons.append(f"부문 {len(sectors)}/{min_sectors}")
+            if len(years) < min_years:
+                reasons.append(f"연도 {len(years)}/{min_years}")
+            return (bool(reasons), ", ".join(reasons))
+
+        if sheet_key == "emissions_management":
+            sectors = {r.get("관리부문") for r in rows if isinstance(r, dict) and r.get("관리부문")}
+            min_sectors = int(thresholds.get("emissions_management_min_sectors", 2))
+            if len(sectors) < min_sectors:
+                return True, f"관리부문 {len(sectors)}/{min_sectors}"
+            return False, ""
+
+        if sheet_key == "emissions_forecast":
+            years = {r.get("연도") for r in rows if isinstance(r, dict) and r.get("연도")}
+            min_years = int(thresholds.get("emissions_forecast_min_years", 2))
+            if len(years) < min_years:
+                return True, f"연도 {len(years)}/{min_years}"
+            return False, ""
+
+        if sheet_key == "reduction_targets":
+            years = {r.get("목표연도") for r in rows if isinstance(r, dict) and r.get("목표연도")}
+            missing = [year for year in (2030, 2050) if year not in years]
+            if missing:
+                return True, "목표연도 누락: " + ", ".join(str(year) for year in missing)
+            return False, ""
+
+        if isinstance(cleaned, dict) and sheet_key in {"quantitative_reductions", "annual_implementation"}:
+            project_rows = cleaned.get("mitigation_projects", [])
+            project_count = len(project_rows) if isinstance(project_rows, list) else 0
+            ratio = float(thresholds.get("project_ratio", 0.3))
+            if project_count and len(rows) < project_count * ratio:
+                return True, f"사업 대비 행수 {len(rows)}/{project_count} < {ratio:.0%}"
+            return False, ""
+
+        if sheet_key == "financial_plan":
+            years = {r.get("연도") for r in rows if isinstance(r, dict) and r.get("연도")}
+            sectors = {r.get("부문") for r in rows if isinstance(r, dict) and r.get("부문")}
+            min_years = int(thresholds.get("financial_plan_min_years", 2))
+            min_sectors = int(thresholds.get("financial_plan_min_sectors", 2))
+            reasons = []
+            if len(years) < min_years:
+                reasons.append(f"연도 {len(years)}/{min_years}")
+            if len(sectors) < min_sectors:
+                reasons.append(f"부문 {len(sectors)}/{min_sectors}")
+            return (bool(reasons), ", ".join(reasons))
+
+        value_fields = _VALUE_FIELDS.get(sheet_key, [])
+        if not value_fields:
+            return False, ""
+        filled = sum(
+            1 for r in rows
+            if isinstance(r, dict) and any(
+                r.get(f) is not None and str(r.get(f, "")).strip() for f in value_fields
+            )
         )
+        ratio = filled / len(rows) if rows else 0.0
+        min_ratio = getattr(config, "GAP_FILL_MIN_FILL_RATIO", 0.6)
+        if ratio < min_ratio:
+            return True, f"채움률 {ratio:.0%} < {min_ratio:.0%}"
+        return False, ""
 
-    def _focused_context_batches(self, pages: list[PageContent], sheet_key: str) -> list[str]:
-        """자동차/에너지 전용으로 관련 가능성이 높은 구간만 다시 묶는다."""
-        if not getattr(config, "FOCUSED_GAP_FILL_ENABLED", True):
+    def _has_strong_keyword(self, page: PageContent, sheet_key: str) -> bool:
+        cfg = _ROUTE_CONFIGS.get(sheet_key, {})
+        combined = f"{page.text or ''}\n" + "\n".join(page.tables or [])
+        return any(keyword in combined for keyword in cfg.get("strong", []))
+
+    def _relevant_pages(
+        self,
+        pages: list[PageContent],
+        sheet_key: str,
+        min_score: int,
+        max_pages: int,
+        exclude_nums: set[int] | None = None,
+    ) -> list[PageContent]:
+        exclude_nums = exclude_nums or set()
+        scored = [
+            (_score_page_for_sheet(page, sheet_key), page)
+            for page in pages
+            if page.page_number not in exclude_nums and self._has_strong_keyword(page, sheet_key)
+        ]
+        scored = [(score, page) for score, page in scored if score >= min_score]
+        scored.sort(key=lambda item: (item[0], -item[1].page_number), reverse=True)
+        return [page for _, page in scored[:max_pages]]
+
+    def _reextract(self, sheet_key: str, batch_text: str, municipality: str) -> list[dict]:
+        cfg = _SHEET_CONFIGS.get(sheet_key)
+        if not cfg:
             return []
-
-        min_score = config.FOCUSED_GAP_FILL_MIN_SCORE.get(sheet_key, 5)
-        max_anchors = config.FOCUSED_GAP_FILL_MAX_ANCHORS.get(sheet_key, 10)
-        context_radius = getattr(config, "FOCUSED_GAP_FILL_CONTEXT_PAGES", 2)
-        batch_pages = getattr(config, "FOCUSED_GAP_FILL_BATCH_PAGES", 6)
-
-        scored = []
-        by_num = {page.page_number: page for page in pages}
-        for page in pages:
-            score = _score_focused_page(page, sheet_key)
-            if score >= min_score:
-                scored.append((score, page.page_number))
-
-        scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
-        anchors = [page_num for _, page_num in scored[:max_anchors]]
-        selected_nums: set[int] = set()
-        for page_num in anchors:
-            for n in range(page_num - context_radius, page_num + context_radius + 1):
-                if n in by_num:
-                    selected_nums.add(n)
-
-        selected = [by_num[n] for n in sorted(selected_nums)]
-        chunks = [selected[i:i + batch_pages] for i in range(0, len(selected), batch_pages)]
-        contexts = []
-        for chunk in chunks:
-            parts = []
-            for page in chunk:
-                body = self._page_text(page)
-                parts.append(f"=== 페이지 {page.page_number} ===\n{body[:3200]}")
-            contexts.append("\n\n".join(parts))
-        return contexts
-
-    def _call_gap_fill(self, sheet_key: str, targets: list[dict], context: str, municipality: str) -> list[dict]:
-        if not targets or not context.strip():
+        page_nums = _page_nums_from_batch_text(batch_text)
+        prompt = (
+            f"지자체명: {municipality}\n\n"
+            "아래 배치 텍스트는 1차 추출에서 값이 누락되었을 가능성이 큰 구간입니다.\n"
+            f"[배치 텍스트]\n{batch_text}\n\n"
+            f"{cfg['prompt']}\n\n{_PROVENANCE_INSTRUCTION}"
+        )
+        parsed, parse_ok = llm_client.call_text_json(prompt, system=GAP_FILL_SYSTEM, stage="gap_fill")
+        if not parse_ok or not isinstance(parsed, dict):
+            self.ledger.append(BatchRecord(sheet_key, page_nums, "parse_fail", 0, "JSON 파싱 실패"))
             return []
-
-        sample = json.dumps(targets, ensure_ascii=False)
-        schemas = {
-            "vehicle": (
-                '{"vehicle": [{"지자체명": "...", "용도": "전체|승용|화물|버스|이륜|특수|승합", '
-                '"차종": "경유|휘발유|LPG|전기|수소|하이브리드", "대수": 숫자or null, '
-                '"주행거리": 숫자or null, "보완상태": "보완|원문미기재"}]}'
-            ),
-            "energy": (
-                '{"energy": [{"지자체명": "...", "용도": "가정|상업|공공|산업|수송 등", '
-                '"석유_에너지유": 숫자or null, "석유_LPG": 숫자or null, "석유_비에너지유": 숫자or null, '
-                '"가스": 숫자or null, "전력": 숫자or null, "열": 숫자or null, "신재생": 숫자or null, '
-                '"보완상태": "보완|원문미기재"}]}'
-            ),
-            "ghg": (
-                '{"ghg": [{"지자체명": "...", "배출유형": "직접배출|간접배출|흡수원", '
-                '"종류": "현황|전망|목표", "부문": "건물|수송|농축산|폐기물|흡수원|전환|산업|수소|합계|기타", '
-                '"연도별": {"2018": 숫자, "2030": 숫자}, "보완상태": "보완|원문미기재"}]}'
-            ),
-            "strategy": (
-                '{"strategy": [{"지자체명": "...", "배출유형": "직접배출|간접배출", '
-                '"감축전략_부문": "...", "감축사업명": "...", "감축사업명_세부": "...", '
-                '"구분": "공통|특화", "성과지표": "...", '
-                '"종류": "계획(지표)|계획(감축량)|계획(예산)|실적(지표)|실적(감축량)|실적(예산)", '
-                '"연도별": {"2024": 숫자}, "보완상태": "보완|원문미기재|정성사업"}]}'
-            ),
-        }
-        prompt = f"""지자체명: {municipality}
-
-다음은 1차 추출 결과에서 값이 비어 있는 {sheet_key} 행입니다.
-원문 문맥을 보고 누락값을 보완하세요.
-
-[보완 대상]
-{sample}
-
-[관련 원문]
-{_compact(context)}
-
-반환 형식:
-{schemas[sheet_key]}
-
-규칙:
-- 원문에 명확한 숫자가 있는 값만 채우세요.
-- 원문에 숫자 없이 정성 설명만 있으면 보완상태를 "정성사업" 또는 "원문미기재"로 두세요.
-- 대상 행에 대응하는 원문을 찾지 못하면 값은 null로 두고 보완상태만 표시하세요.
-- 기존 행 식별에 필요한 사업명/부문/용도/차종은 반드시 유지하세요."""
-
-        resp = llm_client.call_text(prompt, system=GAP_FILL_SYSTEM)
-        parsed = llm_client.parse_json(resp)
-        if not isinstance(parsed, dict):
+        items = parsed.get(sheet_key, [])
+        if not isinstance(items, list):
+            self.ledger.append(BatchRecord(sheet_key, page_nums, "parse_fail", 0, "스키마 불일치"))
             return []
-        rows = parsed.get(sheet_key, [])
-        return rows if isinstance(rows, list) else []
+        out: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            row = _attach_row_context(item, municipality, page_nums)
+            row["보완출처"] = "gap_fill"
+            out.append(row)
+        self.ledger.append(BatchRecord(sheet_key, page_nums, "ok", len(out)))
+        return out
 
-    def _extract_vehicle_table(self, context: str, municipality: str) -> list[dict]:
-        if not context.strip():
-            return []
-        prompt = f"""지자체명: {municipality}
-
-다음 원문에서 자동차 현황 데이터를 다시 추출하세요.
-특히 등록대수(대)를 우선 채우세요. 주행거리가 원문에 없으면 null로 둡니다.
-
-[관련 원문]
-{_compact(context, 12000)}
-
-반환 형식:
-{{
-  "vehicle": [
-    {{"지자체명": "...", "용도": "전체|승용|화물|버스|이륜|특수|승합", "차종": "경유|휘발유|LPG|전기|수소|하이브리드|CNG|기타", "대수": 숫자or null, "주행거리": 숫자or null}}
-  ]
-}}
-
-규칙:
-- 대수와 주행거리를 혼동하지 마세요.
-- 연료별 전체 자동차 등록대수만 있으면 용도는 "전체"로 기록하세요.
-- 차종별 등록대수만 있으면 차종은 "전체" 또는 "기타"로 두고 용도에 승용/화물/승합/특수 등을 기록하세요.
-- 차량 대수·주행거리와 무관한 표이면 빈 배열을 반환하세요.
-- 전기차 성장률, 보급 목표, 추진계획, 투자계획, 감축효과 표의 숫자는 자동차 현황 대수로 사용하지 마세요.
-- 표 제목, 비율, 증감률, 예산, 배출량 숫자는 대수로 사용하지 마세요."""
-        resp = llm_client.call_text(prompt, system=GAP_FILL_SYSTEM)
-        parsed = llm_client.parse_json(resp)
-        if not isinstance(parsed, dict):
-            return []
-        rows = parsed.get("vehicle", [])
-        return rows if isinstance(rows, list) else []
-
-    def _extract_energy_table(self, context: str, municipality: str) -> list[dict]:
-        if not context.strip():
-            return []
-        prompt = f"""지자체명: {municipality}
-
-다음 원문에서 에너지 소비 현황 데이터를 다시 추출하세요.
-원문에 명확한 수치가 있는 셀만 채우고, 교차표가 없으면 억지로 추정하지 마세요.
-
-[관련 원문]
-{_compact(context, 14000)}
-
-반환 형식:
-{{
-  "energy": [
-    {{"지자체명": "...", "용도": "전체|가정|상업|공공|기타|산업|수송|가정·상업|공공·기타", "석유_에너지유": 숫자or null, "석유_LPG": 숫자or null, "석유_비에너지유": 숫자or null, "가스": 숫자or null, "전력": 숫자or null, "열": 숫자or null, "신재생": 숫자or null}}
-  ]
-}}
-
-규칙:
-- [표]에 에너지원별 총량만 있으면 용도는 "전체"로 기록하세요.
-- [표]에 부문별 총량만 있으면 해당 부문의 합계 성격 값을 석유/전력/가스 등에 억지 배분하지 말고, 에너지원별 수치가 확인되는 경우에만 채우세요.
-- 에너지원별 총량을 가정/상업/공공 등 특정 용도에 임의 배정하지 마세요.
-- 서술문에 비중(%)만 있는 경우 실제 소비량으로 환산하지 마세요.
-- 단위가 천TOE, TOE, TJ, GWh 등으로 명시된 수치만 사용하세요.
-- 변화율, 비율, 예산, 온실가스 배출량은 에너지 소비량으로 사용하지 마세요."""
-        resp = llm_client.call_text(prompt, system=GAP_FILL_SYSTEM)
-        parsed = llm_client.parse_json(resp)
-        if not isinstance(parsed, dict):
-            return []
-        rows = parsed.get("energy", [])
-        return rows if isinstance(rows, list) else []
-
-    def _focused_extract_vehicle_energy(
+    def enhance(
         self,
         raw_data: dict,
         cleaned: dict,
         pages: list[PageContent],
-        municipality: str,
-    ) -> tuple[dict, int]:
-        updated = dict(raw_data)
-        total = 0
+        batch_size: int | None = None,
+        extracted_page_nums: dict[str, set[int]] | None = None,
+        routed_page_nums: dict[str, set[int]] | None = None,
+    ) -> dict:
+        """
+        Args:
+            raw_data: 1차 추출(+이미지 병합) 원시 결과. 보완 행이 여기에 append 된다.
+            cleaned: organize() 1차 결과(시트별 정제 데이터). 채움률 판단 기준.
+            pages: 문서 전체 페이지.
+            extracted_page_nums: 1차 추출 원장에서 status==ok인 성공 페이지번호.
+                GAP_FILL_SKIP_ALREADY_ROUTED=True이면 이 페이지만 재추출 후보에서 제외한다.
 
-        vehicle_rows = cleaned.get("vehicle", [])
-        vehicle_count_filled = sum(1 for row in vehicle_rows if row.get("대수") is not None)
-        vehicle_needs_focus = not vehicle_rows or (
-            vehicle_count_filled / len(vehicle_rows) < 0.7
-            or all(row.get("주행거리") is None for row in vehicle_rows)
+        Returns:
+            보완 행이 추가된 raw_data(추가가 전혀 없으면 원본 raw_data 그대로).
+        """
+        municipality = (
+            cleaned.get("municipality_name")
+            or raw_data.get("municipality_name", "알 수 없음")
         )
-
-        energy_cols = ["석유_에너지유", "석유_LPG", "석유_비에너지유", "가스", "전력", "열", "신재생"]
-        energy_rows = cleaned.get("energy", [])
-        energy_filled_cells = sum(1 for row in energy_rows for col in energy_cols if row.get(col) is not None)
-        energy_possible_cells = len(energy_rows) * len(energy_cols)
-        energy_needs_focus = not energy_rows or (
-            energy_possible_cells > 0 and energy_filled_cells / energy_possible_cells < 0.35
-        )
-
-        if vehicle_needs_focus:
-            contexts = self._focused_context_batches(pages, "vehicle")
-            focused_rows: list[dict] = []
-            for context in contexts:
-                focused_rows.extend(self._extract_vehicle_table(context, municipality))
-            if focused_rows:
-                updated["vehicle"] = list(updated.get("vehicle", [])) + focused_rows
-                total += len(focused_rows)
-                self._stats["updates"]["vehicle_focused"] = len(focused_rows)
-            else:
-                self._stats["updates"]["vehicle_focused"] = 0
-
-        if energy_needs_focus:
-            contexts = self._focused_context_batches(pages, "energy")
-            focused_rows = []
-            for context in contexts:
-                focused_rows.extend(self._extract_energy_table(context, municipality))
-            if focused_rows:
-                updated["energy"] = list(updated.get("energy", [])) + focused_rows
-                total += len(focused_rows)
-                self._stats["updates"]["energy_focused"] = len(focused_rows)
-            else:
-                self._stats["updates"]["energy_focused"] = 0
-
-        return updated, total
-
-    def _vehicle_targets(self, cleaned: dict) -> list[dict]:
-        rows = []
-        for row in cleaned.get("vehicle", []):
-            if row.get("대수") is None or row.get("주행거리") is None:
-                rows.append(row)
-        return rows[: config.GAP_FILL_MAX_TARGETS.get("vehicle", 20)]
-
-    def _energy_targets(self, cleaned: dict) -> list[dict]:
-        cols = ["석유_에너지유", "석유_LPG", "석유_비에너지유", "가스", "전력", "열", "신재생"]
-        rows = []
-        for row in cleaned.get("energy", []):
-            filled = sum(1 for col in cols if row.get(col) is not None)
-            if filled < 3:
-                rows.append(row)
-        return rows[: config.GAP_FILL_MAX_TARGETS.get("energy", 20)]
-
-    def _ghg_targets(self, cleaned: dict) -> list[dict]:
-        rows = [row for row in cleaned.get("ghg", []) if _yearly_count(row) <= 1]
-        return rows[: config.GAP_FILL_MAX_TARGETS.get("ghg", 30)]
-
-    def _strategy_targets(self, cleaned: dict) -> list[dict]:
-        rows = [row for row in cleaned.get("strategy", []) if _yearly_count(row) == 0]
-        return rows[: config.GAP_FILL_MAX_TARGETS.get("strategy", 60)]
-
-    def enhance(self, raw_data: dict, cleaned: dict, pages: list[PageContent]) -> dict:
-        municipality = cleaned.get("municipality_name") or raw_data.get("municipality_name", "알 수 없음")
         updated = dict(raw_data)
-        total_updates = 0
+        batch_size = batch_size or config.BATCH_SIZE
+        min_score = getattr(config, "GAP_FILL_REEXTRACT_MIN_SCORE", 2)
+        max_pages = getattr(config, "GAP_FILL_REEXTRACT_MAX_PAGES", 24)
+        skip_routed = getattr(config, "GAP_FILL_SKIP_ALREADY_ROUTED", True)
+        extracted_page_nums = extracted_page_nums or routed_page_nums or {}
+        self._total_added = 0
+        self.ledger = []
 
-        plans = [
-            ("vehicle", self._vehicle_targets(cleaned), ["자동차", "차량", "등록대수", "주행거리"]),
-            ("energy", self._energy_targets(cleaned), ["에너지", "전력", "도시가스", "석유", "신재생", "소비량"]),
-            ("ghg", self._ghg_targets(cleaned), ["온실가스", "배출량", "전망", "목표", "tCO2", "CO2eq"]),
-            ("strategy", self._strategy_targets(cleaned), ["감축", "사업", "성과지표", "예산", "감축량", "실적"]),
-        ]
-
-        for sheet_key, targets, fallback_terms in plans:
-            self._stats["targets"][sheet_key] = len(targets)
-            if not targets:
-                self._stats["updates"][sheet_key] = 0
+        # 보완 대상 시트별로 재추출 배치를 모두 모은 뒤 동시에 호출한다(배치 간 독립).
+        sheet_batches: list[dict] = []
+        print("[에이전트3b 빈칸보완] 채움률 점검 및 보완 재추출 시작...")
+        for sheet_key in _GAP_FILL_SHEETS:
+            rows = self._rows_for(sheet_key, cleaned)
+            needs, reason = self._needs_backfill(sheet_key, cleaned)
+            self._stats[sheet_key] = {
+                "before": len(rows), "needs": needs, "reason": reason, "added": 0,
+            }
+            if not needs:
                 continue
 
-            terms = []
-            if sheet_key == "vehicle":
-                for row in targets:
-                    terms.extend(_row_terms(row, ["용도", "차종"]))
-            elif sheet_key == "energy":
-                for row in targets:
-                    terms.extend(_row_terms(row, ["용도"]))
-            elif sheet_key == "ghg":
-                for row in targets:
-                    terms.extend(_row_terms(row, ["종류", "부문"]))
-            else:
-                for row in targets:
-                    terms.extend(_row_terms(row, ["감축사업명", "감축사업명_세부", "성과지표"]))
+            exclude_nums = extracted_page_nums.get(sheet_key, set()) if skip_routed else set()
+            relevant = self._relevant_pages(
+                pages, sheet_key, min_score, max_pages, exclude_nums=exclude_nums
+            )
+            if not relevant:
+                note = " / 관련 페이지 없음"
+                if skip_routed and exclude_nums:
+                    note = " / 1차 미전송 신규 페이지 없음(이미 라우팅됨)"
+                self._stats[sheet_key]["reason"] = reason + note
+                continue
 
-            updates = []
-            for batch in _chunks(targets, config.GAP_FILL_TARGET_BATCH_SIZE):
-                batch_terms = []
-                if sheet_key == "vehicle":
-                    for row in batch:
-                        batch_terms.extend(_row_terms(row, ["용도", "차종"]))
-                elif sheet_key == "energy":
-                    for row in batch:
-                        batch_terms.extend(_row_terms(row, ["용도"]))
-                elif sheet_key == "ghg":
-                    for row in batch:
-                        batch_terms.extend(_row_terms(row, ["종류", "부문"]))
-                else:
-                    for row in batch:
-                        batch_terms.extend(_row_terms(row, ["감축사업명", "감축사업명_세부", "성과지표"]))
-                context = self._find_context(pages, batch_terms or terms, fallback_terms)
-                updates.extend(self._call_gap_fill(sheet_key, batch, context, municipality))
-            self._stats["updates"][sheet_key] = len(updates)
-            if updates:
-                total_updates += len(updates)
-                updated.setdefault(sheet_key, [])
-                updated[sheet_key] = list(updated.get(sheet_key, [])) + updates
+            # 점수순으로 뽑힌 페이지를 페이지번호 순으로 정렬한 뒤 의미 단위 배치로 묶는다.
+            ordered = sorted(relevant, key=lambda p: p.page_number)
+            for batch in _build_semantic_batches(ordered, batch_size):
+                page_nums = [page.page_number for page in batch]
+                sheet_batches.append({
+                    "sheet_key": sheet_key,
+                    "batch": batch,
+                    "reason": reason,
+                    "relevant_n": len(relevant),
+                    "page_nums": page_nums,
+                })
 
-            if sheet_key == "vehicle":
-                vehicle_rows = cleaned.get("vehicle", [])
-                filled = sum(1 for row in vehicle_rows if row.get("대수") is not None)
-                fill_rate = filled / len(vehicle_rows) if vehicle_rows else 0
-                if fill_rate < 0.5:
-                    context = self._find_context(
-                        pages,
-                        ["자동차", "차량", "등록대수", "차종별", "용도별"],
-                        ["자동차", "차량", "등록대수", "주행거리"],
-                    )
-                    extra = self._extract_vehicle_table(context, municipality)
-                    if extra:
-                        total_updates += len(extra)
-                        self._stats["updates"][sheet_key] += len(extra)
-                        updated.setdefault("vehicle", [])
-                        updated["vehicle"] = list(updated.get("vehicle", [])) + extra
-
-        focused_updated, focused_count = self._focused_extract_vehicle_energy(
-            raw_data=updated,
-            cleaned=cleaned,
-            pages=pages,
-            municipality=municipality,
+        results = parallel_map_collect(
+            lambda sb: self._reextract(sb["sheet_key"], _build_page_text(sb["batch"]), municipality),
+            sheet_batches,
+            workers=getattr(config, "TEXT_WORKERS", 4),
         )
-        if focused_count:
-            updated = focused_updated
-            total_updates += focused_count
 
-        # 연도값이 끝내 없는 감축전략은 삭제하지 않고 상태 표시용 후보를 추가한다.
-        for row in self._strategy_targets(cleaned):
-            marker = dict(row)
-            marker["보완상태"] = "정성사업/원문미기재"
-            updated.setdefault("strategy_gap_notes", []).append(marker)
+        added_by_sheet: dict[str, list[dict]] = {}
+        info_by_sheet: dict[str, tuple[str, int]] = {}
+        failed_batches = 0
+        for task, (added_rows, err) in zip(sheet_batches, results):
+            sheet_key = task["sheet_key"]
+            if err is not None:
+                failed_batches += 1
+                self.ledger.append(BatchRecord(
+                    sheet_key, list(task["page_nums"]), "call_fail", 0,
+                    f"{type(err).__name__}: {str(err)[:200]}",
+                ))
+                print(f"  [{sheet_key}] 보완 배치 호출 실패({type(err).__name__}) — 원장 기록")
+                continue
+            added_by_sheet.setdefault(sheet_key, []).extend(added_rows or [])
+            info_by_sheet[sheet_key] = (task["reason"], task["relevant_n"])
 
-        return updated if total_updates > 0 else raw_data
+        for sheet_key, added_rows in added_by_sheet.items():
+            if not added_rows:
+                continue
+            updated[sheet_key] = list(updated.get(sheet_key, [])) + added_rows
+            self._total_added += len(added_rows)
+            self._stats[sheet_key]["added"] = len(added_rows)
+            reason, relevant_n = info_by_sheet[sheet_key]
+            print(
+                f"  [{sheet_key}] {reason} → 관련 {relevant_n}p 재추출, "
+                f"보완 후보 {len(added_rows)}건"
+            )
+
+        if failed_batches:
+            print(f"[에이전트3b 빈칸보완] 호출 실패 배치 {failed_batches}건 원장 기록")
+        print(f"[에이전트3b 빈칸보완] 완료. 보완 후보 총 {self._total_added}건 추가")
+        return updated if self._total_added > 0 else raw_data
 
     def report(self) -> str:
-        targets = ", ".join(f"{k}: {v}건" for k, v in self._stats.get("targets", {}).items())
-        updates = ", ".join(f"{k}: {v}건" for k, v in self._stats.get("updates", {}).items())
-        return (
-            "[에이전트3b 빈칸보완] 완료\n"
-            f"  - 보완 대상: {targets or '없음'}\n"
-            f"  - 보완 후보 추가: {updates or '없음'}"
-        )
+        needy = {k: v for k, v in self._stats.items() if v.get("needs")}
+        lines = ["[에이전트3b 빈칸보완] 완료", f"  - 보완 후보 총 {self._total_added}건 추가"]
+        for sheet_key, info in needy.items():
+            lines.append(
+                f"  - {sheet_key}: 기존 {info['before']}건 "
+                f"({info['reason']}) → 추가 {info['added']}건"
+            )
+        if not needy:
+            lines.append("  - 보완 필요 시트 없음")
+        return "\n".join(lines)
