@@ -53,7 +53,13 @@ def test_extract_sheet_pages_runs_batches_in_parallel(monkeypatch: pytest.Monkey
     lock = threading.Lock()
     first_pair_barrier = threading.Barrier(2)
 
-    def fake_extract(sheet_key: str, batch_text: str, municipality: str, guideline_prompt: str = "") -> list[dict]:
+    def fake_extract(
+        sheet_key: str,
+        batch_text: str,
+        municipality: str,
+        guideline_prompt: str = "",
+        **kwargs,
+    ) -> list[dict]:
         nonlocal active, max_active
         page_number = int(batch_text.split("페이지 ", maxsplit=1)[1].split(" ", maxsplit=1)[0])
         with lock:
@@ -242,7 +248,7 @@ def test_supervisor_closed_loop_interleaves_sheet_steps_and_preserves_global_cap
     monkeypatch.setattr(config, "HYBRID_REVIEW_ENABLED", True)
     monkeypatch.setattr(config, "HYBRID_REVIEW_SHEETS", [SHEET_A, SHEET_B])
     monkeypatch.setattr(config, "HYBRID_ADJUDICATION_MAX_CANDIDATES", 3)
-    monkeypatch.setattr(supervisor_module, "ExtractorAgent", lambda: fake_extractor)
+    monkeypatch.setattr(supervisor_module, "ExtractorAgent", lambda **kwargs: fake_extractor)
     monkeypatch.setattr(supervisor_module, "OrganizerAgent", lambda: fake_organizer)
     monkeypatch.setattr(supervisor_module, "HybridReviewAgent", lambda: fake_hybrid)
 
@@ -279,7 +285,7 @@ def test_supervisor_closed_loop_quota_keeps_partial_logs_and_continues_extractio
     monkeypatch.setattr(config, "HYBRID_REVIEW_ENABLED", True)
     monkeypatch.setattr(config, "HYBRID_REVIEW_SHEETS", [SHEET_A, SHEET_B, SHEET_C])
     monkeypatch.setattr(config, "HYBRID_ADJUDICATION_MAX_CANDIDATES", 0)
-    monkeypatch.setattr(supervisor_module, "ExtractorAgent", lambda: fake_extractor)
+    monkeypatch.setattr(supervisor_module, "ExtractorAgent", lambda **kwargs: fake_extractor)
     monkeypatch.setattr(supervisor_module, "OrganizerAgent", lambda: fake_organizer)
     monkeypatch.setattr(supervisor_module, "HybridReviewAgent", lambda: fake_hybrid)
 

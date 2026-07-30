@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "development": "반복 개발과 회귀 검사에 사용합니다.",
+    "holdout": "튜닝에는 사용하지 않고 명시적인 최종 평가에서만 엽니다.",
+    "locked": "등록된 파일은 같은 ID에서 수정하지 않고 변경 시 새 버전을 만듭니다."
+  },
+  "datasets": [
+    {
+      "id": "seoul-development-v1-draft",
+      "role": "development",
+      "review_status": "draft",
+      "locked": true,
+      "source": "../../서울특별시_탄소중립계획.pdf",
+      "source_sha256": "9d63dae845099ccb8349e7b370e314b02f6402a4fa712568f6af7d43f65ed207",
+      "golden": "../golden/서울특별시_골든셋_v1_초벌.xlsx",
+      "golden_sha256": "27265078002d0ca2d609e54c05603169c0368c1ad5747298dbab7daedf29033c",
+      "visual_inventory": "../golden/서울_시각요소_인벤토리_v1.xlsx",
+      "visual_inventory_sha256": "75c4623f31c05f8292bf39bd634e609b41f595f4dd96d917772d5744d2fcc39d",
+      "notes": "파일 해시는 고정했지만 골든셋 내용은 사람 최종 확정 전 초벌입니다. --allow-draft-evaluation으로만 사용합니다."
+    },
+    {
+      "id": "gangwon-holdout-v1-pending",
+      "role": "holdout",
+      "review_status": "golden_pending",
+      "locked": false,
+      "source": "../../제1차 강원특별자치도 탄소중립 녹색성장 기본계획.pdf",
+      "source_sha256": "c01fe657eb3c9af724d499e53e24c6ec5a9985f264a3986ea23c78786d9c4308",
+      "golden": null,
+      "golden_sha256": "",
+      "visual_inventory": null,
+      "visual_inventory_sha256": "",
+      "notes": "홀드아웃 후보. 사람 확정 골든셋과 시각 인벤토리 등록 전에는 평가할 수 없습니다."
+    },
+    {
+      "id": "gyeonggi-holdout-v1-pending",
+      "role": "holdout",
+      "review_status": "golden_pending",
+      "locked": false,
+      "source": "../../제1차 경기도 탄소중립 녹색성장 기본계획.pdf",
+      "source_sha256": "b3875d3034a09e2837314bedc268feb02215899b2a6d7f6f62c8ac5b8d83610d",
+      "golden": null,
+      "golden_sha256": "",
+      "visual_inventory": null,
+      "visual_inventory_sha256": "",
+      "notes": "홀드아웃 후보. 사람 확정 골든셋과 시각 인벤토리 등록 전에는 평가할 수 없습니다."
+    }
+  ]
+}

@@ -240,23 +240,57 @@ def _apply_inventory_sector_normalization(row: dict, field: str, raw_field: str)
         row["세부부문"] = _compact_qualifier(qualifier_match.group("qualifier"))
 
 
+_MAJOR_CHAPTER_LINE_PATTERNS = (
+    re.compile(r"^\s*제\s*0*(\d{1,2})\s*장(?:\s|[:：.]|$)"),
+    re.compile(r"^\s*0*(\d{1,2})\s*장(?:\s|[:：.]|$)"),
+    # 실제 지자체 보고서에서 쓰는 '03 기존 계획의 평가', '04 비전 및 전략' 형식.
+    # 한 자리 절 번호와 혼동하지 않도록 이 형식은 두 자리 번호만 허용한다.
+    re.compile(r"^\s*(\d{2})\s+(?=\S)"),
+)
+
+
+def _chapter_heading_ids(text: str) -> list[str]:
+    ids: list[str] = []
+    lines = [line.strip() for line in (text or "").splitlines()[:16]]
+    for index, compact in enumerate(lines):
+        if not compact:
+            continue
+        for pattern in _MAJOR_CHAPTER_LINE_PATTERNS:
+            match = pattern.match(compact)
+            if match is not None:
+                ids.append(str(int(match.group(1))))
+                break
+        else:
+            # PDF 레이아웃 추출에서 '04'와 '비전 및 전략'이 서로 다른 줄로 분리되는 경우.
+            # 다음 줄이 짧은 제목일 때만 장 후보로 인정한다.
+            number_only = re.fullmatch(r"(\d{2})", compact)
+            following = next((line for line in lines[index + 1:] if line), "")
+            if (
+                number_only is not None
+                and following
+                and len(following) <= 80
+                and not re.fullmatch(r"[\d\s.,%-]+", following)
+            ):
+                ids.append(str(int(number_only.group(1))))
+    return ids
+
+
 def _chapter_id(text: str) -> str:
-    head = (text or "")[:200]
-    match = re.search(r"제\s*(\d+)\s*장", head)
-    if match is not None:
-        return match.group(1)
-    match = re.search(r"^\s*(\d+)\s*[장.]\s+", head)
-    return match.group(1) if match is not None else ""
+    ids = _chapter_heading_ids(text)
+    return ids[0] if ids else ""
 
 
 def _has_chapter_heading(text: str) -> bool:
-    head = (text or "")[:200]
-    return bool(re.search(r"제\s*\d+\s*장|^\s*\d+\s*[장.]\s+", head))
+    return bool(_chapter_heading_ids(text))
 
 
 def _is_prior_plan_heading(text: str) -> bool:
-    head = (text or "")[:200]
-    return any(re.search(pattern, head) for pattern in getattr(config, "PRIOR_PLAN_HEADING_PATTERNS", []))
+    patterns = getattr(config, "PRIOR_PLAN_HEADING_PATTERNS", [])
+    for line in (text or "").splitlines()[:16]:
+        compact = line.strip()
+        if compact and len(compact) <= 120 and any(re.search(pattern, compact) for pattern in patterns):
+            return True
+    return False
 
 
 def detect_prior_plan_pages(pages: list) -> set[int]:
@@ -267,6 +301,10 @@ def detect_prior_plan_pages(pages: list) -> set[int]:
         text = getattr(page, "text", "")
         if not _is_prior_plan_heading(text):
             continue
+        chapter_ids = set(_chapter_heading_ids(text))
+        # 목차 페이지는 여러 장 제목이 한꺼번에 등장한다. 시작점으로 쓰지 않는다.
+        if len(chapter_ids) >= 3 or "목차" in "\n".join((text or "").splitlines()[:8]):
+            continue
         start_page = int(getattr(page, "page_number", 0))
         start_chapter = _chapter_id(text)
         break
@@ -275,6 +313,7 @@ def detect_prior_plan_pages(pages: list) -> set[int]:
 
     detected: set[int] = set()
     active = False
+    max_pages = max(1, int(getattr(config, "PRIOR_PLAN_MAX_PAGES", 60)))
     for page in sorted_pages:
         page_number = int(getattr(page, "page_number", 0))
         text = getattr(page, "text", "")
@@ -284,9 +323,23 @@ def detect_prior_plan_pages(pages: list) -> set[int]:
             continue
         current_chapter = _chapter_id(text)
         if page_number != start_page and _has_chapter_heading(text):
-            if not start_chapter or (current_chapter and current_chapter != start_chapter):
+            # 장 내부의 '01 개요', '02 성과 평가' 절 번호는 시작 장 번호보다 작거나
+            # 같을 수 있다. 시작 장보다 큰 번호만 다음 장 경계로 본다.
+            is_later_chapter = bool(
+                start_chapter
+                and current_chapter
+                and int(current_chapter) > int(start_chapter)
+            )
+            if not start_chapter or is_later_chapter:
                 break
         detected.add(page_number)
+        if len(detected) > max_pages:
+            logger.warning(
+                "기존계획 평가 장 종료 경계를 %s페이지 안에 찾지 못해 탐지를 무효화합니다: p%s 이후",
+                max_pages,
+                start_page,
+            )
+            return set()
     return detected
 
 
@@ -674,6 +727,7 @@ def _remember_dedup_conflict(
     fields: list[str],
     reason: str = "기존 순서 유지",
 ) -> None:
+    resolved = bool(reason and reason != "기존 순서 유지")
     _set_data_status(kept, "conflicting")
     key_summary = ", ".join(f"{field}={kept.get(field) or discarded.get(field) or ''}" for field in key_fields)
     detail = "; ".join(
@@ -682,7 +736,12 @@ def _remember_dedup_conflict(
     )
     if reason:
         detail = f"{detail}; 채택근거: {reason}"
-    _DEDUP_CONFLICTS.append({"key": key_summary, "detail": detail})
+    _DEDUP_CONFLICTS.append({
+        "key": key_summary,
+        "detail": detail,
+        "resolved": resolved,
+        "reason": reason,
+    })
 
 
 def _merge_missing_values(target: dict, source: dict) -> None:
@@ -754,6 +813,31 @@ def _filled_cell_count(row: dict) -> int:
 
 
 def _choose_conflict_row(kept: dict, incoming: dict) -> tuple[dict, dict, str]:
+    kept_table = bool(kept.get(_DEDUP_TABLE_MARKER_FIELD))
+    incoming_table = bool(incoming.get(_DEDUP_TABLE_MARKER_FIELD))
+    if incoming_table and not kept_table:
+        return incoming, kept, "표 마커 출처 우선"
+    if kept_table and not incoming_table:
+        return kept, incoming, "표 마커 출처 우선"
+
+    # 본문/파싱 표의 reported 값을 이미지 판독값보다 우선한다. 상태가 같을 때만
+    # 채움 필드 수를 비교해 값이 많은 행을 선택한다.
+    source_rank = {
+        "reported": 4,
+        "gap_fill": 3,
+        "calculated": 3,
+        "visual_only": 2,
+        "conflicting": 1,
+    }
+    kept_status = str(kept.get("데이터상태", "") or "").strip()
+    incoming_status = str(incoming.get("데이터상태", "") or "").strip()
+    kept_rank = source_rank.get(kept_status, 0)
+    incoming_rank = source_rank.get(incoming_status, 0)
+    if incoming_rank > kept_rank:
+        return incoming, kept, "데이터 출처 우선순위"
+    if kept_rank > incoming_rank:
+        return kept, incoming, "데이터 출처 우선순위"
+
     kept_count = _filled_cell_count(kept)
     incoming_count = _filled_cell_count(incoming)
     if incoming_count > kept_count:
@@ -761,12 +845,6 @@ def _choose_conflict_row(kept: dict, incoming: dict) -> tuple[dict, dict, str]:
     if kept_count > incoming_count:
         return kept, incoming, "값 채움 필드 수 우선"
 
-    kept_table = bool(kept.get(_DEDUP_TABLE_MARKER_FIELD))
-    incoming_table = bool(incoming.get(_DEDUP_TABLE_MARKER_FIELD))
-    if incoming_table and not kept_table:
-        return incoming, kept, "표 마커 출처 우선"
-    if kept_table and not incoming_table:
-        return kept, incoming, "표 마커 출처 우선"
     return kept, incoming, "기존 순서 유지"
 
 
@@ -1675,34 +1753,33 @@ def _tag_prior_plan_rows(cleaned: dict, municipality: str, prior_plan_pages: set
         rows = cleaned.get(sheet_key, [])
         if not isinstance(rows, list):
             continue
-        tagged_count = 0
+        tagged_rows: list[int] = []
+        tagged_pages: set[int] = set()
         for index, row in enumerate(rows, start=1):
             pages = _row_source_pages(row)
             if not pages:
                 continue
             if pages <= prior_plan_pages:
                 row[_PLAN_CONTEXT_FIELD] = "기존계획"
-                tagged_count += 1
-                _remember_validation_issue(
-                    municipality,
-                    "경고",
-                    _sheet_area(sheet_key),
-                    f"{_sheet_area(sheet_key)} 행 {index}: 기존계획 평가 장 유래",
-                    f"기존계획 평가 장({','.join(f'p{page}' for page in sorted(pages))}) 유래 — 본계획 사업 목록과 관리번호 충돌 가능",
-                    "본계획 사업목록·사업카드 기준으로 원문 확인",
-                    target_sheet_key=sheet_key,
-                    target_row_number=index,
-                )
+                tagged_rows.append(index)
+                tagged_pages.update(pages)
             else:
                 row[_PLAN_CONTEXT_FIELD] = "본계획"
-        if tagged_count:
+        if tagged_rows:
+            page_list = sorted(tagged_pages)
+            page_summary = ",".join(f"p{page}" for page in page_list[:12])
+            if len(page_list) > 12:
+                page_summary += ",…"
+            row_summary = f"행 {tagged_rows[0]}~{tagged_rows[-1]}" if len(tagged_rows) > 1 else f"행 {tagged_rows[0]}"
             _remember_validation_issue(
                 municipality,
-                "정보",
+                "경고",
                 _sheet_area(sheet_key),
-                f"기존계획 평가 장 유래 {tagged_count}건",
-                f"{_sheet_area(sheet_key)}에서 기존계획 평가 장 유래 행 {tagged_count}건 태깅",
-                "자동 이동·삭제하지 않고 타깃 검수 대상으로 넘김",
+                "기존계획 평가 장 유래 행",
+                f"{_sheet_area(sheet_key)} {len(tagged_rows)}건({row_summary}, {page_summary})을 "
+                "기존계획 평가 장 유래 문맥으로 태깅",
+                "행별 중복 경고는 만들지 않음. 본계획 사업목록·사업카드와 시트 단위로 대조",
+                target_sheet_key=sheet_key,
             )
 
 
@@ -1792,13 +1869,14 @@ def _emissions_total_by_year(rows: list[dict]) -> dict[int, float]:
 
 def _append_dedup_conflict_issues(issues: list[dict], municipality: str) -> None:
     for conflict in _DEDUP_CONFLICTS:
+        resolved = bool(conflict.get("resolved"))
         issues.append(_issue(
             municipality,
-            "경고",
+            "정보" if resolved else "경고",
             "중복제거",
-            f"중복 키 값 충돌({conflict['key']})",
+            f"중복 키 값 충돌-{'자동해결' if resolved else '미해결'}({conflict['key']})",
             conflict["detail"],
-            "원문 페이지 재확인",
+            "선택 근거와 원문 페이지 확인" if resolved else "원문 페이지 재확인",
         ))
 
 
@@ -1972,12 +2050,21 @@ def _validate_final_data(
                 "기준 단위로 환산하거나 출처별로 분리 검토",
             ))
 
-    # 5) 재정 합계 vs 부분합 교차검증(보수적): (계획구분,부문,연도)별로 '합계' 행과
-    #    재원별 행의 합을 비교해 1% 이상 어긋나면 표시.
+    # 5) 재정 합계 vs 부분합 교차검증. 서로 다른 사업을 같은 부문·연도로 묶으면
+    # 허위 경고가 대량 발생하므로 관리번호/사업명과 예산단위가 같은 행만 비교한다.
     fin = cleaned.get("financial_plan", [])
     groups: dict[tuple, dict] = {}
     for r in fin:
-        key = (r.get("계획구분"), r.get("부문"), r.get("연도"))
+        entity = _dedup_key_text(r.get("관리번호") or r.get("사업명"))
+        if not entity:
+            continue
+        key = (
+            r.get("계획구분"),
+            r.get("부문"),
+            entity,
+            r.get("연도"),
+            _dedup_key_text(r.get("예산단위")),
+        )
         g = groups.setdefault(key, {"합계": None, "부분합": 0.0, "부분수": 0})
         amount = r.get("예산액")
         if not isinstance(amount, (int, float)):
@@ -1987,12 +2074,14 @@ def _validate_final_data(
         else:
             g["부분합"] += amount
             g["부분수"] += 1
-    for (plan, sector, year), g in groups.items():
+    for (plan, sector, entity, year, unit), g in groups.items():
         total = g["합계"]
         if total and g["부분수"] >= 2 and total != 0:
             if abs(total - g["부분합"]) / abs(total) > 0.01:
                 issues.append(_issue(
-                    municipality, "경고", "재정투자계획", f"합계≠부분합({sector} {year})",
+                    municipality, "경고", "재정투자계획",
+                    f"합계≠부분합({entity} {year})",
+                    f"{sector or '부문미상'} / {unit or '단위미상'}: "
                     f"합계 {total} vs 재원별 합 {round(g['부분합'],1)}",
                     "재원별 누락/중복 또는 합계 오기 확인",
                 ))
@@ -2005,7 +2094,18 @@ def _validate_final_data(
     _append_gap_fill_summary(issues, cleaned, municipality)
     _append_ledger_issues(issues, municipality, ledger, raw_counts, routed_page_nums, cleaned)
 
-    return issues
+    unique: list[dict] = []
+    seen: set[tuple] = set()
+    for issue in issues:
+        identity = tuple(
+            str(issue.get(field, "") or "").strip()
+            for field in ("지자체명", "심각도", "영역", "항목", "문제내용", "권장조치")
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(issue)
+    return unique
 
 
 class OrganizerAgent:

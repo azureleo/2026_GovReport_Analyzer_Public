@@ -34,7 +34,10 @@ def _timestamp() -> str:
 def _run_command(command: str, source: Path, output: Path, env_extra: dict[str, str]) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.update(env_extra)
-    args = [*shlex.split(command), str(source), "--output", str(output)]
+    tokens = shlex.split(command, posix=os.name != "nt")
+    if os.name == "nt":
+        tokens = [token[1:-1] if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"} else token for token in tokens]
+    args = [*tokens, str(source), "--output", str(output)]
     return subprocess.run(args, cwd=ROOT, env=env, text=True, capture_output=True, check=False)
 
 

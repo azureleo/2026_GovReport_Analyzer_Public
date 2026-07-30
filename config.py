@@ -85,6 +85,34 @@ LOCAL_AGENT_MODEL = os.environ.get("LOCAL_AGENT_MODEL", "").strip()
 # 정상 추출 호출은 보통 1~2분 내 끝난다. 900초 기본값은 hang을 15분씩 방치해
 # 로컬 에이전트 실행을 수 시간 지연시켰으므로, 필요 시 env로만 되돌린다.
 LOCAL_AGENT_TIMEOUT = _env_int("LOCAL_AGENT_TIMEOUT", 300)
+# 타임아웃은 quota로 추정하지 않는다. 최초 호출 뒤 허용할 추가 재시도 횟수와
+# 재시도 간격을 별도로 제한해 한 배치가 수십 분씩 점유하지 않게 한다.
+LOCAL_AGENT_TIMEOUT_RETRIES = _env_int("LOCAL_AGENT_TIMEOUT_RETRIES", 1)
+LOCAL_AGENT_TIMEOUT_RETRY_DELAY_SECONDS = _env_int(
+    "LOCAL_AGENT_TIMEOUT_RETRY_DELAY_SECONDS", 5
+)
+# 텍스트 추출 배치가 끝내 타임아웃되면 페이지 묶음을 더 작게 나눠 다시 시도한다.
+# 모델 호출 전에도 문자 수가 큰 배치를 미리 분할해, 300초 타임아웃을 먼저 소비하지 않는다.
+EXTRACTION_SPLIT_ON_TIMEOUT = _env_bool("EXTRACTION_SPLIT_ON_TIMEOUT", True)
+EXTRACTION_TIMEOUT_MIN_BATCH_PAGES = _env_int("EXTRACTION_TIMEOUT_MIN_BATCH_PAGES", 2)
+EXTRACTION_TIMEOUT_MAX_SPLIT_DEPTH = _env_int("EXTRACTION_TIMEOUT_MAX_SPLIT_DEPTH", 6)
+EXTRACTION_TIMEOUT_RECOVERY_BUDGET_SECONDS = _env_int(
+    "EXTRACTION_TIMEOUT_RECOVERY_BUDGET_SECONDS", 900
+)
+# 타임아웃뿐 아니라 최종 호출 실패·JSON 파싱 실패도 작은 배치에서 복구한다.
+EXTRACTION_SPLIT_ON_FAILURE = _env_bool("EXTRACTION_SPLIT_ON_FAILURE", True)
+# 일반 호출의 최대 배치 문자 수. 초과 배치는 호출 전에 페이지/문서객체 단위로 분할한다.
+EXTRACTION_MAX_BATCH_CHARS = _env_int("EXTRACTION_MAX_BATCH_CHARS", 18000)
+# 실패 복구 자식은 일반 배치보다 작게 유지한다.
+EXTRACTION_RECOVERY_MAX_BATCH_CHARS = _env_int("EXTRACTION_RECOVERY_MAX_BATCH_CHARS", 12000)
+# 단일 페이지의 큰 표는 헤더를 반복하면서 이 행 수 단위로 잘라 정규화한다.
+EXTRACTION_TABLE_ROWS_PER_BATCH = _env_int("EXTRACTION_TABLE_ROWS_PER_BATCH", 20)
+
+# 성공 배치 결과와 실패 상태를 입력/프롬프트/모델 해시별로 영속화한다.
+RUN_STATE_ENABLED = _env_bool("RUN_STATE_ENABLED", True)
+RUN_STATE_DIR = os.environ.get("RUN_STATE_DIR", ".cache/runs").strip()
+EXTRACTION_RESUME = _env_bool("EXTRACTION_RESUME", False)
+EXTRACTION_RETRY_FAILED_ONLY = _env_bool("EXTRACTION_RETRY_FAILED_ONLY", False)
 CODEX_COMMAND = os.environ.get("CODEX_COMMAND", "codex").strip()
 CLAUDE_COMMAND = os.environ.get("CLAUDE_COMMAND", "claude").strip()
 GUIDELINE_STRUCTURED_INJECTION = _env_bool("GUIDELINE_STRUCTURED_INJECTION", True)
@@ -94,6 +122,32 @@ APPENDIX3_MATCH_THRESHOLD = _env_float("APPENDIX3_MATCH_THRESHOLD", APPENDIX4_MA
 CODEBOOK_SHEET_ENABLED = _env_bool("CODEBOOK_SHEET_ENABLED", True)
 DATA_STATUS_ENABLED = _env_bool("DATA_STATUS_ENABLED", True)
 MIN_DOCUMENT_TEXT_CHARS = _env_int("MIN_DOCUMENT_TEXT_CHARS", 500)
+
+# 최종 데이터의 원문 근거를 LLM 없이 행 단위로 대조한다. 원문 표·그래프
+# 인벤토리가 비활성 또는 미연결인 실행에만 보수적인 품질 점수 상한을 적용한다.
+SOURCE_VERIFICATION_ENABLED = _env_bool("SOURCE_VERIFICATION_ENABLED", True)
+SOURCE_VERIFICATION_PAGE_RADIUS = _env_int("SOURCE_VERIFICATION_PAGE_RADIUS", 1)
+SOURCE_VERIFICATION_MAX_TERMS = _env_int("SOURCE_VERIFICATION_MAX_TERMS", 12)
+SOURCE_VERIFICATION_GLOBAL_SEARCH = _env_bool("SOURCE_VERIFICATION_GLOBAL_SEARCH", True)
+SOURCE_VERIFICATION_MARK_PDF = _env_bool("SOURCE_VERIFICATION_MARK_PDF", True)
+SOURCE_VERIFICATION_MAX_MARKS = _env_int("SOURCE_VERIFICATION_MAX_MARKS", 10000)
+SOURCE_OBJECT_INVENTORY_ENABLED = _env_bool("SOURCE_OBJECT_INVENTORY_ENABLED", True)
+# 표·그림 객체 완전성에서 같은 페이지 행만 있는 경우는 부분 확인으로 계산한다.
+SOURCE_OBJECT_PARTIAL_WEIGHT = _env_float("SOURCE_OBJECT_PARTIAL_WEIGHT", 0.5)
+# 표 번호·캡션·섹션을 이용해 결과 행이 올바른 시트에 배치됐는지 별도로 검증한다.
+# 자동 이동은 계획 시작 이후의 배출현황 행이 명시적인 전망표에 놓인 경우로 제한한다.
+SEMANTIC_ROUTING_ENABLED = _env_bool("SEMANTIC_ROUTING_ENABLED", True)
+SEMANTIC_ROUTING_AUTO_RECLASSIFY = _env_bool("SEMANTIC_ROUTING_AUTO_RECLASSIFY", True)
+SEMANTIC_ROUTING_MIN_SCORE = _env_float("SEMANTIC_ROUTING_MIN_SCORE", 5.0)
+SEMANTIC_ROUTING_MIN_MARGIN = _env_float("SEMANTIC_ROUTING_MIN_MARGIN", 1.5)
+QUALITY_THRESHOLD = _env_float("QUALITY_THRESHOLD", 70.0)
+QUALITY_MAX_WITHOUT_SOURCE_INVENTORY = _env_float("QUALITY_MAX_WITHOUT_SOURCE_INVENTORY", 95.0)
+
+# 고정 골든셋/홀드아웃 평가는 일반 실행과 분리된 명시적 테스트 모드다.
+EVALUATION_MANIFEST_PATH = os.environ.get(
+    "EVALUATION_MANIFEST_PATH",
+    "data/evaluation/benchmark_manifest.json",
+).strip()
 
 # 추출은 단발 JSON 작업이라 레포 파일·MCP 서버·스킬·프로젝트 메모리(CLAUDE.md)가 불필요하다.
 # True이면 claude/codex를 중립 임시 디렉터리에서 실행하고, claude는 MCP/스킬/설정/동적
@@ -127,6 +181,9 @@ GEMINI_RETRY_BASE_SECONDS = _env_int("GEMINI_RETRY_BASE_SECONDS", 20)
 GEMINI_RETRY_MAX_SECONDS = _env_int("GEMINI_RETRY_MAX_SECONDS", 90)
 GEMINI_FAIL_SOFT_ON_TRANSIENT = _env_bool("GEMINI_FAIL_SOFT_ON_TRANSIENT", True)
 GEMINI_REQUEST_TIMEOUT_SECONDS = _env_int("GEMINI_REQUEST_TIMEOUT_SECONDS", 180)
+# 추출 재현성을 우선한다. 일부 추론 모델/CLI는 이 값을 지원하지 않으므로 Gemini
+# GenerateContent 요청에만 직접 적용하고, 나머지는 캐시·체크포인트로 고정한다.
+LLM_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.0)
 
 # OpenAI API 설정.
 # Gemini Flash 계열과 비교 테스트하기 위한 기본 모델은 사용자가 지정한 gpt-5.4-mini로 둔다.
@@ -306,6 +363,16 @@ EXCEL_HEADERS = {
     "19_검증리포트": [
         "지자체명", "심각도", "영역", "항목", "문제내용", "권장조치",
     ],
+    "20_원문대조": [
+        "지자체명", "대상시트", "원본행번호", "상태", "신뢰도",
+        "출처페이지", "확인페이지", "점수", "검색어", "일치검색어",
+        "행요약", "검수메시지",
+    ],
+    "21_원문객체인벤토리": [
+        "지자체명", "객체ID", "객체유형", "출처페이지", "번호", "캡션",
+        "섹션", "행수", "열수", "연결상태", "완전성점수", "연결시트",
+        "연결행수", "검수메시지", "예상시트", "시트정합상태",
+    ],
     "90_코드북": [
         "코드유형", "코드", "라벨", "정의", "비고",
     ],
@@ -366,11 +433,16 @@ SHEET_KEY_TO_NAME = {
     "hybrid_review_candidates": "17_보조검수후보",
     "hybrid_merge_log": "18_보조병합로그",
     "validation_report": "19_검증리포트",
+    "source_verification": "20_원문대조",
+    "source_object_inventory": "21_원문객체인벤토리",
     "codebook": "90_코드북",
 }
 
 # 데이터가 있을 때만 생성하는 선택 시트
-OPTIONAL_EXCEL_SHEETS = {"17_보조검수후보", "18_보조병합로그", "19_검증리포트", "90_코드북"}
+OPTIONAL_EXCEL_SHEETS = {
+    "17_보조검수후보", "18_보조병합로그", "19_검증리포트",
+    "20_원문대조", "21_원문객체인벤토리", "90_코드북",
+}
 
 # 행 단위 원문 대조를 위한 페이지 근거. 헤더에는 항상 맨 뒤에 추가하되,
 # 실제 엑셀 출력에서만 PROVENANCE_ENABLED=0으로 v3 스키마를 복원할 수 있다.
@@ -402,6 +474,9 @@ PRIOR_PLAN_HEADING_PATTERNS = _env_pattern_list(
         r"이전\s*계획.{0,6}평가",
     ],
 )
+# 다음 장 제목을 찾지 못했을 때 기존계획 구간을 문서 끝까지 확장하지 않는 안전 상한.
+# 상한을 넘으면 탐지를 무효화하고 오탐 경고를 만들지 않는다.
+PRIOR_PLAN_MAX_PAGES = _env_int("PRIOR_PLAN_MAX_PAGES", 60)
 # 시트별 라우팅 후보 페이지 상한. 기본값은 없음.
 # 테스트/최적화가 필요할 때만 DOCUMENT_ROUTE_MAX_PAGES_* 환경변수로 명시적으로 샘플링한다.
 _DOCUMENT_ROUTE_DEFAULT_MAX_PAGES: dict[str, int | None] = {}
@@ -503,6 +578,10 @@ IMAGE_TRIAGE_KEEP_RENDERED_CONTEXT = True
 IMAGE_CHART_TABLE_EXTRACTION = True
 # 전수 이미지 분석 시 여러 이미지를 한 번의 로컬 에이전트 호출로 묶는다.
 IMAGE_ANALYSIS_BATCH_SIZE = _env_int("IMAGE_ANALYSIS_BATCH_SIZE", 8)
+# 비전 배치도 텍스트 배치와 같은 실행 원장에 저장하고, 실패 시 이미지 단위로 분할한다.
+VISION_CHECKPOINT_ENABLED = _env_bool("VISION_CHECKPOINT_ENABLED", True)
+VISION_SPLIT_ON_FAILURE = _env_bool("VISION_SPLIT_ON_FAILURE", True)
+VISION_RECOVERY_MAX_SPLIT_DEPTH = _env_int("VISION_RECOVERY_MAX_SPLIT_DEPTH", 6)
 # 그래프 판독값을 본 시트에 자동 병합할 최소 신뢰도.
 # low는 별도 판독결과 시트에만 남기고 본 데이터에는 병합하지 않는다.
 IMAGE_CHART_MERGE_MIN_CONFIDENCE = "medium"
@@ -582,20 +661,15 @@ MAX_RETRIES = 3
 # ──────────────────────────────────────────────────────────────────────
 # 할당량(quota/세션 한도) 회복 대기-재개 설정
 # ──────────────────────────────────────────────────────────────────────
-# True이면 codex/claude 로컬 에이전트가 quota 메시지 없이 반복 타임아웃될 때
-# throttling으로 추정해 짧게 대기 후 재시도한다. 명시적 quota/session-limit 오류는
-# 배치 원장과 상위 단계 정책이 처리하도록 즉시 전파한다.
+# 명시적인 quota/session-limit 오류에만 회복 대기를 적용한다. 일반 타임아웃은
+# LOCAL_AGENT_TIMEOUT_RETRIES만큼만 재시도한 뒤 배치 분할/실패 원장으로 넘긴다.
 LLM_QUOTA_WAIT_ENABLED = _env_bool("LLM_QUOTA_WAIT_ENABLED", True)
-# 반복 타임아웃 추정 시 재시도 폴링 간격(초).
-# 10분 폴링은 기본 실행에서 과도한 정지를 만들었으므로 기본 2분으로 줄이고 env로 조정한다.
+# 명시적 quota 회복을 확인할 폴링 간격(초).
 LLM_QUOTA_WAIT_POLL_SECONDS = _env_int("LLM_QUOTA_WAIT_POLL_SECONDS", 120)
 # 누적 대기 상한(초). 6시간은 밤샘 완주용으로만 env에서 선택하고 기본은 30분으로 제한한다.
 LLM_QUOTA_WAIT_MAX_SECONDS = _env_int("LLM_QUOTA_WAIT_MAX_SECONDS", 1800)
 # 대기 중 "아직 살아 있음"을 알리는 하트비트 로그 간격(초). 기본 5분.
 LLM_QUOTA_WAIT_HEARTBEAT_SECONDS = _env_int("LLM_QUOTA_WAIT_HEARTBEAT_SECONDS", 300)
-# codex/claude 명시적 quota와 연속 타임아웃은 짧게 대기 후 재개하고, 상한 초과 시
-# 해당 배치 실패로 격리한다(LLM_QUOTA_WAIT_ENABLED=True일 때).
-LLM_TIMEOUT_AS_QUOTA_THRESHOLD = _env_int("LLM_TIMEOUT_AS_QUOTA_THRESHOLD", 2)
 
 # 이미지 최대 크기 (픽셀, 긴 변 기준)
 MAX_IMAGE_SIZE = 1568

@@ -16,6 +16,7 @@ from openpyxl.styles import (
 from openpyxl.utils import get_column_letter
 
 import config
+from utils.run_state import merge_rows_stably
 
 
 COLOR_HEADER_BG = "2E75B6"
@@ -125,6 +126,16 @@ def _write_generic_sheet(ws, headers: list[str], data: list[dict]):
     _auto_column_widths(ws)
 
 
+def _stable_output_rows(sheet_name: str, data: list[dict]) -> list[dict]:
+    """병렬 완료 순서와 무관하게 같은 행 집합을 같은 순서로 기록한다."""
+    data_key = next(
+        (key for key, configured_name in config.SHEET_KEY_TO_NAME.items() if configured_name == sheet_name),
+        sheet_name,
+    )
+    rows, _ = merge_rows_stably(data_key, [], data)
+    return rows
+
+
 def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
     """
     추출·정제된 데이터 딕셔너리를 받아 16개 시트 엑셀 파일을 생성합니다.
@@ -164,7 +175,11 @@ def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
             continue
 
         ws = wb.create_sheet(sheet_name)
-        _write_generic_sheet(ws, _headers_for_output(sheet_name, headers), data)
+        _write_generic_sheet(
+            ws,
+            _headers_for_output(sheet_name, headers),
+            _stable_output_rows(sheet_name, data),
+        )
 
     try:
         wb.save(str(output_path))

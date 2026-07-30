@@ -109,6 +109,16 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
             if golden_pages & output_pages:
                 page_hits += 1
 
+    scored_sheets = [
+        sheet for sheet in sheet_results.values()
+        if sheet.get("상태") == "정상"
+    ]
+    golden_rows = sum(int(sheet.get("골든행수", 0) or 0) for sheet in scored_sheets)
+    output_rows = sum(int(sheet.get("출력행수", 0) or 0) for sheet in scored_sheets)
+    matched_rows = sum(int(sheet.get("매칭수", 0) or 0) for sheet in scored_sheets)
+    matched_cells = sum(int(sheet.get("셀일치수", 0) or 0) for sheet in scored_sheets)
+    expected_cells = sum(int(sheet.get("셀기대수", 0) or 0) for sheet in scored_sheets)
+
     result: dict[str, Any] = {
         "라벨": label_value,
         "파이프라인출력": str(output),
@@ -178,6 +188,19 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
         ],
         "스케일동치쌍수": len(전체스케일동치),
         "스케일동치쌍": 전체스케일동치,
+        "독립평가지표": {
+            # 매칭되지 않은 골든 행을 포함한 모든 채점 대상 값 셀을 분모로 삼는다.
+            "cell_accuracy": (
+                round(matched_cells / expected_cells, 4) if expected_cells else None
+            ),
+            "cell_matches": matched_cells,
+            "cell_expected": expected_cells,
+            "row_recall": round(matched_rows / golden_rows, 4) if golden_rows else None,
+            "row_precision": round(matched_rows / output_rows, 4) if output_rows else None,
+            "row_matches": matched_rows,
+            "golden_rows": golden_rows,
+            "output_rows": output_rows,
+        },
     }
     md_path = report_base / f"golden_score_{label_value}.md"
     md_path.write_text(마크다운(result), encoding="utf-8")

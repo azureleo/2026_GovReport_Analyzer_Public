@@ -1,3 +1,4 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,8 @@ class QuotaResilienceTests(unittest.TestCase):
                 "LLM_QUOTA_WAIT_MAX_SECONDS",
                 "PARALLEL_PROCESSING_ENABLED",
                 "TEXT_WORKERS",
+                "LOCAL_AGENT_TIMEOUT_RETRIES",
+                "LOCAL_AGENT_TIMEOUT_RETRY_DELAY_SECONDS",
             )
         }
         llm_client.reset_llm_stats()
@@ -68,6 +71,25 @@ class QuotaResilienceTests(unittest.TestCase):
         with patch.object(llm_client.time, "sleep", return_value=None):
             with self.assertRaises(llm_client.LLMQuotaExceededError):
                 llm_client._retry_local_call(quota_call, max_retries=1, label="quota-test")
+
+    def test_timeout_is_bounded_and_not_treated_as_quota(self):
+        # Given: 로컬 호출이 계속 타임아웃되고 추가 재시도는 1회로 제한되어 있으면
+        config.LOCAL_AGENT_TIMEOUT_RETRIES = 1
+        config.LOCAL_AGENT_TIMEOUT_RETRY_DELAY_SECONDS = 0
+        calls = {"count": 0}
+
+        def timeout_call():
+            calls["count"] += 1
+            raise subprocess.TimeoutExpired(["codex"], 300)
+
+        # When/Then: quota 대기 루프에 들어가지 않고 총 2회 뒤 전용 오류로 종료한다.
+        with self.assertRaises(llm_client.LLMTimeoutError):
+            llm_client._retry_local_call(timeout_call, max_retries=3, label="timeout-test")
+
+        self.assertEqual(calls["count"], 2)
+        stats = llm_client.get_llm_stats()
+        self.assertEqual(stats["timeouts"], 2)
+        self.assertEqual(stats["quota_wait_seconds"], 0)
 
     def test_parallel_map_collect_isolates_quota_and_preserves_finished_results(self):
         # Given: 두 번째 항목부터 quota가 발생하는 병렬 배치

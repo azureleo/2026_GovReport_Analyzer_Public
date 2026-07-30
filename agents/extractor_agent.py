@@ -8,12 +8,16 @@ carbon_guideline.md 기반 16개 시트 구조에 맞춰 문서를 추출합니�
 
 import logging
 import re
+import time
 from dataclasses import dataclass
+from typing import Any
 
 import config
 from utils.pdf_reader import PageContent
+from utils.document_objects import build_document_objects, render_table_object_chunks
 from utils import llm_client
 from utils.parallel import parallel_map, parallel_map_collect
+from utils.run_state import RunState, merge_rows_stably
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +31,13 @@ class BatchRecord:
     status: str
     rows: int
     error: str = ""
+    batch_id: str = ""
+    source: str = "live"
+    recovered: bool = False
+
+
+class BatchParseError(llm_client.LLMCallError):
+    """응답은 도착했지만 JSON/시트 스키마가 유효하지 않은 배치."""
 
 
 _PROVENANCE_INSTRUCTION = (
@@ -492,7 +503,48 @@ def _build_semantic_batches(
             current.extend(run)
     if current:
         batches.append(current)
-    return batches
+    max_chars = max(1000, int(getattr(config, "EXTRACTION_MAX_BATCH_CHARS", 18000)))
+    char_bounded: list[list[PageContent]] = []
+    for batch in batches:
+        current: list[PageContent] = []
+        for page in batch:
+            candidate = [*current, page]
+            if current and len(_build_page_text(candidate)) > max_chars:
+                char_bounded.append(current)
+                current = [page]
+            else:
+                current = candidate
+        if current:
+            char_bounded.append(current)
+    return char_bounded
+
+
+def _split_text_with_page_marker(page: PageContent, max_chars: int) -> list[str]:
+    """단일 페이지 본문을 줄 경계에서 나누고 모든 조각에 출처 페이지를 보존한다."""
+    marker = f"=== 페이지 {page.page_number} ===\n"
+    budget = max(500, max_chars - len(marker))
+    lines = (page.text or "").splitlines() or [page.text or ""]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_chars = 0
+    for line in lines:
+        pending = str(line)
+        while len(pending) > budget:
+            if current:
+                chunks.append(marker + "\n".join(current))
+                current, current_chars = [], 0
+            chunks.append(marker + pending[:budget])
+            pending = pending[budget:]
+        extra = len(pending) + (1 if current else 0)
+        if current and current_chars + extra > budget:
+            chunks.append(marker + "\n".join(current))
+            current, current_chars = [], 0
+        if pending:
+            current.append(pending)
+            current_chars += extra
+    if current or not chunks:
+        chunks.append(marker + "\n".join(current))
+    return [chunk for chunk in chunks if chunk.strip()]
 
 
 def _page_title_score(text: str, keywords: list[str]) -> int:
@@ -669,12 +721,18 @@ def _route_pages_by_sheet(
 class ExtractorAgent:
     """에이전트 2: 텍스트·표 추출 에이전트 (가이드라인 기반 16개 시트)"""
 
-    def __init__(self):
+    def __init__(self, run_state: RunState | None = None):
         self._raw_results: dict = {key: [] for key in _SHEET_CONFIGS}
         self._raw_results["municipality_name"] = ""
         # 시트별로 1차 추출에서 실제 LLM에 보낸 페이지번호. 라우팅 통계용으로 유지한다.
         self.routed_page_nums: dict[str, set[int]] = {}
         self.ledger: list[BatchRecord] = []
+        self.timeout_splits = 0
+        self.failure_splits = 0
+        self.preflight_splits = 0
+        self.resumed_batches = 0
+        self.skipped_batches = 0
+        self.run_state = run_state
 
     def partial_results(self) -> dict:
         return {
@@ -698,24 +756,564 @@ class ExtractorAgent:
         status: str,
         rows: int,
         error: str = "",
+        *,
+        batch_id: str = "",
+        source: str = "live",
+        recovered: bool = False,
     ) -> None:
-        self.ledger.append(BatchRecord(sheet_key, list(page_nums), status, rows, error))
+        self.ledger.append(BatchRecord(
+            sheet_key,
+            list(page_nums),
+            status,
+            rows,
+            error,
+            batch_id=batch_id,
+            source=source,
+            recovered=recovered,
+        ))
+
+    @staticmethod
+    def _task_sheet_keys(task: dict) -> list[str]:
+        if "members" in task:
+            return [str(key) for key in task.get("members", [])]
+        return [str(task.get("sheet_key", "?"))]
+
+    def _ensure_batch_id(self, task: dict, kind: str) -> str:
+        batch_id = str(task.get("batch_id") or "")
+        if batch_id or self.run_state is None:
+            return batch_id
+        batch_id = self.run_state.batch_id(
+            kind=kind,
+            sheet_keys=self._task_sheet_keys(task),
+            page_nums=task.get("page_nums", []),
+            batch_text=task.get("batch_text", ""),
+        )
+        task["batch_id"] = batch_id
+        if int(task.get("split_depth", 0)) == 0:
+            self.run_state.register_expected(batch_id, {
+                "kind": kind,
+                "sheet_keys": self._task_sheet_keys(task),
+                "page_nums": list(task.get("page_nums", [])),
+            })
+        return batch_id
+
+    def _restore_task(self, task: dict, kind: str) -> tuple[bool, Any]:
+        if self.run_state is None:
+            return False, None
+        batch_id = self._ensure_batch_id(task, kind)
+        restored = self.run_state.restored_result(batch_id)
+        if restored is not None:
+            self.resumed_batches += 1
+            page_nums = list(task.get("page_nums", []))
+            checkpoint = self.run_state.record_for(batch_id) or {}
+            if kind == "sheet":
+                rows = [row for row in restored if isinstance(row, dict)] if isinstance(restored, list) else []
+                self._record_batch(
+                    task.get("sheet_key", "?"),
+                    page_nums,
+                    "ok",
+                    len(rows),
+                    batch_id=batch_id,
+                    source="checkpoint",
+                    recovered=bool(checkpoint.get("recovered", False)),
+                )
+                return True, rows
+            result = restored if isinstance(restored, dict) else {}
+            for sheet_key in self._task_sheet_keys(task):
+                rows = result.get(sheet_key, []) if isinstance(result, dict) else []
+                self._record_batch(
+                    sheet_key,
+                    page_nums,
+                    "ok",
+                    len(rows) if isinstance(rows, list) else 0,
+                    batch_id=batch_id,
+                    source="checkpoint",
+                    recovered=bool(checkpoint.get("recovered", False)),
+                )
+            return True, result
+        if not self.run_state.should_execute(
+            batch_id,
+            is_child=int(task.get("split_depth", 0)) > 0,
+        ):
+            self.skipped_batches += 1
+            return True, [] if kind == "sheet" else {key: [] for key in self._task_sheet_keys(task)}
+        return False, None
+
+    def _persist_task(
+        self,
+        task: dict,
+        kind: str,
+        status: str,
+        *,
+        result: Any = None,
+        error: str = "",
+        recovered: bool = False,
+    ) -> None:
+        if self.run_state is None:
+            return
+        batch_id = self._ensure_batch_id(task, kind)
+        self.run_state.record_batch(
+            batch_id=batch_id,
+            kind=kind,
+            sheet_keys=self._task_sheet_keys(task),
+            page_nums=task.get("page_nums", []),
+            status=status,
+            result=result,
+            error=error,
+            split_depth=int(task.get("split_depth", 0)),
+            recovered=recovered,
+        )
+
+    def _merge_rows(self, sheet_key: str, existing: list[dict], incoming: list[dict]) -> list[dict]:
+        rows, conflicts = merge_rows_stably(sheet_key, existing, incoming)
+        if self.run_state is not None:
+            self.run_state.record_conflicts(conflicts)
+        return rows
+
+    def _prepare_tasks(self, tasks: list[dict], kind: str) -> None:
+        if self.run_state is None:
+            return
+        for task in tasks:
+            self._ensure_batch_id(task, kind)
 
     def _record_call_failure(self, task: dict, exc: Exception) -> None:
         page_nums = list(task.get("page_nums", []))
         error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        status = "parse_fail" if isinstance(exc, BatchParseError) else "call_fail"
+        kind = "cluster" if "members" in task else "sheet"
+        self._persist_task(task, kind, status, error=error)
         if "members" in task:
             for sheet_key in task["members"]:
-                self._record_batch(sheet_key, page_nums, "call_fail", 0, error)
+                self._record_batch(
+                    sheet_key,
+                    page_nums,
+                    status,
+                    0,
+                    error,
+                    batch_id=str(task.get("batch_id") or ""),
+                )
             label = "/".join(task["members"][:2]) + ("…" if len(task["members"]) > 2 else "")
         else:
             sheet_key = task.get("sheet_key", "?")
-            self._record_batch(sheet_key, page_nums, "call_fail", 0, error)
+            self._record_batch(
+                sheet_key,
+                page_nums,
+                status,
+                0,
+                error,
+                batch_id=str(task.get("batch_id") or ""),
+            )
             label = sheet_key
+        failure_label = "파싱 실패" if status == "parse_fail" else "호출 실패"
         print(
             f"  [{label}] 배치 {task.get('batch_num', 0)}/{task.get('batch_total', 0)} "
-            f"({task.get('page_range', _page_range_label(page_nums))}): 호출 실패({type(exc).__name__}) — 원장 기록"
+            f"({task.get('page_range', _page_range_label(page_nums))}): "
+            f"{failure_label}({type(exc).__name__}) — 원장 기록"
         )
+
+    @staticmethod
+    def _task_label(task: dict) -> str:
+        if "members" in task:
+            members = list(task.get("members", []))
+            return "/".join(members[:2]) + ("…" if len(members) > 2 else "")
+        return str(task.get("sheet_key", "?"))
+
+    @staticmethod
+    def _split_child_task(task: dict, pages: list[PageContent], child_number: int) -> dict:
+        page_nums = [page.page_number for page in pages]
+        child = dict(task)
+        child.update({
+            "pages": pages,
+            "batch_text": _build_page_text(pages),
+            "page_nums": page_nums,
+            "page_range": _page_range_label(page_nums),
+            "batch_num": f"{task.get('batch_num', '?')}.{child_number}",
+            "batch_total": 2,
+            "split_depth": int(task.get("split_depth", 0)) + 1,
+        })
+        child.pop("batch_id", None)
+        return child
+
+    @staticmethod
+    def _custom_child_task(
+        task: dict,
+        *,
+        pages: list[PageContent],
+        batch_text: str,
+        child_number: int,
+        object_id: str = "",
+    ) -> dict:
+        child = ExtractorAgent._split_child_task(task, pages, child_number)
+        child["batch_text"] = batch_text
+        if object_id:
+            child["object_id"] = object_id
+        return child
+
+    def _recovery_children(self, task: dict, max_chars: int) -> list[dict]:
+        """페이지 → 표 객체/본문 조각 순으로 복구 단위를 만든다."""
+        pages = list(task.get("pages", []))
+        if not pages:
+            return []
+        max_chars = max(1000, int(max_chars))
+        children: list[dict] = []
+
+        if len(pages) > 1:
+            groups: list[list[PageContent]] = []
+            current: list[PageContent] = []
+            for page in pages:
+                candidate = [*current, page]
+                if current and len(_build_page_text(candidate)) > max_chars:
+                    groups.append(current)
+                    current = [page]
+                else:
+                    current = candidate
+            if current:
+                groups.append(current)
+            if len(groups) == 1:
+                midpoint = max(1, len(pages) // 2)
+                groups = [pages[:midpoint], pages[midpoint:]]
+            for number, group in enumerate((group for group in groups if group), start=1):
+                children.append(self._split_child_task(task, group, number))
+        else:
+            page = pages[0]
+            table_objects = [
+                obj for obj in build_document_objects([page])
+                if obj.object_type == "table" and obj.rows
+            ]
+            for table_object in table_objects:
+                for rendered in render_table_object_chunks(
+                    table_object,
+                    rows_per_chunk=max(
+                        2,
+                        int(getattr(config, "EXTRACTION_TABLE_ROWS_PER_BATCH", 20)),
+                    ),
+                    max_chars=max_chars,
+                ):
+                    children.append(self._custom_child_task(
+                        task,
+                        pages=[page],
+                        batch_text=f"=== 페이지 {page.page_number} ===\n{rendered}",
+                        child_number=len(children) + 1,
+                        object_id=table_object.object_id,
+                    ))
+
+            for text_chunk in _split_text_with_page_marker(page, max_chars):
+                # 표 원문 HTML은 표 객체 자식에서 처리하고 본문 자식에는 넣지 않는다.
+                if text_chunk.strip() == str(task.get("batch_text", "")).strip() and not table_objects:
+                    continue
+                children.append(self._custom_child_task(
+                    task,
+                    pages=[page],
+                    batch_text=text_chunk,
+                    child_number=len(children) + 1,
+                    object_id=f"p{page.page_number}_text",
+                ))
+
+        for index, child in enumerate(children, start=1):
+            child["batch_num"] = f"{task.get('batch_num', '?')}.{index}"
+            child["batch_total"] = len(children)
+        return children
+
+    def _run_sheet_children(
+        self,
+        task: dict,
+        children: list[dict],
+        municipality: str,
+        *,
+        reason: str,
+    ) -> list[dict]:
+        label = self._task_label(task)
+        page_range = task.get("page_range", _page_range_label(task.get("page_nums", [])))
+        child_labels = ", ".join(
+            child.get("object_id") or child.get("page_range", "?") for child in children
+        )
+        print(f"  [{label}] {page_range} {reason} → {len(children)}개 복구 단위: {child_labels}")
+        recovered: list[dict] = []
+        child_failed = False
+        for child in children:
+            try:
+                child_rows = self._run_sheet_task(child, municipality)
+                recovered = self._merge_rows(task["sheet_key"], recovered, child_rows)
+                if self.run_state is not None:
+                    child_record = self.run_state.record_for(str(child.get("batch_id") or "")) or {}
+                    child_failed = child_failed or child_record.get("status") not in {None, "ok"}
+            except Exception as child_exc:  # 성공한 형제 결과는 보존한다.
+                child_failed = True
+                self._record_call_failure(child, child_exc)
+        self._persist_task(
+            task,
+            "sheet",
+            "partial" if child_failed else "ok",
+            result=recovered,
+            error=reason if child_failed else "",
+            recovered=True,
+        )
+        print(f"  [{label}] {page_range} 분할 복구 완료: {len(recovered)}건")
+        return recovered
+
+    def _run_cluster_children(
+        self,
+        task: dict,
+        children: list[dict],
+        municipality: str,
+        extraction_prompts: dict[str, str],
+        *,
+        reason: str,
+    ) -> dict[str, list]:
+        label = self._task_label(task)
+        page_range = task.get("page_range", _page_range_label(task.get("page_nums", [])))
+        print(f"  [{label}] {page_range} {reason} → {len(children)}개 클러스터 복구 단위")
+        recovered = {sheet_key: [] for sheet_key in task["members"]}
+        child_failed = False
+        for child in children:
+            try:
+                child_result = self._run_cluster_task(child, municipality, extraction_prompts)
+                for sheet_key, rows in child_result.items():
+                    recovered[sheet_key] = self._merge_rows(
+                        sheet_key,
+                        recovered.setdefault(sheet_key, []),
+                        rows,
+                    )
+                if self.run_state is not None:
+                    child_record = self.run_state.record_for(str(child.get("batch_id") or "")) or {}
+                    child_failed = child_failed or child_record.get("status") not in {None, "ok"}
+            except Exception as child_exc:
+                child_failed = True
+                self._record_call_failure(child, child_exc)
+        self._persist_task(
+            task,
+            "cluster",
+            "partial" if child_failed else "ok",
+            result=recovered,
+            error=reason if child_failed else "",
+            recovered=True,
+        )
+        total_rows = sum(len(rows) for rows in recovered.values())
+        print(f"  [{label}] {page_range} 분할 복구 완료: {total_rows}건")
+        return recovered
+
+    def _run_sheet_task(self, task: dict, municipality: str) -> list[dict]:
+        """한 추출 태스크를 실행하고, 타임아웃이면 더 작은 페이지 묶음으로 복구한다."""
+        restored, restored_rows = self._restore_task(task, "sheet")
+        if restored:
+            if restored_rows:
+                print(
+                    f"  [{self._task_label(task)}] {task.get('page_range', '?')} "
+                    f"체크포인트 복원: {len(restored_rows)}건"
+                )
+            return restored_rows
+        root_started = float(task.setdefault("timeout_root_started", time.monotonic()))
+        recovery_budget = max(
+            0,
+            int(getattr(config, "EXTRACTION_TIMEOUT_RECOVERY_BUDGET_SECONDS", 900)),
+        )
+        if (
+            int(task.get("split_depth", 0)) > 0
+            and recovery_budget
+            and time.monotonic() - root_started >= recovery_budget
+        ):
+            raise llm_client.LLMTimeoutError(
+                f"타임아웃 분할 복구 시간 상한({recovery_budget}초) 도달"
+            )
+        split_depth = int(task.get("split_depth", 0))
+        max_depth = max(0, int(getattr(config, "EXTRACTION_TIMEOUT_MAX_SPLIT_DEPTH", 6)))
+        char_limit = max(
+            1000,
+            int(getattr(
+                config,
+                "EXTRACTION_MAX_BATCH_CHARS" if split_depth == 0 else "EXTRACTION_RECOVERY_MAX_BATCH_CHARS",
+                18000 if split_depth == 0 else 12000,
+            )),
+        )
+        if len(str(task.get("batch_text", ""))) > char_limit and split_depth < max_depth:
+            children = self._recovery_children(task, char_limit)
+            if children:
+                self.preflight_splits += 1
+                return self._run_sheet_children(
+                    task,
+                    children,
+                    municipality,
+                    reason=f"사전 크기 분할({len(str(task.get('batch_text', ''))):,}자>{char_limit:,}자)",
+                )
+        label = self._task_label(task)
+        page_range = task.get("page_range", _page_range_label(task.get("page_nums", [])))
+        print(
+            f"  [{label}] 배치 {task.get('batch_num', 0)}/{task.get('batch_total', 0)} "
+            f"({page_range}) 호출 시작 ({len(task.get('batch_text', '')):,}자)"
+        )
+        try:
+            rows = self._extract_sheet(
+                task["sheet_key"],
+                task["batch_text"],
+                municipality,
+                task.get("guideline_prompt", ""),
+                fail_fast=True,
+                batch_id=str(task.get("batch_id") or ""),
+            )
+        except llm_client.LLMQuotaExceededError:
+            raise
+        except (llm_client.LLMTimeoutError, BatchParseError, llm_client.LLMCallError) as exc:
+            pages = list(task.get("pages", []))
+            split_enabled = (
+                getattr(config, "EXTRACTION_SPLIT_ON_TIMEOUT", True)
+                if isinstance(exc, llm_client.LLMTimeoutError)
+                else getattr(config, "EXTRACTION_SPLIT_ON_FAILURE", True)
+            )
+            if (
+                not split_enabled
+                or int(task.get("split_depth", 0)) >= max_depth
+                or (
+                    recovery_budget
+                    and time.monotonic() - root_started >= recovery_budget
+                )
+            ):
+                raise
+            if isinstance(exc, llm_client.LLMTimeoutError):
+                self.timeout_splits += 1
+                failure_label = "타임아웃"
+            elif isinstance(exc, BatchParseError):
+                self.failure_splits += 1
+                failure_label = "파싱 실패"
+            else:
+                self.failure_splits += 1
+                failure_label = "호출 실패"
+            children = self._recovery_children(
+                task,
+                max(1000, int(getattr(config, "EXTRACTION_RECOVERY_MAX_BATCH_CHARS", 12000))),
+            )
+            if not children:
+                raise
+            return self._run_sheet_children(
+                task,
+                children,
+                municipality,
+                reason=failure_label,
+            )
+
+        status = f"{len(rows)}건" if rows else "추출 없음"
+        print(
+            f"  [{label}] 배치 {task.get('batch_num', 0)}/{task.get('batch_total', 0)} "
+            f"({page_range}) 완료: {status}"
+        )
+        self._persist_task(task, "sheet", "ok", result=rows)
+        return rows
+
+    def _run_cluster_task(
+        self,
+        task: dict,
+        municipality: str,
+        extraction_prompts: dict[str, str],
+    ) -> dict[str, list]:
+        """클러스터 태스크에도 동일한 타임아웃 분할 정책을 적용한다."""
+        restored, restored_result = self._restore_task(task, "cluster")
+        if restored:
+            total_restored = sum(
+                len(rows) for rows in restored_result.values() if isinstance(rows, list)
+            ) if isinstance(restored_result, dict) else 0
+            if total_restored:
+                print(
+                    f"  [{self._task_label(task)}] {task.get('page_range', '?')} "
+                    f"체크포인트 복원: {total_restored}건"
+                )
+            return restored_result
+        root_started = float(task.setdefault("timeout_root_started", time.monotonic()))
+        recovery_budget = max(
+            0,
+            int(getattr(config, "EXTRACTION_TIMEOUT_RECOVERY_BUDGET_SECONDS", 900)),
+        )
+        if (
+            int(task.get("split_depth", 0)) > 0
+            and recovery_budget
+            and time.monotonic() - root_started >= recovery_budget
+        ):
+            raise llm_client.LLMTimeoutError(
+                f"타임아웃 분할 복구 시간 상한({recovery_budget}초) 도달"
+            )
+        split_depth = int(task.get("split_depth", 0))
+        max_depth = max(0, int(getattr(config, "EXTRACTION_TIMEOUT_MAX_SPLIT_DEPTH", 6)))
+        char_limit = max(
+            1000,
+            int(getattr(
+                config,
+                "EXTRACTION_MAX_BATCH_CHARS" if split_depth == 0 else "EXTRACTION_RECOVERY_MAX_BATCH_CHARS",
+                18000 if split_depth == 0 else 12000,
+            )),
+        )
+        if len(str(task.get("batch_text", ""))) > char_limit and split_depth < max_depth:
+            children = self._recovery_children(task, char_limit)
+            if children:
+                self.preflight_splits += 1
+                return self._run_cluster_children(
+                    task,
+                    children,
+                    municipality,
+                    extraction_prompts,
+                    reason=f"사전 크기 분할({len(str(task.get('batch_text', ''))):,}자>{char_limit:,}자)",
+                )
+        label = self._task_label(task)
+        page_range = task.get("page_range", _page_range_label(task.get("page_nums", [])))
+        print(
+            f"  [{label}] 배치 {task.get('batch_num', 0)}/{task.get('batch_total', 0)} "
+            f"({page_range}) 호출 시작 ({len(task.get('batch_text', '')):,}자)"
+        )
+        try:
+            result = self._extract_cluster(
+                task["members"],
+                task["batch_text"],
+                municipality,
+                extraction_prompts,
+                fail_fast=True,
+                batch_id=str(task.get("batch_id") or ""),
+            )
+        except llm_client.LLMQuotaExceededError:
+            raise
+        except (llm_client.LLMTimeoutError, BatchParseError, llm_client.LLMCallError) as exc:
+            pages = list(task.get("pages", []))
+            split_enabled = (
+                getattr(config, "EXTRACTION_SPLIT_ON_TIMEOUT", True)
+                if isinstance(exc, llm_client.LLMTimeoutError)
+                else getattr(config, "EXTRACTION_SPLIT_ON_FAILURE", True)
+            )
+            if (
+                not split_enabled
+                or int(task.get("split_depth", 0)) >= max_depth
+                or (
+                    recovery_budget
+                    and time.monotonic() - root_started >= recovery_budget
+                )
+            ):
+                raise
+            if isinstance(exc, llm_client.LLMTimeoutError):
+                self.timeout_splits += 1
+                failure_label = "타임아웃"
+            elif isinstance(exc, BatchParseError):
+                self.failure_splits += 1
+                failure_label = "파싱 실패"
+            else:
+                self.failure_splits += 1
+                failure_label = "호출 실패"
+            children = self._recovery_children(
+                task,
+                max(1000, int(getattr(config, "EXTRACTION_RECOVERY_MAX_BATCH_CHARS", 12000))),
+            )
+            if not children:
+                raise
+            return self._run_cluster_children(
+                task,
+                children,
+                municipality,
+                extraction_prompts,
+                reason=failure_label,
+            )
+
+        counts = [f"{sheet_key}={len(rows)}" for sheet_key, rows in result.items() if rows]
+        status = ", ".join(counts) if counts else "추출 없음"
+        print(
+            f"  [{label}] 배치 {task.get('batch_num', 0)}/{task.get('batch_total', 0)} "
+            f"({page_range}) 완료: {status}"
+        )
+        self._persist_task(task, "cluster", "ok", result=result)
+        return result
 
     def ledger_summary(self) -> str:
         total = len(self.ledger)
@@ -735,7 +1333,11 @@ class ExtractorAgent:
             page_text = "없음"
         return (
             f"[감독관] 추출 원장: 배치 {total}건 중 성공 {ok}, "
-            f"호출실패 {call_fail}, 파싱실패 {parse_fail} (실패 페이지: {page_text})"
+            f"호출실패 {call_fail}, 파싱실패 {parse_fail}, "
+            f"사전 크기 분할 {self.preflight_splits}회, 타임아웃 분할 {self.timeout_splits}회, "
+            f"기타 실패 분할 {self.failure_splits}회, "
+            f"체크포인트 복원 {self.resumed_batches}회, 선택 건너뜀 {self.skipped_batches}회 "
+            f"(실패 페이지: {page_text})"
         )
 
     def _extract_municipality_name(self, full_text: str) -> str:
@@ -766,6 +1368,9 @@ class ExtractorAgent:
         batch_text: str,
         municipality: str,
         guideline_prompt: str = "",
+        *,
+        fail_fast: bool = False,
+        batch_id: str = "",
     ) -> list:
         cfg = _SHEET_CONFIGS[sheet_key]
 
@@ -794,13 +1399,31 @@ class ExtractorAgent:
         )
         parsed, parse_ok = llm_client.call_text_json(full_prompt, system=EXTRACTION_SYSTEM, stage="extraction")
 
-        if not parse_ok or not isinstance(parsed, dict):
-            self._record_batch(sheet_key, page_nums, "parse_fail", 0, "JSON 파싱 실패")
+        if not parse_ok or not isinstance(parsed, dict) or sheet_key not in parsed:
+            if fail_fast:
+                raise BatchParseError("JSON 파싱 실패 또는 시트 키 누락")
+            self._record_batch(
+                sheet_key,
+                page_nums,
+                "parse_fail",
+                0,
+                "JSON 파싱 실패 또는 시트 키 누락",
+                batch_id=batch_id,
+            )
             return []
 
         items = parsed.get(sheet_key, [])
         if not isinstance(items, list):
-            self._record_batch(sheet_key, page_nums, "parse_fail", 0, "스키마 불일치")
+            if fail_fast:
+                raise BatchParseError("스키마 불일치")
+            self._record_batch(
+                sheet_key,
+                page_nums,
+                "parse_fail",
+                0,
+                "스키마 불일치",
+                batch_id=batch_id,
+            )
             return []
 
         rows = [
@@ -808,7 +1431,7 @@ class ExtractorAgent:
             for item in items
             if isinstance(item, dict)
         ]
-        self._record_batch(sheet_key, page_nums, "ok", len(rows))
+        self._record_batch(sheet_key, page_nums, "ok", len(rows), batch_id=batch_id)
         return rows
 
     def _extract_cluster(
@@ -817,6 +1440,9 @@ class ExtractorAgent:
         batch_text: str,
         municipality: str,
         guideline_prompts: dict[str, str],
+        *,
+        fail_fast: bool = False,
+        batch_id: str = "",
     ) -> dict[str, list]:
         """
         여러 시트를 한 번의 호출로 추출한다(클러스터링). 같은 배치 텍스트를 시트마다
@@ -855,19 +1481,42 @@ class ExtractorAgent:
 
         out: dict[str, list] = {sk: [] for sk in sheet_keys}
         if not parse_ok or not isinstance(parsed, dict):
+            if fail_fast:
+                raise BatchParseError("JSON 파싱 실패")
             for sk in sheet_keys:
-                self._record_batch(sk, page_nums, "parse_fail", 0, "JSON 파싱 실패")
+                self._record_batch(
+                    sk,
+                    page_nums,
+                    "parse_fail",
+                    0,
+                    "JSON 파싱 실패",
+                    batch_id=batch_id,
+                )
             return out
+        if fail_fast:
+            invalid_key = next(
+                (sk for sk in sheet_keys if sk not in parsed or not isinstance(parsed.get(sk), list)),
+                None,
+            )
+            if invalid_key is not None:
+                raise BatchParseError(f"{invalid_key} 스키마 불일치")
         for sk in sheet_keys:
-            items = parsed.get(sk, [])
+            items = parsed.get(sk)
             if not isinstance(items, list):
-                self._record_batch(sk, page_nums, "parse_fail", 0, "스키마 불일치")
+                self._record_batch(
+                    sk,
+                    page_nums,
+                    "parse_fail",
+                    0,
+                    "스키마 불일치",
+                    batch_id=batch_id,
+                )
                 continue
             for item in items:
                 if not isinstance(item, dict):
                     continue
                 out[sk].append(_attach_row_context(item, municipality, page_nums))
-            self._record_batch(sk, page_nums, "ok", len(out[sk]))
+            self._record_batch(sk, page_nums, "ok", len(out[sk]), batch_id=batch_id)
         return out
 
     def _extract_clustered(
@@ -901,6 +1550,7 @@ class ExtractorAgent:
                 )
                 tasks.append({
                     "members": members,
+                    "pages": batch,
                     "batch_text": _build_page_text(batch),
                     "batch_num": batch_num,
                     "batch_total": len(batches),
@@ -908,10 +1558,9 @@ class ExtractorAgent:
                     "page_nums": page_nums,
                 })
 
+        self._prepare_tasks(tasks, "cluster")
         results = parallel_map_collect(
-            lambda t: self._extract_cluster(
-                t["members"], t["batch_text"], municipality, extraction_prompts
-            ),
+            lambda task: self._run_cluster_task(task, municipality, extraction_prompts),
             tasks,
             workers=getattr(config, "TEXT_WORKERS", 4),
         )
@@ -921,17 +1570,8 @@ class ExtractorAgent:
                 continue
             if res is None:
                 continue
-            counts = []
             for sk, items in res.items():
-                self._raw_results[sk].extend(items)
-                if items:
-                    counts.append(f"{sk}={len(items)}")
-            label = "/".join(task["members"][:2]) + ("…" if len(task["members"]) > 2 else "")
-            status = ", ".join(counts) if counts else "추출 없음"
-            print(
-                f"  [{label}] 배치 {task['batch_num']:>2}/{task['batch_total']} "
-                f"({task['page_range']}): {status}"
-            )
+                self._raw_results[sk] = self._merge_rows(sk, self._raw_results[sk], items)
 
     def route_pages(self, pages: list[PageContent]) -> dict[str, list[PageContent]]:
         if getattr(config, "FULL_DOCUMENT_SCAN", False):
@@ -968,6 +1608,7 @@ class ExtractorAgent:
             page_nums = [page.page_number for page in batch]
             tasks.append({
                 "sheet_key": sheet_key,
+                "pages": batch,
                 "batch_text": _build_page_text(batch),
                 "guideline_prompt": extraction_prompts.get(sheet_key, ""),
                 "batch_num": batch_num,
@@ -976,14 +1617,10 @@ class ExtractorAgent:
                 "page_nums": page_nums,
             })
 
+        self._prepare_tasks(tasks, "sheet")
         rows_for_sheet: list[dict] = []
         results = parallel_map_collect(
-            lambda task: self._extract_sheet(
-                task["sheet_key"],
-                task["batch_text"],
-                municipality,
-                task["guideline_prompt"],
-            ),
+            lambda task: self._run_sheet_task(task, municipality),
             tasks,
             workers=getattr(config, "TEXT_WORKERS", 4),
         )
@@ -992,12 +1629,11 @@ class ExtractorAgent:
                 self._record_call_failure(task, err)
                 continue
             rows = [row for row in (items or []) if isinstance(row, dict)]
-            rows_for_sheet.extend(rows)
-            self._raw_results[sheet_key].extend(rows)
-            status = f"{len(rows)}건" if rows else "추출 없음"
-            print(
-                f"  [{sheet_key}] 배치 {task['batch_num']:>2}/{task['batch_total']} "
-                f"({task['page_range']}): {status}"
+            rows_for_sheet = self._merge_rows(sheet_key, rows_for_sheet, rows)
+            self._raw_results[sheet_key] = self._merge_rows(
+                sheet_key,
+                self._raw_results[sheet_key],
+                rows,
             )
         return rows_for_sheet
 
@@ -1024,6 +1660,7 @@ class ExtractorAgent:
                 for sheet_key in _SHEET_CONFIGS:
                     tasks.append({
                         "sheet_key": sheet_key,
+                        "pages": batch,
                         "batch_text": batch_text,
                         "guideline_prompt": extraction_prompts.get(sheet_key, ""),
                         "batch_num": batch_num,
@@ -1031,10 +1668,9 @@ class ExtractorAgent:
                         "page_nums": page_nums,
                         "page_range": _page_range_label(page_nums),
                     })
+            self._prepare_tasks(tasks, "sheet")
             results = parallel_map_collect(
-                lambda t: self._extract_sheet(
-                    t["sheet_key"], t["batch_text"], municipality, t["guideline_prompt"]
-                ),
+                lambda task: self._run_sheet_task(task, municipality),
                 tasks,
                 workers=getattr(config, "TEXT_WORKERS", 4),
             )
@@ -1042,7 +1678,12 @@ class ExtractorAgent:
                 if err is not None:
                     self._record_call_failure(task, err)
                     continue
-                self._raw_results[task["sheet_key"]].extend(items or [])
+                sheet_key = task["sheet_key"]
+                self._raw_results[sheet_key] = self._merge_rows(
+                    sheet_key,
+                    self._raw_results[sheet_key],
+                    items or [],
+                )
             print(f"  [full] 배치 {len(batches)}개 × 16시트 추출 완료")
 
             total = {k: len(v) for k, v in self._raw_results.items() if isinstance(v, list)}
@@ -1078,6 +1719,7 @@ class ExtractorAgent:
                 )
                 tasks.append({
                     "sheet_key": sheet_key,
+                    "pages": batch,
                     "batch_text": _build_page_text(batch),
                     "guideline_prompt": extraction_prompts.get(sheet_key, ""),
                     "batch_num": batch_num,
@@ -1086,10 +1728,9 @@ class ExtractorAgent:
                     "page_nums": page_nums,
                 })
 
+        self._prepare_tasks(tasks, "sheet")
         results = parallel_map_collect(
-            lambda t: self._extract_sheet(
-                t["sheet_key"], t["batch_text"], municipality, t["guideline_prompt"]
-            ),
+            lambda task: self._run_sheet_task(task, municipality),
             tasks,
             workers=getattr(config, "TEXT_WORKERS", 4),
         )
@@ -1098,11 +1739,11 @@ class ExtractorAgent:
                 self._record_call_failure(task, err)
                 continue
             rows = items or []
-            self._raw_results[task["sheet_key"]].extend(rows)
-            status = f"{len(rows)}건" if rows else "추출 없음"
-            print(
-                f"  [{task['sheet_key']}] 배치 {task['batch_num']:>2}/{task['batch_total']} "
-                f"({task['page_range']}): {status}"
+            sheet_key = task["sheet_key"]
+            self._raw_results[sheet_key] = self._merge_rows(
+                sheet_key,
+                self._raw_results[sheet_key],
+                rows,
             )
 
         total = {k: len(v) for k, v in self._raw_results.items() if isinstance(v, list) and v}

@@ -112,7 +112,8 @@ def build_variant_env(base_env: dict[str, str], candidate: Candidate, cache_dir:
     env["LLM_PROVIDER"] = TEXT_PROVIDER
     env["GEMINI_MODEL"] = TEXT_MODEL
     env["LLM_CACHE_ENABLED"] = "1"
-    env["LLM_CACHE_DIR"] = str(cache_dir)
+    # 환경 스냅샷과 테스트 결과가 OS 경로 구분자에 따라 달라지지 않게 한다.
+    env["LLM_CACHE_DIR"] = cache_dir.as_posix()
     env["STAGE_PROVIDER_VISION"] = candidate.provider
     if candidate.model:
         env["STAGE_MODEL_VISION"] = candidate.model

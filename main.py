@@ -223,6 +223,41 @@ def main():
         action="store_true",
         help="Pro가 accept/fix_then_merge + high로 판정하고 규칙 검사를 통과한 후보를 본 시트에 자동 병합",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="동일 입력·프롬프트·모델의 성공 배치를 복원하고 미완료/실패 배치부터 재개",
+    )
+    parser.add_argument(
+        "--retry-failed-only",
+        action="store_true",
+        help="기존 성공 체크포인트는 복원하고 실패·부분 배치만 다시 실행 (--resume 포함)",
+    )
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="추출 완료 후 고정 골든셋·시각 인벤토리·라우팅 독립 평가 실행",
+    )
+    parser.add_argument(
+        "--evaluation-manifest",
+        default=None,
+        help="평가 데이터셋 매니페스트 경로",
+    )
+    parser.add_argument(
+        "--evaluation-dataset",
+        default=None,
+        help="평가 데이터셋 ID. 생략하면 원문 SHA256으로 선택",
+    )
+    parser.add_argument(
+        "--allow-draft-evaluation",
+        action="store_true",
+        help="사람 확정 전 초벌 골든셋을 테스트 목적으로 허용",
+    )
+    parser.add_argument(
+        "--evaluate-holdout",
+        action="store_true",
+        help="개발 튜닝과 분리된 홀드아웃 평가를 명시적으로 허용",
+    )
 
     args = parser.parse_args()
 
@@ -265,6 +300,10 @@ def main():
         os.environ["HYBRID_ADJUDICATION_ENABLED"] = "0"
     if args.hybrid_auto_merge:
         os.environ["HYBRID_AUTO_MERGE_ENABLED"] = "1"
+    if args.resume or args.retry_failed_only:
+        os.environ["EXTRACTION_RESUME"] = "1"
+    if args.retry_failed_only:
+        os.environ["EXTRACTION_RETRY_FAILED_ONLY"] = "1"
 
     # API 키 설정
     if args.api_key:
@@ -275,6 +314,12 @@ def main():
             os.environ["GEMINI_API_KEY"] = args.api_key
 
     import config
+
+    # 테스트처럼 config가 이미 import된 프로세스에서도 CLI 플래그를 즉시 반영한다.
+    if args.resume or args.retry_failed_only:
+        config.EXTRACTION_RESUME = True
+    if args.retry_failed_only:
+        config.EXTRACTION_RETRY_FAILED_ONLY = True
 
     provider_aliases = {
         "gemini-api": "gemini",
@@ -364,6 +409,17 @@ def main():
         print(f"  모델: {config.LOCAL_AGENT_MODEL}")
     else:
         print("  모델: 백엔드 기본값")
+    if provider in {"codex", "claude"}:
+        print(
+            f"  로컬 호출 타임아웃: {config.LOCAL_AGENT_TIMEOUT}초 "
+            f"(추가 재시도 {config.LOCAL_AGENT_TIMEOUT_RETRIES}회)"
+        )
+        print(
+            "  타임아웃 배치 자동 분할: "
+            f"{'활성' if config.EXTRACTION_SPLIT_ON_TIMEOUT else '비활성'} "
+            f"(깊이 {config.EXTRACTION_TIMEOUT_MAX_SPLIT_DEPTH}, "
+            f"배치별 {config.EXTRACTION_TIMEOUT_RECOVERY_BUDGET_SECONDS}초 상한)"
+        )
     print(f"  이미지 분석: {'비활성' if args.no_images else '활성'}")
     if args.no_images:
         print("  이미지 상한: 해당 없음")
@@ -372,7 +428,47 @@ def main():
         print(f"  이미지 상한: {image_limit}")
         print(f"  이미지 배치 크기: {config.IMAGE_ANALYSIS_BATCH_SIZE}")
     print(f"  LLM 캐시: {'활성' if config.LLM_CACHE_ENABLED else '비활성'}")
+    if config.RUN_STATE_ENABLED:
+        resume_mode = (
+            "실패 배치만 재실행"
+            if config.EXTRACTION_RETRY_FAILED_ONLY
+            else "중단 지점부터 재개"
+            if config.EXTRACTION_RESUME
+            else "새 실행"
+        )
+        print(f"  영속 배치 복구: 활성 ({resume_mode})")
+    else:
+        print("  영속 배치 복구: 비활성")
+    print(
+        "  텍스트 사전 분할: "
+        f"{config.EXTRACTION_MAX_BATCH_CHARS:,}자 "
+        f"(복구 {config.EXTRACTION_RECOVERY_MAX_BATCH_CHARS:,}자, "
+        f"표 {config.EXTRACTION_TABLE_ROWS_PER_BATCH}행)"
+    )
+    if not args.no_images:
+        print(
+            "  Vision 체크포인트: "
+            f"{'활성' if config.VISION_CHECKPOINT_ENABLED else '비활성'}"
+        )
     print(f"  라우팅 샤프닝: {'활성' if config.ROUTE_DROP_UBIQUITOUS_WEAK else '비활성'}")
+    print(f"  결정론적 원문 대조: {'활성' if config.SOURCE_VERIFICATION_ENABLED else '비활성'}")
+    print(
+        "  원문 객체 인벤토리: "
+        f"{'활성' if config.SOURCE_OBJECT_INVENTORY_ENABLED else '비활성'}"
+    )
+    print(
+        "  시트 의미 검증: "
+        f"{'활성' if config.SEMANTIC_ROUTING_ENABLED else '비활성'}"
+        + (
+            " (안전 범위 자동 재분류)"
+            if config.SEMANTIC_ROUTING_ENABLED
+            and config.SEMANTIC_ROUTING_AUTO_RECLASSIFY
+            else ""
+        )
+    )
+    if config.SOURCE_VERIFICATION_ENABLED:
+        print(f"  원문 마킹 PDF: {'생성' if config.SOURCE_VERIFICATION_MARK_PDF else '생략'}")
+        print(f"  품질 통과 기준: {config.QUALITY_THRESHOLD:g}/100")
     print(f"  시트별 폐루프: {'활성' if config.SHEET_CLOSED_LOOP_ENABLED else '비활성'}")
     print(f"  보조 모델 검수: {'활성' if config.HYBRID_REVIEW_ENABLED else '비활성'}")
     if config.HYBRID_REVIEW_ENABLED:
@@ -418,11 +514,41 @@ def main():
             include_images=not args.no_images,
         )
         print(f"\n완료! 결과 파일: {result_path}")
+        if args.evaluate:
+            from utils.benchmark_evaluation import (
+                EvaluationContractError,
+                evaluate_benchmark,
+            )
+
+            manifest_path = args.evaluation_manifest or config.EVALUATION_MANIFEST_PATH
+            print("\n[평가] 고정 골든셋·객체·라우팅 독립 평가 실행...")
+            try:
+                evaluation = evaluate_benchmark(
+                    result_path,
+                    input_path,
+                    manifest_path=manifest_path,
+                    dataset_id=args.evaluation_dataset,
+                    allow_draft=args.allow_draft_evaluation,
+                    allow_holdout=args.evaluate_holdout,
+                )
+            except EvaluationContractError as exc:
+                print(f"[평가 오류] {exc}")
+                return 2
+            metrics = evaluation.metrics
+            print(
+                "[평가] 완료: "
+                f"셀 정확도={metrics.get('cell_accuracy')}, "
+                f"객체 재현율={metrics.get('object_recall')}, "
+                f"라우팅 오류율={metrics.get('routing_error_rate')}"
+            )
+            print(f"[평가] 리포트: {evaluation.report_markdown}")
         return 0
     except KeyboardInterrupt:
+        supervisor.mark_interrupted("사용자 중단")
         print("\n[중단] 사용자에 의해 중단되었습니다.")
         return 1
     except Exception as e:
+        supervisor.mark_interrupted(str(e))
         print(f"\n[오류] 파이프라인 실행 중 오류 발생: {e}")
         if args.verbose:
             import traceback

@@ -22,6 +22,7 @@ import base64
 import importlib
 import json
 import logging
+import os
 import random
 import re
 import shlex
@@ -46,6 +47,10 @@ class LLMCallError(RuntimeError):
 
 class LLMQuotaExceededError(LLMCallError):
     """계정 quota, 세션 한도, rate limit처럼 즉시 회복되지 않는 실패."""
+
+
+class LLMTimeoutError(LLMCallError):
+    """로컬 에이전트가 제한 시간 안에 응답하지 못한 실패."""
 
 
 _QUOTA_ERROR_MARKERS = (
@@ -155,7 +160,9 @@ _JSON_ONLY_INSTRUCTION = """
 
 def _split_command(command: str) -> list[str]:
     """환경변수에 들어간 실행 명령을 안전하게 토큰화한다."""
-    tokens = shlex.split(command or "")
+    tokens = shlex.split(command or "", posix=os.name != "nt")
+    if os.name == "nt":
+        tokens = [token[1:-1] if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"} else token for token in tokens]
     if not tokens:
         raise RuntimeError("로컬 에이전트 실행 명령이 비어 있습니다.")
     return tokens
@@ -534,46 +541,38 @@ def _sleep_with_heartbeat(total_seconds: float, label: str) -> None:
 def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
     attempt = 0
     quota_waited = 0.0
-    consecutive_timeouts = 0
-    timeout_threshold = int(getattr(config, "LLM_TIMEOUT_AS_QUOTA_THRESHOLD", 2))
+    timeout_retries = max(0, int(getattr(config, "LOCAL_AGENT_TIMEOUT_RETRIES", 1)))
+    timeout_max_attempts = min(max(1, int(max_retries)), timeout_retries + 1)
     while True:
         attempt += 1
         try:
-            result = fn()
-            consecutive_timeouts = 0
-            return result
+            return fn()
         except subprocess.TimeoutExpired as exc:
-            consecutive_timeouts += 1
             _inc_stat("timeouts")
-            wait_enabled = getattr(config, "LLM_QUOTA_WAIT_ENABLED", True)
-            # 연속 타임아웃이 임계값 이상이면 throttling으로 보고 quota처럼 대기-재개한다.
-            if wait_enabled and consecutive_timeouts >= timeout_threshold:
-                poll = int(getattr(config, "LLM_QUOTA_WAIT_POLL_SECONDS", 600))
-                cap = int(getattr(config, "LLM_QUOTA_WAIT_MAX_SECONDS", 21600))
-                if quota_waited + poll > cap:
-                    logger.error(
-                        "%s 반복 타임아웃 대기 누적 %s 가 상한 %s 초과. 중단합니다.",
-                        label, _fmt_duration(quota_waited), _fmt_duration(cap),
-                    )
-                    raise LLMCallError(f"{label} 반복 타임아웃(throttling 추정) 상한 초과") from exc
-                quota_waited += poll
-                _inc_stat("retries")
-                attempt -= 1  # throttling 대기는 일반 재시도 예산을 소모하지 않는다.
-                logger.warning(
-                    "%s 연속 %s회 타임아웃 → throttling 추정. %s 후 자동 재개(누적 대기 %s).",
-                    label, consecutive_timeouts, _fmt_duration(poll), _fmt_duration(quota_waited),
+            if attempt >= timeout_max_attempts:
+                logger.error(
+                    "%s 타임아웃 상한 도달(%s회). 상위 배치 분할/실패 격리로 넘깁니다.",
+                    label,
+                    timeout_max_attempts,
                 )
-                _sleep_with_heartbeat(poll, label)
-            elif attempt >= max_retries:
-                logger.error("%s 타임아웃 최대 재시도 초과: %s", label, exc)
-                raise LLMCallError(f"{label} 타임아웃 최대 재시도 초과") from exc
-            else:
-                wait = min(5 * attempt, 30)
-                logger.warning("%s 타임아웃. %s초 후 재시도 (%s/%s)", label, wait, attempt, max_retries)
-                _inc_stat("retries")
+                raise LLMTimeoutError(
+                    f"{label} 타임아웃 상한 도달({timeout_max_attempts}회)"
+                ) from exc
+            wait = max(
+                0,
+                int(getattr(config, "LOCAL_AGENT_TIMEOUT_RETRY_DELAY_SECONDS", 5)),
+            )
+            logger.warning(
+                "%s 타임아웃. %s초 후 제한 재시도 (%s/%s)",
+                label,
+                wait,
+                attempt,
+                timeout_max_attempts,
+            )
+            _inc_stat("retries")
+            if wait:
                 time.sleep(wait)
         except LLMQuotaExceededError as exc:
-            consecutive_timeouts = 0
             if not getattr(config, "LLM_QUOTA_WAIT_ENABLED", True):
                 raise
             parsed = _parse_quota_reset_seconds(str(exc))
@@ -595,7 +594,6 @@ def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
             )
             _sleep_with_heartbeat(wait, label)
         except (LLMCallError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            consecutive_timeouts = 0  # 비-타임아웃 오류는 연속 타임아웃 카운트를 끊는다.
             if attempt >= max_retries:
                 logger.error("%s 최대 재시도 초과: %s", label, exc)
                 raise LLMCallError(f"{label} 최대 재시도 초과") from exc
@@ -1066,7 +1064,7 @@ def _call_gemini_text(prompt: str, system: str = "", max_retries: int = config.M
     contents = [types.Content(role="user", parts=[types.Part(text=full_text)])]
     api_config = types.GenerateContentConfig(
         max_output_tokens=config.MAX_TOKENS,
-        temperature=0.1,
+        temperature=float(getattr(config, "LLM_TEMPERATURE", 0.0)),
         response_mime_type="application/json",
     )
     client = _gemini_client()
@@ -1115,7 +1113,7 @@ def _call_gemini_vision(
     ]
     api_config = types.GenerateContentConfig(
         max_output_tokens=config.MAX_TOKENS,
-        temperature=0.1,
+        temperature=float(getattr(config, "LLM_TEMPERATURE", 0.0)),
         response_mime_type="application/json",
     )
     client = _gemini_client()
@@ -1164,7 +1162,7 @@ def _call_gemini_vision_batch(
     ]
     api_config = types.GenerateContentConfig(
         max_output_tokens=config.MAX_TOKENS,
-        temperature=0.1,
+        temperature=float(getattr(config, "LLM_TEMPERATURE", 0.0)),
         response_mime_type="application/json",
     )
     client = _gemini_client()

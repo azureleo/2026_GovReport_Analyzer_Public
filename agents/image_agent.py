@@ -11,12 +11,14 @@ import hashlib
 import io
 import json
 import re
+import threading
 
 import config
 from agents.organizer_agent import _IPCC_GAS_NAMES, _gas_sector_key
 from utils.pdf_reader import PageContent
 from utils import llm_client
 from utils.parallel import parallel_map_collect
+from utils.run_state import RunState
 from PIL import Image, ImageFilter, ImageStat
 
 logger = logging.getLogger(__name__)
@@ -455,13 +457,28 @@ def _infer_chart_kind(item: dict, analysis: dict) -> str:
 class ImageAgent:
     """에이전트 2-b: 이미지·그래프 분석 에이전트"""
 
-    def __init__(self):
+    def __init__(self, run_state: RunState | None = None):
         self._image_results: list[dict] = []
         self._triage_stats: dict = {}
+        self.run_state = (
+            run_state if getattr(config, "VISION_CHECKPOINT_ENABLED", True) else None
+        )
+        self.resumed_batches = 0
+        self.split_batches = 0
+        self.failed_batches = 0
+        self.skipped_batches = 0
+        self._counter_lock = threading.Lock()
 
-    def _analyze_image(self, image: dict, page_num: int, municipality: str) -> dict | None:
+    def _analyze_image(
+        self,
+        image: dict,
+        page_num: int,
+        municipality: str,
+        *,
+        fail_fast: bool = False,
+    ) -> dict | None:
         if config.IMAGE_CHART_TABLE_EXTRACTION:
-            return self._chart_to_table(image, page_num, municipality)
+            return self._chart_to_table(image, page_num, municipality, fail_fast=fail_fast)
 
         prompt = f"""이 이미지는 '{municipality}' 탄소중립 기본계획 보고서 {page_num}페이지에서 추출되었습니다.
 
@@ -483,6 +500,8 @@ class ImageAgent:
 
         parsed, parse_ok = llm_client.call_vision_json(image["base64"], prompt, system=IMAGE_SYSTEM, stage="vision")
         if not parse_ok:
+            if fail_fast:
+                raise llm_client.LLMCallError("Vision JSON 파싱 실패")
             return None
         # list나 빈 값이 반환되면 건너뜀
         if not parsed or not isinstance(parsed, dict):
@@ -493,7 +512,14 @@ class ImageAgent:
         parsed["municipality"] = municipality
         return parsed
 
-    def _chart_to_table(self, image: dict, page_num: int, municipality: str) -> dict | None:
+    def _chart_to_table(
+        self,
+        image: dict,
+        page_num: int,
+        municipality: str,
+        *,
+        fail_fast: bool = False,
+    ) -> dict | None:
         prompt = f"""이 이미지는 '{municipality}' 탄소중립 기본계획 보고서 {page_num}페이지에서 추출되었습니다.
 
 이미지가 그래프/차트/표라면 DePlot 방식으로 다음 JSON 형식의 표 데이터로 변환하세요:
@@ -526,8 +552,12 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
 
         parsed, parse_ok = llm_client.call_vision_json(image["base64"], prompt, system=CHART_TABLE_SYSTEM, stage="vision")
         if not parse_ok:
+            if fail_fast:
+                raise llm_client.LLMCallError("Vision JSON 파싱 실패")
             return None
-        if not parsed or not isinstance(parsed, dict):
+        if not isinstance(parsed, dict):
+            if fail_fast:
+                raise llm_client.LLMCallError("Vision 응답 스키마 불일치")
             return None
         if parsed.get("type") == "해당없음":
             return None
@@ -543,12 +573,19 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         self,
         batch: list[tuple[PageContent, dict]],
         municipality: str,
+        *,
+        fail_fast: bool = False,
     ) -> list[dict]:
         if not batch:
             return []
         if len(batch) == 1:
             page, image = batch[0]
-            result = self._chart_to_table(image, page.page_number, municipality)
+            result = self._chart_to_table(
+                image,
+                page.page_number,
+                municipality,
+                fail_fast=fail_fast,
+            )
             return [result] if result else []
 
         image_lines = []
@@ -602,10 +639,29 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         images = [image["base64"] for _, image in batch]
         parsed, parse_ok = llm_client.call_vision_batch_json(images, prompt, system=CHART_TABLE_SYSTEM, stage="vision")
         if not parse_ok:
+            if fail_fast:
+                raise llm_client.LLMCallError("Vision 배치 JSON 파싱 실패")
             return []
         raw_analyses = parsed.get("analyses", []) if isinstance(parsed, dict) else parsed
         if not isinstance(raw_analyses, list):
+            if fail_fast:
+                raise llm_client.LLMCallError("Vision 배치 응답 스키마 불일치")
             return []
+        if fail_fast:
+            returned_indexes: set[int] = set()
+            for raw in raw_analyses:
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    returned_indexes.add(int(raw.get("image_index")))
+                except (TypeError, ValueError):
+                    continue
+            expected_indexes = set(range(1, len(batch) + 1))
+            if returned_indexes != expected_indexes:
+                raise llm_client.LLMCallError(
+                    f"Vision 배치 응답 누락: expected={sorted(expected_indexes)}, "
+                    f"returned={sorted(returned_indexes)}"
+                )
 
         results: list[dict] = []
         page_by_index = {idx: page.page_number for idx, (page, _) in enumerate(batch, start=1)}
@@ -951,6 +1007,174 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         text_results["financial_plan"] = existing_financial
         return text_results
 
+    @staticmethod
+    def _vision_descriptor(batch: list[tuple[PageContent, dict]]) -> str:
+        payload = []
+        for page, image in batch:
+            payload.append({
+                "page": page.page_number,
+                "sha256": hashlib.sha256(str(image.get("base64", "")).encode("utf-8")).hexdigest(),
+                "width": image.get("width"),
+                "height": image.get("height"),
+                "caption": image.get("caption", ""),
+            })
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _vision_batch_id(self, task: dict) -> str:
+        batch_id = str(task.get("batch_id") or "")
+        if batch_id or self.run_state is None:
+            return batch_id
+        batch = list(task.get("batch", []))
+        page_nums = [page.page_number for page, _image in batch]
+        batch_id = self.run_state.batch_id(
+            kind="vision",
+            sheet_keys=["visual_inventory"],
+            page_nums=page_nums,
+            batch_text=self._vision_descriptor(batch),
+        )
+        task["batch_id"] = batch_id
+        if int(task.get("split_depth", 0)) == 0:
+            self.run_state.register_expected(batch_id, {
+                "kind": "vision",
+                "sheet_keys": ["visual_inventory"],
+                "page_nums": page_nums,
+            })
+        return batch_id
+
+    def _persist_vision(
+        self,
+        task: dict,
+        status: str,
+        *,
+        result: list[dict] | None = None,
+        error: str = "",
+        recovered: bool = False,
+    ) -> None:
+        if self.run_state is None:
+            return
+        batch = list(task.get("batch", []))
+        self.run_state.record_batch(
+            batch_id=self._vision_batch_id(task),
+            kind="vision",
+            sheet_keys=["visual_inventory"],
+            page_nums=[page.page_number for page, _image in batch],
+            status=status,
+            result=result,
+            error=error,
+            split_depth=int(task.get("split_depth", 0)),
+            recovered=recovered,
+        )
+
+    @staticmethod
+    def _merge_vision_results(groups: list[list[dict]]) -> list[dict]:
+        merged: list[dict] = []
+        seen: set[str] = set()
+        for group in groups:
+            for row in group:
+                if not isinstance(row, dict):
+                    continue
+                identity = hashlib.sha256(
+                    json.dumps(row, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                merged.append(row)
+        return merged
+
+    def _split_vision_task(self, task: dict) -> list[dict]:
+        batch = list(task.get("batch", []))
+        if len(batch) <= 1:
+            return []
+        midpoint = max(1, len(batch) // 2)
+        groups = [batch[:midpoint], batch[midpoint:]]
+        children: list[dict] = []
+        for index, group in enumerate((group for group in groups if group), start=1):
+            children.append({
+                "batch": group,
+                "batch_num": f"{task.get('batch_num', '?')}.{index}",
+                "batch_total": len(groups),
+                "split_depth": int(task.get("split_depth", 0)) + 1,
+            })
+        return children
+
+    def _run_vision_task(self, task: dict, municipality: str) -> list[dict]:
+        batch = list(task.get("batch", []))
+        batch_id = self._vision_batch_id(task)
+        if self.run_state is not None:
+            restored = self.run_state.restored_result(batch_id)
+            if isinstance(restored, list):
+                with self._counter_lock:
+                    self.resumed_batches += 1
+                return [row for row in restored if isinstance(row, dict)]
+            if not self.run_state.should_execute(
+                batch_id,
+                is_child=int(task.get("split_depth", 0)) > 0,
+            ):
+                with self._counter_lock:
+                    self.skipped_batches += 1
+                return []
+
+        try:
+            if config.IMAGE_CHART_TABLE_EXTRACTION:
+                rows = self._chart_to_table_batch(batch, municipality, fail_fast=True)
+            else:
+                rows = []
+                for page, image in batch:
+                    result = self._analyze_image(
+                        image,
+                        page.page_number,
+                        municipality,
+                        fail_fast=True,
+                    )
+                    if result:
+                        rows.append(result)
+        except llm_client.LLMQuotaExceededError as exc:
+            self._persist_vision(task, "call_fail", error=str(exc))
+            with self._counter_lock:
+                self.failed_batches += 1
+            raise
+        except (llm_client.LLMTimeoutError, llm_client.LLMCallError) as exc:
+            max_depth = max(0, int(getattr(config, "VISION_RECOVERY_MAX_SPLIT_DEPTH", 6)))
+            can_split = (
+                bool(getattr(config, "VISION_SPLIT_ON_FAILURE", True))
+                and len(batch) > 1
+                and int(task.get("split_depth", 0)) < max_depth
+            )
+            if can_split:
+                children = self._split_vision_task(task)
+                with self._counter_lock:
+                    self.split_batches += 1
+                child_results: list[list[dict]] = []
+                child_failed = False
+                for child in children:
+                    try:
+                        child_results.append(self._run_vision_task(child, municipality))
+                    except llm_client.LLMQuotaExceededError:
+                        raise
+                    except (llm_client.LLMTimeoutError, llm_client.LLMCallError):
+                        child_failed = True
+                merged = self._merge_vision_results(child_results)
+                self._persist_vision(
+                    task,
+                    "partial" if child_failed else "ok",
+                    result=merged,
+                    error=str(exc) if child_failed else "",
+                    recovered=True,
+                )
+                return merged
+            status = "parse_fail" if any(
+                token in str(exc) for token in ("파싱", "스키마", "누락")
+            ) else "call_fail"
+            self._persist_vision(task, status, error=str(exc))
+            with self._counter_lock:
+                self.failed_batches += 1
+            raise
+
+        rows = [row for row in rows if isinstance(row, dict)]
+        self._persist_vision(task, "ok", result=rows)
+        return rows
+
     def extract(self, pages: list[PageContent], text_results: dict, municipality: str) -> dict:
         raw_images = [
             (p, img)
@@ -1035,15 +1259,18 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
             pages_with_images[i:i + batch_size]
             for i in range(0, len(pages_with_images), batch_size)
         ]
-        def _run_batch(image_batch: list) -> list:
-            if config.IMAGE_CHART_TABLE_EXTRACTION:
-                return self._chart_to_table_batch(image_batch, municipality)
-            out = []
-            for page, image in image_batch:
-                result = self._analyze_image(image, page.page_number, municipality)
-                if result:
-                    out.append(result)
-            return out
+        vision_tasks = [
+            {
+                "batch": image_batch,
+                "batch_num": batch_num,
+                "batch_total": len(image_batches),
+                "split_depth": 0,
+            }
+            for batch_num, image_batch in enumerate(image_batches, start=1)
+        ]
+        if self.run_state is not None and getattr(config, "VISION_CHECKPOINT_ENABLED", True):
+            for task in vision_tasks:
+                self._vision_batch_id(task)
 
         # vision 배치는 서로 독립적이라 동시에 호출한다(VISION_WORKERS). 입력 순서를
         # 보존하므로 누적 결과는 순차 실행과 동일하다.
@@ -1052,16 +1279,18 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
             f"(이미지당 batch={batch_size}, 동시={getattr(config, 'VISION_WORKERS', 2)})..."
         )
         batch_results_list = parallel_map_collect(
-            _run_batch, image_batches, workers=getattr(config, "VISION_WORKERS", 2)
+            lambda task: self._run_vision_task(task, municipality),
+            vision_tasks,
+            workers=getattr(config, "VISION_WORKERS", 2),
         )
-        failed_batches = 0
-        for batch_num, (image_batch, result) in enumerate(
-            zip(image_batches, batch_results_list), start=1
-        ):
+        outer_failed_batches = 0
+        for task, result in zip(vision_tasks, batch_results_list):
+            batch_num = task["batch_num"]
+            image_batch = task["batch"]
             batch_results, err = result
             page_nums = [page.page_number for page, _ in image_batch]
             if err is not None:
-                failed_batches += 1
+                outer_failed_batches += 1
                 print(
                     f"  배치 {batch_num}/{len(image_batches)} "
                     f"(p{page_nums[0]}~{page_nums[-1]}) → 호출 실패({type(err).__name__})"
@@ -1080,8 +1309,11 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
                     f"  배치 {batch_num}/{len(image_batches)} "
                     f"(p{page_nums[0]}~{page_nums[-1]}) → 관련 있는 표/그래프 없음"
                 )
-        if failed_batches:
-            print(f"[에이전트2b 이미지분석] 호출 실패 배치 {failed_batches}건 건너뜀")
+        if outer_failed_batches or self.failed_batches:
+            print(
+                "[에이전트2b 이미지분석] 미복구 비전 배치: "
+                f"루트 {outer_failed_batches}건, 최종 자식 {self.failed_batches}건"
+            )
 
         self._image_results = analyses
         print(f"[에이전트2b 이미지분석] 유효 분석 {len(analyses)}개 완료")
@@ -1126,9 +1358,17 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
                 f"통과 {triage.get('passed', 0)}개 / 필터 {triage.get('filtered', 0)}개"
                 f" / 참고자료 제외 {triage.get('reference_filtered', 0)}개"
             )
+        checkpoint_line = ""
+        if self.run_state is not None:
+            checkpoint_line = (
+                f"\n  - 체크포인트: 재사용 {self.resumed_batches}배치, "
+                f"분할복구 {self.split_batches}배치, "
+                f"미복구 {self.failed_batches}배치, 건너뜀 {self.skipped_batches}배치"
+            )
         return (
             f"[에이전트2b 이미지분석] 완료\n"
             f"  - 분석된 이미지: {len(self._image_results)}개\n"
             f"  - 유형별: {type_str}"
             f"{triage_line}"
+            f"{checkpoint_line}"
         )

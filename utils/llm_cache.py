@@ -27,7 +27,13 @@ class LLMCacheRequest:
 
 # 실행 단위 캐시 통계. Supervisor가 시작 시 reset_cache_stats()로 초기화하고
 # 종료 시 get_cache_stats()로 hit/miss/write/disabled 요약을 출력한다.
-_CACHE_STATS: dict[str, int] = {"hit": 0, "miss": 0, "write": 0, "disabled": 0}
+_CACHE_STATS: dict[str, int] = {
+    "hit": 0,
+    "miss": 0,
+    "write": 0,
+    "rejected": 0,
+    "disabled": 0,
+}
 # 병렬 호출 시 여러 스레드가 통계를 증가시키므로 보호한다.
 _CACHE_STATS_LOCK = threading.Lock()
 
@@ -92,14 +98,20 @@ def _read_response(request: LLMCacheRequest) -> str | None:
     response = payload.get("response", "")
     if not isinstance(response, str):
         return None
-    if not response.strip() or response.strip() == "{}":
+    if not _is_valid_json_response(response):
+        _bump_stat("rejected")
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return None
     return response
 
 
-def _write_response(request: LLMCacheRequest, response: str) -> None:
-    if not response.strip() or response.strip() == "{}":
-        return
+def _write_response(request: LLMCacheRequest, response: str) -> bool:
+    if not _is_valid_json_response(response):
+        _bump_stat("rejected")
+        return False
 
     path = _cache_path(request)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,6 +126,30 @@ def _write_response(request: LLMCacheRequest, response: str) -> None:
         tmp.write(encoded)
         tmp_path = Path(tmp.name)
     tmp_path.replace(path)
+    return True
+
+
+def _is_valid_json_response(response: str) -> bool:
+    """실패 문구나 잘린 응답이 다음 실행에서 정상 응답처럼 재사용되지 않게 한다."""
+    stripped = (response or "").strip()
+    if not stripped:
+        return False
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    # 공급자 fail-soft 경로는 일시 오류를 빈 객체로 반환한다. 이를 캐시하면
+    # 다음 실행에서도 정상 호출 없이 데이터가 계속 누락되므로 저장하지 않는다.
+    if parsed == {}:
+        return False
+    return isinstance(parsed, (dict, list))
 
 
 def cached_response(request: LLMCacheRequest, producer: Callable[[], str]) -> str:
@@ -129,8 +165,8 @@ def cached_response(request: LLMCacheRequest, producer: Callable[[], str]) -> st
     _bump_stat("miss")
     response = producer()
     try:
-        _write_response(request, response)
-        _bump_stat("write")
+        if _write_response(request, response):
+            _bump_stat("write")
     except OSError:
         return response
     return response

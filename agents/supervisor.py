@@ -17,6 +17,17 @@ import config
 from utils.pdf_reader import extract_pdf, PDFContent, PageContent
 from utils.hwp_reader import extract_hwp, is_hwp_file
 from utils import llm_cache, llm_client
+from utils.run_state import RunState, sha256_json
+from utils.semantic_routing import SemanticRoutingReport, validate_and_reclassify
+from utils.source_verifier import (
+    QualityAssessment,
+    SourceObjectInventoryReport,
+    SourceVerificationReport,
+    assess_quality,
+    build_source_object_inventory,
+    create_marked_pdf,
+    verify_final_data,
+)
 from agents.guideline_agent import GuidelineAgent
 from agents.extractor_agent import ExtractorAgent
 from agents.image_agent import ImageAgent
@@ -41,7 +52,11 @@ _TIMING_ORDER = [
     "시트 단위 보조검수·병합",
     "보조 모델 검수",
     "보조 후보 판정·병합",
+    "시트 의미 검증",
+    "원문 대조",
+    "원문 객체 인벤토리",
     "엑셀 작성",
+    "마킹 PDF",
     "LLM 최종 검수",
 ]
 
@@ -101,53 +116,59 @@ def _execution_info(input_path: Path, started_at: datetime) -> dict[str, str]:
     }
 
 
-def _quality_score(final_data: dict) -> tuple[float, list[str]]:
-    issues = []
-    score = 100.0
+def _ledger_quality_metrics(
+    records: list,
+    run_state: RunState | None = None,
+) -> dict[str, int]:
+    # 분할 자식은 복구 수단이지 별도의 원본 작업이 아니다. 품질 분모에는 최초
+    # sheet/cluster 루트 배치만 넣어 재시도할수록 점수가 내려가는 현상을 막는다.
+    if run_state is not None:
+        root_summary = run_state.summary(kinds={"sheet", "cluster"})
+        if root_summary["expected"]:
+            return {
+                "extraction_batches_total": root_summary["expected"],
+                "extraction_batches_ok": root_summary["ok"],
+                "extraction_batches_failed": root_summary["failed"],
+                "extraction_batches_missing": root_summary["missing"],
+            }
 
-    municipality = final_data.get("municipality_name", "알 수 없음")
-    if not municipality or municipality == "알 수 없음":
-        issues.append("지자체명 미확인")
-        score -= 20
+    def status_of(record) -> str:
+        if isinstance(record, dict):
+            return str(record.get("status", ""))
+        return str(getattr(record, "status", ""))
 
-    # 핵심 시트 데이터 존재 확인
-    emissions = final_data.get("emissions_regional", []) + final_data.get("emissions_management", [])
-    if not emissions:
-        issues.append("온실가스 배출 데이터 없음 (중요)")
-        score -= 25
+    statuses = [status_of(record) for record in records]
+    return {
+        "extraction_batches_total": len(statuses),
+        "extraction_batches_ok": sum(status == "ok" for status in statuses),
+        "extraction_batches_call_fail": sum(status == "call_fail" for status in statuses),
+        "extraction_batches_parse_fail": sum(status == "parse_fail" for status in statuses),
+    }
 
-    targets = final_data.get("reduction_targets", [])
-    if not targets:
-        issues.append("감축목표 데이터 없음")
-        score -= 15
 
-    projects = final_data.get("mitigation_projects", [])
-    if not projects:
-        issues.append("감축사업 목록 없음")
-        score -= 10
+def _deduplicate_validation_rows(rows: list) -> list[dict]:
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for source in rows:
+        if not isinstance(source, dict):
+            continue
+        row = dict(source)
+        identity = sha256_json(row)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(row)
+    return unique
 
-    forecast = final_data.get("emissions_forecast", [])
-    if not forecast:
-        issues.append("배출전망 데이터 없음")
-        score -= 5
 
-    regional = final_data.get("regional_conditions", [])
-    if not regional:
-        issues.append("지역여건 데이터 없음")
-        score -= 5
-
-    vision = final_data.get("vision_strategy", [])
-    if not vision:
-        issues.append("비전·전략 없음")
-        score -= 5
-
-    # 채움률 확인
-    total_rows = sum(len(v) for v in final_data.values() if isinstance(v, list))
-    if total_rows < 10:
-        issues.append(f"전체 추출 행 수 매우 적음 ({total_rows}행)")
-        score -= 15
-
-    return max(0.0, score), issues
+def _quality_score(
+    final_data: dict,
+    verification: SourceVerificationReport | None = None,
+    source_inventory: SourceObjectInventoryReport | None = None,
+) -> tuple[float, list[str]]:
+    """호환용 래퍼. 실제 점수는 결정론적 품질 지표에서 계산한다."""
+    assessment = assess_quality(final_data, verification, source_inventory)
+    return assessment.score, assessment.issues
 
 
 def _document_text_chars(pdf_content: PDFContent) -> int:
@@ -157,11 +178,17 @@ def _document_text_chars(pdf_content: PDFContent) -> int:
 class Supervisor:
     """에이전트 5: 감독·검수 에이전트"""
 
-    QUALITY_THRESHOLD = 40.0
+    QUALITY_THRESHOLD = 70.0
 
     def __init__(self):
         self._reports: list[str] = []
         self._timings: dict[str, float] = {}
+        self._quality_assessment_for_review: QualityAssessment | None = None
+        self._active_run_state: RunState | None = None
+
+    def mark_interrupted(self, reason: str = "") -> None:
+        if self._active_run_state is not None:
+            self._active_run_state.mark_interrupted(reason)
 
     def _log(self, msg: str):
         print(msg)
@@ -206,6 +233,7 @@ class Supervisor:
                 f"hit {stats.get('hit', 0)}, "
                 f"miss {stats.get('miss', 0)}, "
                 f"write {stats.get('write', 0)}, "
+                f"reject {stats.get('rejected', 0)}, "
                 f"disabled {stats.get('disabled', 0)}"
             )
         llm_stats = llm_client.get_llm_stats()
@@ -221,13 +249,22 @@ class Supervisor:
             )
 
     def _llm_quality_review(self, final_data: dict) -> dict:
+        assessment = self._quality_assessment_for_review or assess_quality(final_data)
         municipality = final_data.get("municipality_name", "?")
         sheet_counts = {k: len(v) for k, v in final_data.items() if isinstance(v, list) and v}
         prompt = f"""다음은 '{municipality}' 탄소중립 계획 추출 결과 요약입니다:
 - 시트별 행 수: {json.dumps(sheet_counts, ensure_ascii=False)}
 - 총 추출 행: {sum(sheet_counts.values())}
+- 결정론적 품질 점수: {assessment.score:.1f}/100
+- 결정론적 품질 지표: {json.dumps(assessment.metrics, ensure_ascii=False)}
+- 결정론적 이슈: {json.dumps(assessment.issues, ensure_ascii=False)}
 
-이 추출 결과의 완성도를 평가하고 JSON으로 반환하세요:
+이 점수는 행별 원문 근거, 원문 객체 완전성, 필수 필드 채움률, 출처페이지,
+정합성, 핵심 시트 존재를 코드로 계산한 결과입니다. 다만 셀 정확도는 명시적인
+고정 골든셋 평가를 실행해야만 산출됩니다. 행 수나 배치 성공률만 보고 완전하거나
+누락이 없다고 판단하지 마세요.
+
+위 근거를 해석해 JSON으로 반환하세요. 결정론적 점수를 임의로 대체하지 마세요:
 {{
   "assessment": "평가 의견 (2~3문장)",
   "quality_level": "우수|보통|미흡",
@@ -239,11 +276,10 @@ class Supervisor:
             raise
         except llm_client.LLMCallError as exc:
             logger.warning("LLM 최종 품질 검수 실패. 규칙 기반 점수만 사용: %s", exc)
-            score, issues = _quality_score(final_data)
             return {
-                "assessment": f"LLM 검수 호출이 실패하여 규칙 기반 품질 점수({score:.1f}/100)만 기록했습니다.",
-                "quality_level": "보통" if score >= self.QUALITY_THRESHOLD else "미흡",
-                "key_issues": issues,
+                "assessment": f"LLM 검수 호출이 실패하여 결정론적 품질 점수({assessment.score:.1f}/100)만 기록했습니다.",
+                "quality_level": "우수" if assessment.score >= 85 else "보통" if assessment.score >= 70 else "미흡",
+                "key_issues": assessment.issues,
             }
         return llm_client.parse_json(resp)
 
@@ -253,6 +289,7 @@ class Supervisor:
         pages: list[PageContent],
         full_text: str,
         extraction_prompts: dict[str, str],
+        run_state: RunState | None = None,
     ) -> tuple[dict, ExtractorAgent, list[dict], list[dict]]:
         """
         시트별 추출·정제·검수 폐루프.
@@ -260,7 +297,9 @@ class Supervisor:
         이미지 분석과 빈칸 보완은 이 폐루프 이후 실행되므로 보조검수가 본 기준본과
         최종본은 다를 수 있다. 최종 organize 검증 패스가 최종본 기준 정합성을 다시 점검한다.
         """
-        extractor = ExtractorAgent()
+        # 기존 테스트·확장 코드가 무인자 팩토리를 주입할 수 있으므로 새 상태가
+        # 실제로 있을 때만 생성자 인자를 전달한다.
+        extractor = ExtractorAgent(run_state=run_state) if run_state is not None else ExtractorAgent()
         organizer = OrganizerAgent()
         hybrid_agent = HybridReviewAgent() if getattr(config, "HYBRID_REVIEW_ENABLED", False) else None
         municipality = extractor._extract_municipality_name(full_text)
@@ -407,8 +446,35 @@ class Supervisor:
         self._log(guideline_agent.report())
         self._log(f"[감독관] STEP 1 완료: {elapsed:.1f}초")
 
+        run_state: RunState | None = None
+        if getattr(config, "RUN_STATE_ENABLED", True):
+            run_state = RunState.create(
+                input_path=input_path,
+                guideline_path=hwp_path,
+                extraction_prompts=extraction_prompts,
+                execution_info=execution_info,
+                output_path=output_path,
+                resume=bool(getattr(config, "EXTRACTION_RESUME", False)),
+                retry_failed_only=bool(getattr(config, "EXTRACTION_RETRY_FAILED_ONLY", False)),
+            )
+            self._active_run_state = run_state
+            execution_info["run_id"] = run_state.run_id
+            execution_info["run_state_dir"] = str(run_state.root)
+            mode = (
+                "실패 배치만 재실행"
+                if run_state.retry_failed_only
+                else "체크포인트 재개"
+                if run_state.resume
+                else "새 실행"
+            )
+            self._log(f"[감독관] 실행 상태: {mode} ({run_state.run_id})")
+
         # STEP 2~3: 추출·정제 (품질 미달 시 재시도)
         final_data = None
+        source_verification: SourceVerificationReport | None = None
+        source_object_inventory: SourceObjectInventoryReport | None = None
+        semantic_routing: SemanticRoutingReport | None = None
+        quality_assessment: QualityAssessment | None = None
         for attempt in range(1, max_pipeline_retries + 1):
             self._log(f"\n[감독관] STEP 2~3: 추출·정제 시도 {attempt}/{max_pipeline_retries}")
 
@@ -421,13 +487,14 @@ class Supervisor:
                         pages=pdf_content.pages,
                         full_text=pdf_content.full_text,
                         extraction_prompts=extraction_prompts,
+                        run_state=run_state,
                     )
                 except llm_client.LLMQuotaExceededError as exc:
-                    extractor = ExtractorAgent()
+                    extractor = ExtractorAgent(run_state=run_state)
                     raw_data = extractor.partial_results()
                     logger.warning("시트별 폐루프 추출 quota/한도 문제로 부분 결과로 계속 진행: %s", exc)
             else:
-                extractor = ExtractorAgent()
+                extractor = ExtractorAgent(run_state=run_state)
                 try:
                     raw_data = extractor.extract(
                         pages=pdf_content.pages,
@@ -441,6 +508,14 @@ class Supervisor:
             self._add_timing("텍스트 추출", elapsed)
             self._log(extractor.report())
             self._log(extractor.ledger_summary())
+            if run_state is not None:
+                state_summary = run_state.summary()
+                self._log(
+                    "[감독관] 영속 배치 상태: "
+                    f"예정 {state_summary['expected']}, 성공 {state_summary['ok']}, "
+                    f"실패/부분 {state_summary['failed']}, 미실행 {state_summary['missing']}, "
+                    f"충돌 {state_summary['conflicts']}"
+                )
             self._log(f"[감독관] 텍스트 추출 완료: {elapsed:.1f}초")
 
             ledger_records = list(extractor.ledger)
@@ -448,7 +523,7 @@ class Supervisor:
             raw_data["execution_info"] = execution_info
 
             if include_images:
-                image_agent = ImageAgent()
+                image_agent = ImageAgent(run_state=run_state)
                 t0 = time.time()
                 try:
                     raw_data = image_agent.extract(
@@ -604,18 +679,129 @@ class Supervisor:
                             logger.warning("보조 후보 판정 quota/한도 문제로 건너뜀: %s", exc)
                         elapsed = time.time() - t0
                         self._add_timing("보조 후보 판정·병합", elapsed)
-                        if merge_log:
-                            reconcile_reflected_merge_log(final_data, merge_log)
-                            final_data.setdefault("hybrid_merge_log", []).extend(merge_log)
-                        self._log(hybrid_agent.adjudication_report())
-                        self._log(f"[감독관] 보조 후보 판정·병합 완료: {elapsed:.1f}초")
+                    if merge_log:
+                        reconcile_reflected_merge_log(final_data, merge_log)
+                        final_data.setdefault("hybrid_merge_log", []).extend(merge_log)
+                    self._log(hybrid_agent.adjudication_report())
+                    self._log(f"[감독관] 보조 후보 판정·병합 완료: {elapsed:.1f}초")
 
-            score, issues = _quality_score(final_data)
+            # STEP 3d-2: 원문 표 캡션·섹션을 이용해 행이 올바른 시트에
+            # 배치됐는지 검증한다. 자동 이동은 미래연도 현황→전망 오배치로 제한한다.
+            if getattr(config, "SEMANTIC_ROUTING_ENABLED", True):
+                self._log("\n[감독관] STEP 3d-2: 표 캡션·섹션 기반 시트 의미 검증...")
+                t0 = time.time()
+                semantic_routing = validate_and_reclassify(
+                    final_data,
+                    pdf_content,
+                    auto_reclassify=bool(
+                        getattr(config, "SEMANTIC_ROUTING_AUTO_RECLASSIFY", True)
+                    ),
+                )
+                municipality = final_data.get("municipality_name", "알 수 없음")
+                validation_report = final_data.setdefault("validation_report", [])
+                if isinstance(validation_report, list):
+                    validation_report.extend(
+                        semantic_routing.validation_issues(municipality)
+                    )
+                elapsed = time.time() - t0
+                self._add_timing("시트 의미 검증", elapsed)
+                self._log(
+                    f"[감독관] 시트 의미 검증 완료: "
+                    f"{semantic_routing.summary_text()} ({elapsed:.1f}초)"
+                )
+            else:
+                semantic_routing = None
+                self._log("[감독관] 시트 의미 검증 비활성화")
+
+            # STEP 3e: 최종 행을 원문과 결정론적으로 대조한다. 기존 외전 검수 도구의
+            # 검색어·출처페이지 우선·전체문서 fallback 원리를 인메모리 데이터에 적용한다.
+            if getattr(config, "SOURCE_VERIFICATION_ENABLED", True):
+                self._log("\n[감독관] STEP 3e: 원문 근거 대조 실행...")
+                t0 = time.time()
+                source_verification = verify_final_data(
+                    final_data,
+                    pdf_content,
+                    page_radius=max(0, int(getattr(config, "SOURCE_VERIFICATION_PAGE_RADIUS", 1))),
+                    max_terms=max(1, int(getattr(config, "SOURCE_VERIFICATION_MAX_TERMS", 12))),
+                    global_search=bool(getattr(config, "SOURCE_VERIFICATION_GLOBAL_SEARCH", True)),
+                )
+                municipality = final_data.get("municipality_name", "알 수 없음")
+                final_data["source_verification"] = source_verification.excel_rows(municipality)
+                validation_report = final_data.setdefault("validation_report", [])
+                if isinstance(validation_report, list):
+                    validation_report.extend(source_verification.validation_issues(municipality))
+                elapsed = time.time() - t0
+                self._add_timing("원문 대조", elapsed)
+                self._log(f"[감독관] 원문 대조 완료: {source_verification.summary_text()} ({elapsed:.1f}초)")
+            else:
+                source_verification = None
+                final_data["source_verification"] = []
+                self._log("[감독관] 원문 대조 비활성화")
+
+            # STEP 3f: 추출된 행을 출발점으로 삼는 원문대조와 반대 방향으로,
+            # 원문의 표·그래프 전체를 분모로 삼아 누락 객체를 계산한다.
+            if getattr(config, "SOURCE_OBJECT_INVENTORY_ENABLED", True):
+                self._log("\n[감독관] STEP 3f: 원문 표·그래프 객체 인벤토리 연결...")
+                t0 = time.time()
+                source_object_inventory = build_source_object_inventory(final_data, pdf_content)
+                municipality = final_data.get("municipality_name", "알 수 없음")
+                final_data["source_object_inventory"] = source_object_inventory.excel_rows(municipality)
+                validation_report = final_data.setdefault("validation_report", [])
+                if isinstance(validation_report, list):
+                    validation_report.extend(source_object_inventory.validation_issues(municipality))
+                elapsed = time.time() - t0
+                self._add_timing("원문 객체 인벤토리", elapsed)
+                self._log(
+                    f"[감독관] 원문 객체 연결 완료: "
+                    f"{source_object_inventory.summary_text()} ({elapsed:.1f}초)"
+                )
+            else:
+                source_object_inventory = None
+                final_data["source_object_inventory"] = []
+                self._log("[감독관] 원문 객체 인벤토리 비활성화")
+
+            validation_rows = final_data.get("validation_report", [])
+            if isinstance(validation_rows, list):
+                final_data["validation_report"] = _deduplicate_validation_rows(validation_rows)
+
+            pipeline_metrics = _ledger_quality_metrics(ledger_records, run_state)
+            if semantic_routing is not None:
+                pipeline_metrics.update(semantic_routing.metrics())
+            if source_object_inventory is not None:
+                pipeline_metrics.update({
+                    "automatic_source_object_coverage": round(
+                        source_object_inventory.coverage_ratio, 4
+                    ),
+                    "object_routing_error_rate": round(
+                        source_object_inventory.routing_error_rate, 4
+                    ),
+                })
+            final_data["pipeline_metrics"] = pipeline_metrics
+            quality_assessment = assess_quality(
+                final_data,
+                source_verification,
+                source_object_inventory,
+            )
+            score, issues = quality_assessment.score, quality_assessment.issues
             self._log(f"\n[감독관] 품질 점수: {score:.1f}/100")
+            components = quality_assessment.metrics.get("components", {})
+            if components:
+                self._log(
+                    "[감독관] 점수 구성: "
+                    + ", ".join(f"{name} {value:.1f}" for name, value in components.items())
+                )
             if issues:
                 self._log(f"[감독관] 이슈: {', '.join(issues)}")
+            self._log(
+                "[감독관] 독립 지표: "
+                "셀 정확도·객체 재현율=고정 평가(--evaluate) 시 산출, "
+                f"자동 객체 커버리지="
+                f"{quality_assessment.metrics.get('automatic_source_object_coverage', 0):.1%}, "
+                f"라우팅 오류율={quality_assessment.metrics.get('routing_error_rate', 0):.1%}"
+            )
 
-            if score >= self.QUALITY_THRESHOLD:
+            quality_threshold = float(getattr(config, "QUALITY_THRESHOLD", self.QUALITY_THRESHOLD))
+            if score >= quality_threshold:
                 self._log("[감독관] 품질 기준 통과")
                 break
             elif attempt < max_pipeline_retries:
@@ -628,20 +814,54 @@ class Supervisor:
         excel_agent = ExcelAgent()
         t0 = time.time()
         excel_data = organizer.get_excel_ready()
-        if final_data and final_data.get("hybrid_review_candidates"):
-            excel_data["hybrid_review_candidates"] = final_data["hybrid_review_candidates"]
-        if final_data and final_data.get("hybrid_merge_log"):
-            excel_data["hybrid_merge_log"] = final_data["hybrid_merge_log"]
+        for supplemental_key in (
+            "hybrid_review_candidates", "hybrid_merge_log", "validation_report",
+            "source_verification", "source_object_inventory",
+        ):
+            if final_data and isinstance(final_data.get(supplemental_key), list):
+                excel_data[supplemental_key] = final_data[supplemental_key]
         result_path = excel_agent.write(excel_data, output_path)
         elapsed = time.time() - t0
         self._add_timing("엑셀 작성", elapsed)
         self._log(excel_agent.report())
         self._log(f"[감독관] 엑셀 작성 완료: {elapsed:.1f}초")
 
+        # 외전 검수 도구와 같은 좌표 마킹 산출물. 점수 계산과 분리해 실패해도 Excel은 보존한다.
+        if (
+            source_verification is not None
+            and getattr(config, "SOURCE_VERIFICATION_MARK_PDF", True)
+            and input_path.suffix.casefold() == ".pdf"
+        ):
+            t0 = time.time()
+            marked_path = result_path.with_name(f"마킹_{result_path.stem}.pdf")
+            try:
+                saved_marked_path, mark_count = create_marked_pdf(
+                    input_path,
+                    source_verification,
+                    marked_path,
+                    max_marks=max(0, int(getattr(config, "SOURCE_VERIFICATION_MAX_MARKS", 10000))),
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                logger.warning("원문 마킹 PDF 생성 실패. Excel 결과는 유지합니다: %s", exc)
+                saved_marked_path, mark_count = None, 0
+            elapsed = time.time() - t0
+            self._add_timing("마킹 PDF", elapsed)
+            if saved_marked_path is not None:
+                self._log(f"[감독관] 원문 마킹 PDF: {saved_marked_path} ({mark_count}개, {elapsed:.1f}초)")
+            else:
+                self._log(f"[감독관] 원문 마킹 PDF 생략: 표시 가능한 좌표 없음 ({elapsed:.1f}초)")
+
         # LLM 최종 검수
         self._log("\n[감독관] LLM 최종 품질 검수 중...")
         t0 = time.time()
         try:
+            if quality_assessment is None:
+                quality_assessment = assess_quality(
+                    final_data,
+                    source_verification,
+                    source_object_inventory,
+                )
+            self._quality_assessment_for_review = quality_assessment
             review = self._llm_quality_review(final_data)
         except llm_client.LLMQuotaExceededError as exc:
             elapsed = time.time() - t0
@@ -660,7 +880,36 @@ class Supervisor:
         self._log("\n" + "=" * 60)
         self._log("[감독관] 파이프라인 완료")
         self._log(f"  출력 파일: {result_path}")
-        self._log(f"  최종 품질 점수: {_quality_score(final_data)[0]:.1f}/100")
+        if quality_assessment is None:
+            quality_assessment = assess_quality(
+                final_data,
+                source_verification,
+                source_object_inventory,
+            )
+        self._log(f"  최종 품질 점수: {quality_assessment.score:.1f}/100")
+        if run_state is not None:
+            manifest_path = run_state.finalize(
+                output_path=result_path,
+                semantic_result_hash=sha256_json({
+                    key: value
+                    for key, value in final_data.items()
+                    if isinstance(value, list) or key in {"municipality_name", "pipeline_metrics"}
+                }),
+                extra={
+                    "quality_score": quality_assessment.score,
+                    "quality_metrics": quality_assessment.metrics,
+                    "timings_seconds": {key: round(value, 3) for key, value in self._timings.items()},
+                    "llm_cache_stats": llm_cache.get_cache_stats(),
+                    "llm_call_stats": llm_client.get_llm_stats(),
+                },
+            )
+            state_summary = run_state.summary()
+            self._log(
+                f"  실행 상태: {run_state.completion_status()} "
+                f"(성공 {state_summary['ok']}/{state_summary['expected']}, "
+                f"미복구 {state_summary['failed'] + state_summary['missing']})"
+            )
+            self._log(f"  실행 매니페스트: {manifest_path}")
         self._log_timing_summary(time.time() - pipeline_start)
         self._log("=" * 60)
 
