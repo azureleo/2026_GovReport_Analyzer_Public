@@ -15,6 +15,7 @@ from utils.benchmark_evaluation import (
     select_evaluation_dataset,
     sha256_file,
 )
+from utils.routing_benchmark import evaluate_fixed_routing_inventory
 
 
 def _write_output(path: Path) -> None:
@@ -163,3 +164,45 @@ def test_cell_accuracy_counts_values_from_unmatched_golden_rows(tmp_path: Path) 
 
     assert result.metrics["cell_matches"] < result.metrics["cell_expected"]
     assert result.metrics["cell_accuracy"] == 0.5
+
+
+def test_fixed_routing_inventory_keeps_missing_object_in_denominator(tmp_path: Path) -> None:
+    output = tmp_path / "output.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "21_원문객체인벤토리"
+    headers = config.EXCEL_HEADERS["21_원문객체인벤토리"]
+    sheet.append(headers)
+    row = {
+        "객체ID": "body-table-1",
+        "출처페이지": 20,
+        "번호": "표 3-1",
+        "캡션": "표 3-1 온실가스 감축 목표",
+        "연결시트": "06_감축목표, 16_시각자료목록",
+        "보조연결시트": "16_시각자료목록",
+    }
+    sheet.append([row.get(header) for header in headers])
+    workbook.save(output)
+
+    fixed = tmp_path / "routing.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "라우팅객체"
+    fixed_headers = ["객체ID", "페이지", "객체유형", "번호", "캡션", "평가대상", "허용시트"]
+    sheet.append(fixed_headers)
+    sheet.append([
+        "body-table-1", 20, "표", "표 3-1", "온실가스 감축 목표", "Y", "06_감축목표",
+    ])
+    sheet.append([
+        "missing-chart-1", 30, "그래프", "그림 4-2", "배출 전망", "Y", "05_배출전망|06_감축목표",
+    ])
+    workbook.save(fixed)
+
+    metrics, details = evaluate_fixed_routing_inventory(output, fixed)
+
+    assert metrics["routing_fixed_denominator"] is True
+    assert metrics["routing_evaluable_objects"] == 2
+    assert metrics["routing_mismatch_objects"] == 1
+    assert metrics["routing_missing_objects"] == 1
+    assert metrics["routing_error_rate"] == 0.5
+    assert [detail.status for detail in details] == ["일치", "미추출"]

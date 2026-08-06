@@ -14,6 +14,7 @@ from openpyxl import load_workbook
 
 from scripts.audit_visual_inventory import AuditPaths, run_audit
 from scripts.score_against_golden import score_workbooks
+from utils.routing_benchmark import evaluate_fixed_routing_inventory
 
 
 class EvaluationContractError(RuntimeError):
@@ -32,6 +33,8 @@ class EvaluationDataset:
     golden_sha256: str
     visual_inventory_path: Path | None
     visual_inventory_sha256: str
+    routing_inventory_path: Path | None
+    routing_inventory_sha256: str
     notes: str = ""
 
 
@@ -97,6 +100,10 @@ def load_evaluation_datasets(manifest_path: str | Path) -> list[EvaluationDatase
             visual_inventory_path=_resolve_path(manifest.parent, raw.get("visual_inventory")),
             visual_inventory_sha256=str(
                 raw.get("visual_inventory_sha256") or ""
+            ).strip().lower(),
+            routing_inventory_path=_resolve_path(manifest.parent, raw.get("routing_inventory")),
+            routing_inventory_sha256=str(
+                raw.get("routing_inventory_sha256") or ""
             ).strip().lower(),
             notes=str(raw.get("notes") or "").strip(),
         ))
@@ -172,9 +179,24 @@ def verify_evaluation_contract(
             dataset.visual_inventory_sha256,
             "시각요소 인벤토리",
         )
+    if dataset.routing_inventory_path is not None:
+        _verify_file(
+            dataset.routing_inventory_path,
+            dataset.routing_inventory_sha256,
+            "라우팅 인벤토리",
+        )
 
 
-def routing_metrics_from_workbook(output_path: str | Path) -> dict[str, Any]:
+def routing_metrics_from_workbook(
+    output_path: str | Path,
+    routing_inventory_path: str | Path | None = None,
+) -> dict[str, Any]:
+    if routing_inventory_path is not None:
+        metrics, _details = evaluate_fixed_routing_inventory(
+            output_path,
+            routing_inventory_path,
+        )
+        return metrics
     workbook = load_workbook(output_path, read_only=True, data_only=True)
     try:
         if "21_원문객체인벤토리" not in workbook.sheetnames:
@@ -182,6 +204,8 @@ def routing_metrics_from_workbook(output_path: str | Path) -> dict[str, Any]:
                 "routing_error_rate": None,
                 "routing_evaluable_objects": 0,
                 "routing_mismatch_objects": 0,
+                "routing_missing_objects": 0,
+                "routing_fixed_denominator": False,
             }
         sheet = workbook["21_원문객체인벤토리"]
         headers = [str(cell.value or "").strip() for cell in sheet[1]]
@@ -190,6 +214,8 @@ def routing_metrics_from_workbook(output_path: str | Path) -> dict[str, Any]:
                 "routing_error_rate": None,
                 "routing_evaluable_objects": 0,
                 "routing_mismatch_objects": 0,
+                "routing_missing_objects": 0,
+                "routing_fixed_denominator": False,
             }
         status_index = headers.index("시트정합상태")
         statuses = [
@@ -197,12 +223,15 @@ def routing_metrics_from_workbook(output_path: str | Path) -> dict[str, Any]:
             for values in sheet.iter_rows(min_row=2, values_only=True)
             if status_index < len(values)
         ]
-        evaluable = sum(status in {"일치", "오배치의심"} for status in statuses)
-        mismatches = sum(status == "오배치의심" for status in statuses)
+        evaluable_statuses = {"일치", "오배치의심", "본문미연결"}
+        evaluable = sum(status in evaluable_statuses for status in statuses)
+        mismatches = sum(status in {"오배치의심", "본문미연결"} for status in statuses)
         return {
             "routing_error_rate": round(mismatches / evaluable, 4) if evaluable else None,
             "routing_evaluable_objects": evaluable,
             "routing_mismatch_objects": mismatches,
+            "routing_missing_objects": 0,
+            "routing_fixed_denominator": False,
         }
     finally:
         workbook.close()
@@ -243,6 +272,53 @@ def _safe_label(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z가-힣_.-]+", "_", value).strip("_") or "evaluation"
 
 
+def _routing_metrics(
+    dataset: EvaluationDataset,
+    output_path: Path,
+    report_dir: Path,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    if dataset.routing_inventory_path is None:
+        return routing_metrics_from_workbook(output_path), {}
+    metrics, details = evaluate_fixed_routing_inventory(
+        output_path,
+        dataset.routing_inventory_path,
+    )
+    payload = {
+        "schema_version": 1,
+        "dataset_id": dataset.dataset_id,
+        "routing_inventory": str(dataset.routing_inventory_path),
+        "metrics": metrics,
+        "objects": [detail.to_dict() for detail in details],
+    }
+    json_path = report_dir / "routing_fixed_inventory.json"
+    markdown_path = report_dir / "routing_fixed_inventory.md"
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    lines = [
+        f"# 고정 라우팅 평가: {dataset.dataset_id}",
+        "",
+        "| 객체ID | 페이지 | 허용 시트 | 연결 본문 시트 | 판정 |",
+        "|---|---:|---|---|---|",
+    ]
+    lines.extend(
+        "| {id} | {page} | {allowed} | {linked} | {status} |".format(
+            id=detail.item_id,
+            page=detail.page,
+            allowed=", ".join(detail.allowed_sheets),
+            linked=", ".join(detail.linked_body_sheets) or "-",
+            status=detail.status,
+        )
+        for detail in details
+    )
+    markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return metrics, {
+        "routing_evaluation_json": str(json_path),
+        "routing_evaluation_markdown": str(markdown_path),
+    }
+
+
 def _markdown(payload: dict[str, Any]) -> str:
     metrics = payload["metrics"]
 
@@ -269,8 +345,9 @@ def _markdown(payload: dict[str, Any]) -> str:
         f"| 행 정밀도 | {ratio('row_precision')} | {metrics.get('output_rows', 0)}행 |",
         "",
         "셀 정확도는 골든에 값이 있으나 출력에서 비어 있는 셀도 오답으로 계산합니다. "
-        "객체 재현율은 사람 확정 시각요소 인벤토리, 라우팅 오류율은 캡션·섹션으로 "
-        "판정 가능한 원문 객체를 각각 분모로 사용합니다.",
+        "객체 재현율은 사람 확정 시각요소 인벤토리를 분모로 사용합니다. "
+        "라우팅 인벤토리가 등록된 데이터셋은 미추출 객체를 포함한 고정 분모를, "
+        "미등록 문서는 운영 객체의 동적 지표를 사용합니다.",
         "",
     ]
     return "\n".join(lines)
@@ -322,12 +399,13 @@ def evaluate_benchmark(
     visual_metrics, visual_artifacts = _visual_metrics(
         dataset, output, source, target_dir
     )
-    routing_metrics = routing_metrics_from_workbook(output)
+    routing_metrics, routing_artifacts = _routing_metrics(dataset, output, target_dir)
     metrics = {**cell_metrics, **visual_metrics, **routing_metrics}
     artifacts = {
         "golden_score_json": str(score.get("리포트", {}).get("json", "")),
         "golden_score_markdown": str(score.get("리포트", {}).get("md", "")),
         **visual_artifacts,
+        **routing_artifacts,
     }
     payload = {
         "schema_version": 1,
@@ -347,6 +425,11 @@ def evaluate_benchmark(
             if dataset.visual_inventory_path is not None
             else None
         ),
+        "routing_inventory": (
+            str(dataset.routing_inventory_path)
+            if dataset.routing_inventory_path is not None
+            else None
+        ),
         "metrics": metrics,
         "artifacts": artifacts,
         "notes": dataset.notes,
@@ -355,7 +438,13 @@ def evaluate_benchmark(
     json_path = target_dir / f"benchmark_evaluation_{label}.json"
     markdown_path = target_dir / f"benchmark_evaluation_{label}.md"
     json_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            default=str,
+        ),
         encoding="utf-8",
     )
     markdown_path.write_text(_markdown(payload), encoding="utf-8")

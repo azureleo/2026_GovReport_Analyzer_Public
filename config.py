@@ -140,6 +140,14 @@ SEMANTIC_ROUTING_ENABLED = _env_bool("SEMANTIC_ROUTING_ENABLED", True)
 SEMANTIC_ROUTING_AUTO_RECLASSIFY = _env_bool("SEMANTIC_ROUTING_AUTO_RECLASSIFY", True)
 SEMANTIC_ROUTING_MIN_SCORE = _env_float("SEMANTIC_ROUTING_MIN_SCORE", 5.0)
 SEMANTIC_ROUTING_MIN_MARGIN = _env_float("SEMANTIC_ROUTING_MIN_MARGIN", 1.5)
+# 한 표가 계획개요와 감축목표처럼 둘 이상의 본문 시트에 합법적으로 대응할 때,
+# 최고 점수와 가까운 후보를 허용 집합으로 보존한다. 단일 행 자동 이동에는 사용하지 않는다.
+SEMANTIC_ROUTING_ALLOWED_SCORE_DELTA = _env_float(
+    "SEMANTIC_ROUTING_ALLOWED_SCORE_DELTA", 1.5
+)
+SEMANTIC_ROUTING_MAX_ALLOWED_TARGETS = _env_int(
+    "SEMANTIC_ROUTING_MAX_ALLOWED_TARGETS", 3
+)
 QUALITY_THRESHOLD = _env_float("QUALITY_THRESHOLD", 70.0)
 QUALITY_MAX_WITHOUT_SOURCE_INVENTORY = _env_float("QUALITY_MAX_WITHOUT_SOURCE_INVENTORY", 95.0)
 
@@ -248,6 +256,12 @@ HYBRID_AUTO_MERGE_MIN_CONFIDENCE = os.environ.get("HYBRID_AUTO_MERGE_MIN_CONFIDE
 # 라벨 기반 시각 판독값을 Organizer에서 본 시트로 병합한다.
 # 기본 활성화하되 환경변수를 0으로 지정하면 기존 비활성 경로를 유지한다.
 VISUAL_MERGE_LABELED_ENABLED = _env_bool("VISUAL_MERGE_LABELED_ENABLED", True)
+# 객체 인벤토리가 연결된 운영 경로에서는 단일 근거 ID가 단일 extracted 객체와
+# 정확히 일치한 시각 후보만 본문 시트에 병합한다. 나머지는 16번 시트에 격리한다.
+VISUAL_EVIDENCE_MERGE_ENABLED = _env_bool("VISUAL_EVIDENCE_MERGE_ENABLED", True)
+# 운영 Vision 결과를 모델 호출 없이 병합 정책 A/B에 재사용할 수 있도록
+# 정제 직전의 최소 입력을 gzip JSON 스냅샷으로 보존한다.
+VISUAL_MERGE_SNAPSHOT_ENABLED = _env_bool("VISUAL_MERGE_SNAPSHOT_ENABLED", True)
 
 # 연도 범위 (탄소중립 기본계획 기준)
 YEARS = list(range(2018, 2051))
@@ -349,7 +363,11 @@ EXCEL_HEADERS = {
     ],
     "16_시각자료목록": [
         "지자체명", "시각자료ID", "캡션", "유형",
-        "데이터포함여부", "추출값요약", "디지타이징필요", "관련시트",
+        "데이터포함여부", "추출값요약", "원문값", "원문단위",
+        "정규화값", "정규화단위", "정규화배율",
+        "값근거", "값검증상태", "계약버전",
+        "디지타이징필요", "관련시트",
+        "근거ID", "근거매칭상태", "병합상태", "병합차단사유",
     ],
     "17_보조검수후보": [
         "지자체명", "대상시트", "후보유형", "신뢰도", "근거페이지",
@@ -371,7 +389,10 @@ EXCEL_HEADERS = {
     "21_원문객체인벤토리": [
         "지자체명", "객체ID", "객체유형", "출처페이지", "번호", "캡션",
         "섹션", "행수", "열수", "연결상태", "완전성점수", "연결시트",
-        "연결행수", "검수메시지", "예상시트", "시트정합상태",
+        "연결행수", "검수메시지", "예상시트", "시트정합상태", "좌표",
+        "원본신뢰도", "Triage판정", "Triage사유", "보완백엔드", "보완상태",
+        "최종상태", "시도횟수", "종결사유", "근거ID",
+        "허용시트", "보조연결시트", "목차참조페이지", "중복객체ID",
     ],
     "90_코드북": [
         "코드유형", "코드", "라벨", "정의", "비고",
@@ -444,11 +465,17 @@ OPTIONAL_EXCEL_SHEETS = {
     "20_원문대조", "21_원문객체인벤토리", "90_코드북",
 }
 
+# 원문 객체 검증 단계에서만 사용하는 내부 원장. Excel 시트 행 수, 최종 LLM 요약,
+# 사용자용 작성 데이터 집계에는 포함하지 않는다.
+INTERNAL_OBJECT_KEYS = {"object_triage", "ocr_document_objects", "document_objects"}
+
 # 행 단위 원문 대조를 위한 페이지 근거. 헤더에는 항상 맨 뒤에 추가하되,
 # 실제 엑셀 출력에서만 PROVENANCE_ENABLED=0으로 v3 스키마를 복원할 수 있다.
 PROVENANCE_ENABLED = _env_bool("PROVENANCE_ENABLED", True)
 _PROVENANCE_DATA_SHEETS = [name for name in EXCEL_HEADERS if name[:2].isdigit() and int(name[:2]) <= 15]
 for _sheet_name in _PROVENANCE_DATA_SHEETS:
+    if "근거ID" not in EXCEL_HEADERS[_sheet_name]:
+        EXCEL_HEADERS[_sheet_name].append("근거ID")
     if "출처페이지" not in EXCEL_HEADERS[_sheet_name]:
         EXCEL_HEADERS[_sheet_name].append("출처페이지")
     if "데이터상태" not in EXCEL_HEADERS[_sheet_name]:
@@ -582,6 +609,19 @@ IMAGE_ANALYSIS_BATCH_SIZE = _env_int("IMAGE_ANALYSIS_BATCH_SIZE", 8)
 VISION_CHECKPOINT_ENABLED = _env_bool("VISION_CHECKPOINT_ENABLED", True)
 VISION_SPLIT_ON_FAILURE = _env_bool("VISION_SPLIT_ON_FAILURE", True)
 VISION_RECOVERY_MAX_SPLIT_DEPTH = _env_int("VISION_RECOVERY_MAX_SPLIT_DEPTH", 6)
+# 루트 호출도 1회로 계산한다. 기본 7회는 최대 분할 깊이 6과 같은 상한이다.
+VISION_RECOVERY_MAX_OBJECT_ATTEMPTS = _env_int(
+    "VISION_RECOVERY_MAX_OBJECT_ATTEMPTS", 7
+)
+# 재개 실행에서 성공 체크포인트 전체를 버리지 않고, 지정한 근거 객체나
+# 페이지가 포함된 Vision 배치만 다시 판독한다. 새 결과는 같은 배치의 기존
+# 비대상 결과와 병합되어 체크포인트에 다시 저장된다.
+VISION_RETRY_EVIDENCE_IDS = _env_list("VISION_RETRY_EVIDENCE_IDS", [])
+VISION_RETRY_PAGES = {
+    page
+    for value in _env_list("VISION_RETRY_PAGES", [])
+    if str(value).strip().isdigit() and (page := int(value)) > 0
+}
 # 그래프 판독값을 본 시트에 자동 병합할 최소 신뢰도.
 # low는 별도 판독결과 시트에만 남기고 본 데이터에는 병합하지 않는다.
 IMAGE_CHART_MERGE_MIN_CONFIDENCE = "medium"
@@ -600,6 +640,20 @@ IMAGE_CHART_REFERENCE_KEYWORDS = [
 ]
 # True이면 참고자료/해외사례/목차성 페이지 이미지를 Vision 호출 전에 제외한다.
 IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT = True
+
+# ──────────────────────────────────────────────────────────────────────
+# 문서 객체 기반 선택적 OCR/VLM
+# ──────────────────────────────────────────────────────────────────────
+# PyMuPDF가 충분히 읽은 표·텍스트는 재호출하지 않고, 누락·부분·복잡 객체와
+# 데이터 차트만 보완한다. 백엔드는 vlm(기존 이미지 에이전트),
+# unlimited_ocr(사전 생성 Markdown/JSONL 디렉터리), none 중 하나다.
+SELECTIVE_OCR_ENABLED = _env_bool("SELECTIVE_OCR_ENABLED", True)
+OCR_BACKEND = os.environ.get("OCR_BACKEND", "vlm").strip().lower() or "vlm"
+OCR_RESULTS_DIR = os.environ.get("OCR_RESULTS_DIR", "").strip()
+OCR_NATIVE_CONFIDENCE_THRESHOLD = _env_float("OCR_NATIVE_CONFIDENCE_THRESHOLD", 0.78)
+OCR_COMPLEX_TABLE_ROWS = _env_int("OCR_COMPLEX_TABLE_ROWS", 45)
+OCR_COMPLEX_TABLE_COLUMNS = _env_int("OCR_COMPLEX_TABLE_COLUMNS", 12)
+OCR_RENDER_DPI = _env_int("OCR_RENDER_DPI", 200)
 
 # 1차 추출 후 빈칸이 큰 행만 좁은 문맥으로 다시 보완
 GAP_FILL_ENABLED = _env_bool("GAP_FILL_ENABLED", True)

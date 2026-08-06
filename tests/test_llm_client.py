@@ -255,6 +255,11 @@ class LLMClientTests(unittest.TestCase):
             llm_client.config.CODEX_COMMAND = self._fake_codex_command(Path(tmp))
             llm_client.config.LOCAL_AGENT_TIMEOUT = 5
             llm_client.config.LOCAL_AGENT_MODEL = ""
+            llm_client.config.CODEX_VISION_MODEL = "gpt-5.6-luna"
+            llm_client.config.STAGE_MODELS = {
+                **llm_client.config.STAGE_MODELS,
+                "vision": "",
+            }
 
             image_b64 = base64.b64encode(b"not really a png").decode("ascii")
             raw = llm_client.call_vision(image_b64, '{"image": true}', max_retries=1, stage="vision")

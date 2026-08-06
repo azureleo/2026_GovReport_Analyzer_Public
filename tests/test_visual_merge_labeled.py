@@ -149,8 +149,19 @@ def test_시각_라벨병합은_실스키마의_estimated_부재만으로_G1을_
     assert "G1 판독필드 없음" in details
 
 
-@pytest.mark.parametrize("title", ["온실가스 흡수 전망", "온실가스 BAU 산정"])
-def test_시각_라벨병합은_03_전망성_제목을_05로_재지정한_뒤_G3에서_차단한다(monkeypatch, title: str) -> None:
+@pytest.mark.parametrize(
+    ("title", "expected_count", "expected_status"),
+    [
+        ("온실가스 흡수 전망", 0, "needs_review"),
+        ("온실가스 BAU 산정", 1, "accept"),
+    ],
+)
+def test_시각_라벨병합은_03_전망성_제목을_05로_재지정해_시나리오_계약을_적용한다(
+    monkeypatch,
+    title: str,
+    expected_count: int,
+    expected_status: str,
+) -> None:
     # Given: 03 후보의 제목에 전망 키워드가 있고 시나리오 표기는 없으면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
     observation = _시각_관찰값(
@@ -165,16 +176,20 @@ def test_시각_라벨병합은_03_전망성_제목을_05로_재지정한_뒤_G3
         "chart_observations": [observation],
     })
 
-    # Then: 03은 오염되지 않고 미지원 시트인 05 라벨 후보도 차단된다.
+    # Then: 03은 오염되지 않고, BAU를 식별한 후보만 05에 반영된다.
     assert cleaned["emissions_regional"] == []
-    assert cleaned["emissions_forecast"] == []
-    assert any(
-        issue.get("대상시트키") == "emissions_forecast"
-        and issue.get("항목") == "차단"
-        and "G3 대상 시트 미지원" in issue.get("문제내용", "")
-        and "대상시트 재지정(전망 키워드)" in issue.get("문제내용", "")
-        for issue in cleaned["validation_report"]
-    )
+    assert len(cleaned["emissions_forecast"]) == expected_count
+    assert observation["병합상태"] == expected_status
+    if expected_status == "needs_review":
+        assert "G3 1차 키 누락(시나리오)" in observation["병합차단사유"]
+    else:
+        assert cleaned["emissions_forecast"][0]["시나리오"] == "BAU"
+        assert any(
+            issue.get("대상시트키") == "emissions_forecast"
+            and issue.get("항목") == "병합"
+            and "대상시트 재지정(전망 키워드)" in issue.get("문제내용", "")
+            for issue in cleaned["validation_report"]
+        )
 
 
 def test_시각_라벨병합은_근거의_전망_문자열로_03을_재지정하지_않는다(monkeypatch) -> None:
@@ -569,8 +584,8 @@ def test_시각_라벨병합은_빈_세부부문을_기본값으로_채우지_�
         ("regional_conditions", {"지표범주": "교통", "지표명": "통행량", "연도": 2030}, "값", "02_지역여건", True),
         ("emissions_regional", {"배출유형": "직접배출", "부문": "건물", "세부부문": "공공", "연도": 2030}, "배출량", "03_배출현황_지역", True),
         ("emissions_management", {"관리부문": "건물", "세부부문": "공공", "직간접구분": "직접", "연도": 2030}, "배출량", "04_배출현황_관리권한", True),
-        ("emissions_forecast", {"시나리오": "BAU", "부문": "건물", "연도": 2030}, "전망값", "05_배출전망", False),
-        ("reduction_targets", {"목표수준": "부문", "목표범위": "지역전체", "부문": "건물", "목표연도": 2030}, "목표배출량", "06_감축목표", False),
+        ("emissions_forecast", {"시나리오": "BAU", "부문": "건물", "연도": 2030}, "전망값", "05_배출전망", True),
+        ("reduction_targets", {"목표수준": "부문", "목표범위": "지역전체", "부문": "건물", "목표연도": 2030}, "목표배출량", "06_감축목표", True),
         ("financial_plan", {"계획구분": "온실가스감축대책", "부문": "건물", "사업명": "효율화", "재원구분": "합계", "연도": 2030}, "예산액", "11_재정투자계획", True),
     ],
 )

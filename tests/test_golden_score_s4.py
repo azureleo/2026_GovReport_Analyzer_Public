@@ -4,8 +4,15 @@ from pathlib import Path
 
 import openpyxl
 
+import config
+from scripts.golden_score_contract import 계약헤더
 from scripts.score_against_golden import score_workbooks
 from tests.test_score_against_golden import _계약열, _워크북, _점수
+
+
+def test_근거_id는_골든셋_내용_계약에서_제외한다() -> None:
+    assert "근거ID" in config.EXCEL_HEADERS["03_배출현황_지역"]
+    assert "근거ID" not in 계약헤더("03_배출현황_지역")
 
 
 def test_값일치율은_양쪽_값이_있는_쌍만_분모로_쓴다(tmp_path: Path) -> None:

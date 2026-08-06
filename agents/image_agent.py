@@ -15,10 +15,35 @@ import threading
 
 import config
 from agents.organizer_agent import _IPCC_GAS_NAMES, _gas_sector_key
-from utils.pdf_reader import PageContent
+from utils.document_objects import build_document_objects
+from utils.evidence_merge import (
+    EvidenceMatch,
+    build_evidence_catalog,
+    match_evidence,
+    normalize_evidence_ids,
+)
+from utils.pdf_reader import PDFContent, PageContent
+from utils.selective_ocr import (
+    apply_triage_metadata,
+    build_triage_plan,
+    get_ocr_backend,
+    merge_document_objects,
+    render_ocr_candidate_images,
+    vision_analyses_to_objects,
+)
 from utils import llm_client
 from utils.parallel import parallel_map_collect
 from utils.run_state import RunState
+from utils.vision_recovery import (
+    ObjectOutcomeLedger,
+    has_usable_table_value,
+    split_in_half,
+)
+from utils.visual_contract import (
+    VISUAL_CONTRACT_VERSION,
+    normalize_value_source,
+    normalize_visual_table_rows,
+)
 from PIL import Image, ImageFilter, ImageStat
 
 logger = logging.getLogger(__name__)
@@ -29,9 +54,9 @@ IMAGE_SYSTEM = """당신은 한국 지자체 탄소중립 계획 보고서의 �
 이미지에서 보이는 수치, 연도, 부문, 단위 정보를 최대한 정확하게 읽어내세요.
 
 규칙:
-1. 그래프 축의 값을 꼼꼼히 읽어 숫자로 반환하세요.
+1. 그래프 축의 값은 직접 수치 라벨이 있을 때만 정확값으로 반환하세요.
 2. 단위(tCO2eq, 천 tCO2eq 등)를 반드시 기록하세요.
-3. 값이 불분명하면 "약 XXX" 형태로 표현하세요.
+3. 값이 불분명하면 "약 XXX"를 만들지 말고 null로 반환하세요.
 4. 텍스트가 포함된 표(도표)도 분석하세요.
 5. 그래프가 아닌 이미지(사진, 로고 등)는 type을 "해당없음"으로 반환하세요.
 6. 반드시 JSON만 반환하세요."""
@@ -55,6 +80,11 @@ DePlot 방식처럼 그래프 이미지를 먼저 선형화된 표 데이터로 
 8. 반드시 JSON만 반환하세요.
 9. 각 행의 fields에는 아래 시트별 필수 분류 필드를 이미지·캡션·주변 라벨에서 읽을 수 있을 때만 넣으세요. 확신이 없으면 그 필드를 생략하세요(추측 금지).
 10. 감축목표 차트에서 막대·수치가 '감축량'인지 '목표배출량'인지 축·화살표·범례로 구분해 값역할에 명시하세요. 구분이 안 되면 값역할을 생략하세요.
+11. 항목명·범례명·부호·기간·단위는 이미지 원문을 그대로 보존하세요. 동의어나 축약어로 바꾸지 마세요.
+12. 하나의 정량값은 반드시 table의 한 행으로 분리하세요. BAU·감축량·감축률·신규·누계·예산을 fields 문자열 안에 묶지 마세요.
+13. `21~30년` 같은 기간은 임의의 단일 연도나 `21~1930`으로 확장하지 말고 연도=null, fields.기간원문="21~30년"으로 기록하세요.
+14. fields.값근거는 명시라벨, 표셀, 축추정, 계산값, 불명 중 하나로 기록하세요. 축추정·계산값은 자동 병합되지 않습니다.
+15. 합계와 세부값이 함께 보이면 합계도 별도 행으로 반환하고 동일한 fields.합계그룹과 집계수준(합계|세부)을 기록하세요.
 
 시트별 fields 예시:
 - vehicle: {"용도": "승용", "차종": "전기", "대수": 123, "주행거리": 45.1}
@@ -89,7 +119,7 @@ def _coverage_reduce_images(raw_images: list[tuple[PageContent, dict]]) -> list[
         by_page.setdefault(page.page_number, []).append((page, image))
 
     reduced: list[tuple[PageContent, dict]] = []
-    seen_hashes: set[str] = set()
+    seen_hashes: dict[str, int] = {}
     for page_num in sorted(by_page):
         items = by_page[page_num]
         full_renders = [
@@ -100,8 +130,13 @@ def _coverage_reduce_images(raw_images: list[tuple[PageContent, dict]]) -> list[
         for page, image in candidates:
             digest = hashlib.sha1(str(image.get("base64", "")).encode("utf-8")).hexdigest()
             if digest in seen_hashes:
+                _, existing = reduced[seen_hashes[digest]]
+                for key in ("source_object_ids", "source_evidence_ids"):
+                    current = existing.get(key) if isinstance(existing.get(key), list) else []
+                    incoming = image.get(key) if isinstance(image.get(key), list) else []
+                    existing[key] = list(dict.fromkeys([*current, *incoming]))
                 continue
-            seen_hashes.add(digest)
+            seen_hashes[digest] = len(reduced)
             reduced.append((page, image))
     return reduced
 
@@ -193,6 +228,11 @@ def _fallback_visual_observations(page: PageContent, municipality: str) -> list[
                     "신뢰도": "medium",
                     "반영여부": "검토",
                     "근거": "이미지 분석 fallback: 페이지 렌더/표 주변 텍스트에서 연도별 통행량 변화율 행을 판독",
+                    "근거ID": "",
+                    "근거ID목록": [],
+                    "근거매칭상태": "missing",
+                    "병합상태": "needs_review",
+                    "병합차단사유": "fallback 관찰값의 원본 객체 근거 ID 미확정",
                 })
 
     # 사업개요형 이미지/도표 주변에 보이는 정량 지표.
@@ -220,6 +260,11 @@ def _fallback_visual_observations(page: PageContent, municipality: str) -> list[
                     "신뢰도": "medium",
                     "반영여부": "검토",
                     "근거": "이미지 분석 fallback: 사업 이미지 주변 정량 설명에서 직접 판독",
+                    "근거ID": "",
+                    "근거ID목록": [],
+                    "근거매칭상태": "missing",
+                    "병합상태": "needs_review",
+                    "병합차단사유": "fallback 관찰값의 원본 객체 근거 ID 미확정",
                 })
 
     return observations
@@ -468,6 +513,171 @@ class ImageAgent:
         self.failed_batches = 0
         self.skipped_batches = 0
         self._counter_lock = threading.Lock()
+        self._object_outcomes = ObjectOutcomeLedger()
+
+    @staticmethod
+    def _image_evidence_ids(image: dict) -> list[str]:
+        values = image.get("source_evidence_ids")
+        if not isinstance(values, list):
+            return []
+        return list(dict.fromkeys(
+            str(value or "").strip() for value in values if str(value or "").strip()
+        ))
+
+    def _task_evidence_ids(self, task: dict) -> list[str]:
+        return list(dict.fromkeys(
+            evidence_id
+            for _page, image in task.get("batch", [])
+            for evidence_id in self._image_evidence_ids(image)
+        ))
+
+    def _forced_retry_evidence_ids(self, task: dict) -> set[str]:
+        configured = {
+            str(value or "").strip()
+            for value in getattr(config, "VISION_RETRY_EVIDENCE_IDS", [])
+            if str(value or "").strip()
+        }
+        retry_pages = {
+            int(value)
+            for value in getattr(config, "VISION_RETRY_PAGES", set())
+            if str(value).isdigit() and int(value) > 0
+        }
+        selected: set[str] = set()
+        for page, image in task.get("batch", []):
+            evidence_ids = set(self._image_evidence_ids(image))
+            selected.update(evidence_ids & configured)
+            if page.page_number in retry_pages:
+                selected.update(evidence_ids)
+        return selected
+
+    def _forced_retry_task(self, task: dict, evidence_ids: set[str]) -> dict:
+        """Build an object-isolated retry task without changing the root checkpoint ID."""
+        isolated: list[tuple[PageContent, dict]] = []
+        for page, source_image in task.get("batch", []):
+            source_evidence = self._image_evidence_ids(source_image)
+            source_objects = source_image.get("source_object_ids")
+            object_by_evidence = dict(zip(
+                source_evidence,
+                source_objects if isinstance(source_objects, list) else [],
+            ))
+            for evidence_id in source_evidence:
+                if evidence_id not in evidence_ids:
+                    continue
+                image = dict(source_image)
+                image["source_evidence_ids"] = [evidence_id]
+                object_id = object_by_evidence.get(evidence_id)
+                image["source_object_ids"] = [object_id] if object_id else []
+                image["targeted_retry"] = True
+                isolated.append((page, image))
+        return {**task, "batch": isolated, "targeted_retry": True}
+
+    @staticmethod
+    def _replace_forced_results(
+        restored: list[dict],
+        fresh: list[dict],
+        forced_ids: set[str],
+    ) -> list[dict]:
+        retained = [
+            row for row in restored
+            if not (
+                set(normalize_evidence_ids(row.get("source_evidence_ids"))) & forced_ids
+            )
+        ]
+        return ImageAgent._merge_vision_results([retained, fresh])
+
+    @staticmethod
+    def _mark_forced_retry_failure(
+        restored: list[dict],
+        forced_ids: set[str],
+        reason: str,
+    ) -> list[dict]:
+        rows = [dict(row) for row in restored]
+        for row in rows:
+            if set(normalize_evidence_ids(row.get("source_evidence_ids"))) & forced_ids:
+                row["targeted_retry_status"] = "failed"
+                row["targeted_retry_reason"] = str(reason or "선택 재처리 실패")
+        return rows
+
+    def _record_image_outcome(
+        self,
+        image: dict,
+        status: str,
+        reason: str,
+        *,
+        response_received: bool = True,
+    ) -> None:
+        for evidence_id in self._image_evidence_ids(image):
+            self._object_outcomes.record(
+                evidence_id,
+                status,
+                response_received=response_received,
+                reason=reason,
+            )
+
+    def _record_parsed_image_outcome(self, image: dict, parsed: dict) -> None:
+        if parsed.get("type") == "해당없음":
+            self._record_image_outcome(image, "not_relevant", "VLM 비데이터 판정")
+            return
+        table = parsed.get("table")
+        if isinstance(table, list):
+            status = "extracted" if has_usable_table_value(table) else "no_data"
+            reason = "명시 수치 판독 완료" if status == "extracted" else "객체는 판독했으나 명시 수치 없음"
+            self._record_image_outcome(image, status, reason)
+            return
+        self._record_image_outcome(image, "extracted", "시각 객체 판독 완료")
+
+    def _record_analysis_outcome(self, analysis: dict, reason: str = "VLM 결과 확보") -> None:
+        evidence_ids = analysis.get("source_evidence_ids")
+        if not isinstance(evidence_ids, list):
+            return
+        retry_failed = analysis.get("targeted_retry_status") == "failed"
+        if retry_failed:
+            status = "needs_review"
+            reason = str(analysis.get("targeted_retry_reason") or "선택 재처리 실패")
+        elif analysis.get("type") == "해당없음":
+            status = "not_relevant"
+        elif isinstance(analysis.get("table"), list):
+            status = "extracted" if has_usable_table_value(analysis.get("table")) else "no_data"
+        else:
+            status = "extracted"
+        for evidence_id in evidence_ids:
+            self._object_outcomes.record(
+                str(evidence_id or ""),
+                status,
+                response_received=True,
+                reason=reason,
+            )
+
+    def _finalize_object_states(self, decisions: list, *, unresolved_reason: str) -> None:
+        for decision in decisions:
+            if decision.action != "ocr_required":
+                continue
+            outcome = self._object_outcomes.outcome(
+                decision.evidence_id,
+                unresolved_reason=unresolved_reason,
+            )
+            decision.final_status = outcome.status
+            decision.attempt_count = outcome.attempt_count
+            decision.terminal_reason = outcome.terminal_reason
+
+    def _update_final_status_stats(self, decisions: list) -> None:
+        counts: dict[str, int] = {}
+        for decision in decisions:
+            status = str(getattr(decision, "final_status", "needs_review") or "needs_review")
+            counts[status] = counts.get(status, 0) + 1
+        self._triage_stats["final_statuses"] = counts
+
+    @staticmethod
+    def _attach_source_metadata(result: dict, image: dict) -> dict:
+        """Vision 결과를 원본 DocumentObject 근거 ID에 연결한다."""
+        evidence_ids = image.get("source_evidence_ids")
+        object_ids = image.get("source_object_ids")
+        result["source_evidence_ids"] = list(evidence_ids) if isinstance(evidence_ids, list) else []
+        result["source_object_ids"] = list(object_ids) if isinstance(object_ids, list) else []
+        if image.get("bbox") is not None:
+            result["source_bbox"] = image.get("bbox")
+        result["ocr_backend"] = "vlm"
+        return result
 
     def _analyze_image(
         self,
@@ -506,11 +716,12 @@ class ImageAgent:
         # list나 빈 값이 반환되면 건너뜀
         if not parsed or not isinstance(parsed, dict):
             return None
+        self._record_parsed_image_outcome(image, parsed)
         if parsed.get("type") == "해당없음":
             return None
         parsed["page_number"] = page_num
         parsed["municipality"] = municipality
-        return parsed
+        return self._attach_source_metadata(parsed, image)
 
     def _chart_to_table(
         self,
@@ -524,6 +735,7 @@ class ImageAgent:
 
 이미지가 그래프/차트/표라면 DePlot 방식으로 다음 JSON 형식의 표 데이터로 변환하세요:
 {{
+  "contract_version": {VISUAL_CONTRACT_VERSION},
   "type": "chart_table|해당없음",
   "target_sheet": "vehicle|energy|ghg|strategy|summary",
   "chart_type": "막대|꺾은선|영역|원|표|복합|기타",
@@ -537,7 +749,7 @@ class ImageAgent:
       "종류": "현황|전망|목표|기타",
       "값": 12345,
       "단위": "단위 원문",
-      "fields": {{"지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "..."}}
+      "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "..."}}
     }}
   ],
   "summary": "이미지 내용 요약 1문장",
@@ -548,7 +760,12 @@ class ImageAgent:
 감축사업별 계획/실적/예산/감축량 표라면 target_sheet는 strategy로 두고 fields에 사업명과 부문을 넣으세요.
 차량 등록대수/주행거리 표라면 target_sheet는 vehicle, 에너지 소비량 표라면 target_sheet는 energy로 두세요.
 fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣고, 확신이 없으면 생략하세요(추측 금지).
-이미지에 숫자축만 있고 정확한 값을 읽기 어려우면 대략값을 만들지 말고 null로 반환하세요."""
+이미지에 숫자축만 있고 정확한 값을 읽기 어려우면 대략값을 만들지 말고 null로 반환하세요.
+항목명·범례명·부호·기간·단위는 원문 그대로 기록하고 동의어나 축약어로 바꾸지 마세요.
+`21~30년` 같은 기간은 연도=null, fields.기간원문="21~30년"으로 기록하세요.
+BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에 묶지 말고 값 하나당 table 한 행으로 분리하세요.
+합계와 세부값이 함께 보이면 모두 별도 행으로 반환하고 동일한 fields.합계그룹을 부여하세요.
+모든 값 행에 fields.값근거를 반드시 기록하세요."""
 
         parsed, parse_ok = llm_client.call_vision_json(image["base64"], prompt, system=CHART_TABLE_SYSTEM, stage="vision")
         if not parse_ok:
@@ -559,15 +776,25 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
             if fail_fast:
                 raise llm_client.LLMCallError("Vision 응답 스키마 불일치")
             return None
+        self._record_parsed_image_outcome(image, parsed)
         if parsed.get("type") == "해당없음":
             return None
         table = parsed.get("table", [])
         if not isinstance(table, list) or not table:
             return None
+        table = normalize_visual_table_rows(
+            table,
+            chart_type=str(parsed.get("chart_type") or ""),
+            title=str(parsed.get("title") or ""),
+        )
+        if not table:
+            return None
+        parsed["table"] = table
+        parsed["contract_version"] = VISUAL_CONTRACT_VERSION
         parsed["type"] = "chart_table"
         parsed["page_number"] = page_num
         parsed["municipality"] = municipality
-        return parsed
+        return self._attach_source_metadata(parsed, image)
 
     def _chart_to_table_batch(
         self,
@@ -608,6 +835,7 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
     {{
       "image_index": 1,
       "page_number": 123,
+      "contract_version": {VISUAL_CONTRACT_VERSION},
       "type": "chart_table|해당없음",
       "target_sheet": "vehicle|energy|ghg|strategy|summary",
       "chart_type": "막대|꺾은선|영역|원|표|복합|기타",
@@ -620,7 +848,7 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
           "종류": "현황|전망|목표|기타",
           "값": 12345,
           "단위": "단위 원문",
-          "fields": {{"지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "..."}}
+          "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "..."}}
         }}
       ],
       "summary": "이미지 내용 요약 1문장",
@@ -633,6 +861,11 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
 - analyses에는 반드시 모든 image_index를 한 번씩 포함하세요.
 - 이미지에 숫자축만 있고 정확한 값을 읽기 어려우면 값을 추정하지 말고 null로 반환하세요.
 - fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣고, 확신이 없으면 생략하세요(추측 금지).
+- 항목명·범례명·부호·기간·단위는 원문 그대로 기록하고 동의어나 축약어로 바꾸지 마세요.
+- `21~30년` 같은 기간은 연도=null, fields.기간원문="21~30년"으로 기록하세요.
+- 정량값은 값 하나당 table 한 행으로 분리하고, fields에 다른 정량값을 중첩하지 마세요.
+- 합계와 세부값은 별도 행으로 반환하고 동일한 fields.합계그룹을 부여하세요.
+- 모든 값 행에 fields.값근거를 반드시 기록하세요.
 - 표/그래프가 아니거나 지자체 직접 데이터가 아니면 type은 "해당없음"으로 두세요.
 - 반드시 JSON만 반환하세요."""
 
@@ -648,28 +881,51 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
                 raise llm_client.LLMCallError("Vision 배치 응답 스키마 불일치")
             return []
         if fail_fast:
-            returned_indexes: set[int] = set()
+            returned_indexes: list[int] = []
             for raw in raw_analyses:
                 if not isinstance(raw, dict):
                     continue
                 try:
-                    returned_indexes.add(int(raw.get("image_index")))
+                    returned_indexes.append(int(raw.get("image_index")))
                 except (TypeError, ValueError):
                     continue
-            expected_indexes = set(range(1, len(batch) + 1))
-            if returned_indexes != expected_indexes:
+            expected_indexes = list(range(1, len(batch) + 1))
+            if sorted(returned_indexes) != expected_indexes:
                 raise llm_client.LLMCallError(
-                    f"Vision 배치 응답 누락: expected={sorted(expected_indexes)}, "
+                    f"Vision 배치 객체 계약 위반: expected={expected_indexes}, "
                     f"returned={sorted(returned_indexes)}"
                 )
 
-        results: list[dict] = []
         page_by_index = {idx: page.page_number for idx, (page, _) in enumerate(batch, start=1)}
+        image_by_index = {idx: image for idx, (_, image) in enumerate(batch, start=1)}
+
+        # 전체 index 계약을 확인한 뒤 각 객체의 종결 상태를 기록한다. 부분 응답은
+        # 위에서 예외로 전환되어 상위 이분 분할 경로로 들어간다.
+        for raw in raw_analyses:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                image_index = int(raw.get("image_index"))
+            except (TypeError, ValueError):
+                continue
+            self._record_parsed_image_outcome(
+                image_by_index.get(image_index, {}),
+                raw,
+            )
+
+        results: list[dict] = []
         for raw in raw_analyses:
             if not isinstance(raw, dict) or raw.get("type") == "해당없음":
                 continue
             table = raw.get("table", [])
             if not isinstance(table, list) or not table:
+                continue
+            table = normalize_visual_table_rows(
+                table,
+                chart_type=str(raw.get("chart_type") or ""),
+                title=str(raw.get("title") or ""),
+            )
+            if not table:
                 continue
             try:
                 image_index = int(raw.get("image_index"))
@@ -677,9 +933,11 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
                 image_index = 0
             page_number = page_by_index.get(image_index) or raw.get("page_number")
             raw["type"] = "chart_table"
+            raw["table"] = table
+            raw["contract_version"] = VISUAL_CONTRACT_VERSION
             raw["page_number"] = page_number
             raw["municipality"] = municipality
-            results.append(raw)
+            results.append(self._attach_source_metadata(raw, image_by_index.get(image_index, {})))
         return results
 
     def _infer_target_sheet(self, analysis: dict) -> str:
@@ -739,28 +997,40 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
             reasons.append("신뢰도 기준 미달")
 
         fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
-        if fields.get("estimated") is True:
+        value_source = normalize_value_source(
+            item.get("값근거") or fields.get("값근거") or fields.get("value_source")
+        )
+        if value_source == "unknown" and _is_table_like_chart(analysis):
+            value_source = "table_cell"
+        if fields.get("estimated") is True or value_source == "axis_estimate":
             reasons.append("축 기반 추정값")
+        elif value_source == "derived":
+            reasons.append("계산값")
+        elif value_source == "unknown":
+            reasons.append("명시 값 근거 없음")
         if target_sheet == "summary":
             reasons.append("요약/참고성 자료")
         if _is_reference_chart(analysis):
             reasons.append("참고자료/해외사례")
-        if not _has_chart_value(item):
+        qualitative_project = bool(
+            target_sheet == "mitigation_projects"
+            and (
+                fields.get("사업명")
+                or fields.get("감축사업명")
+                or item.get("항목")
+            )
+        )
+        if not _has_chart_value(item) and not qualitative_project:
             reasons.append("값 없음")
 
         year_int = _chart_year_int(item.get("연도"))
-        if year_int is None:
+        if year_int is None and not qualitative_project:
             reasons.append("연도 없음/비숫자")
         allowed_years = config.IMAGE_CHART_MERGE_YEARS_BY_SHEET.get(
             target_sheet, config.IMAGE_CHART_MERGE_YEARS
         )
         if year_int is not None and year_int not in allowed_years:
             reasons.append("연도 범위 외")
-
-        chart_type = str(analysis.get("chart_type", "") or "")
-        if chart_type in {"꺾은선", "막대", "영역", "복합"} and not _is_table_like_chart(analysis):
-            # 그래프 축에서 읽은 값은 감사 시트에는 남기되, 본 데이터 자동 병합은 표보다 훨씬 보수적으로 한다.
-            reasons.append("그래프 추정 후보")
 
         can_merge = not reasons
         if can_merge:
@@ -782,11 +1052,48 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         merged: bool,
         confidence: str | None = None,
         reasons: list[str] | None = None,
+        evidence_match: EvidenceMatch | None = None,
+        defer_merge: bool = False,
     ):
         fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
-        reason_text = "; ".join(reasons or [])
-        base_evidence = json.dumps(fields, ensure_ascii=False) if fields else analysis.get("summary", "")
+        value_source = normalize_value_source(
+            item.get("값근거") or fields.get("값근거") or fields.get("value_source")
+        )
+        if value_source == "unknown" and _is_table_like_chart(analysis):
+            value_source = "table_cell"
+        evidence_ids = normalize_evidence_ids(analysis.get("source_evidence_ids"))
+        blockers = list(reasons or [])
+        if evidence_match is not None and not evidence_match.exact:
+            blockers.append(evidence_match.reason)
+        qualitative_project = bool(
+            target_sheet == "mitigation_projects"
+            and (
+                fields.get("사업명")
+                or fields.get("감축사업명")
+                or item.get("항목")
+            )
+        )
+        all_null = not _has_chart_value(item) and not qualitative_project
+        if all_null and "값 없음" not in blockers:
+            blockers.append("판독값 전부 null")
+        reason_text = "; ".join(dict.fromkeys(blockers))
+        base_evidence = (
+            json.dumps(fields, ensure_ascii=False, sort_keys=True)
+            if fields else analysis.get("summary", "")
+        )
         evidence_text = f"{base_evidence} | {reason_text}" if reason_text else base_evidence
+        if merged:
+            merge_status = "merged"
+        elif (
+            defer_merge
+            and evidence_match is not None
+            and evidence_match.exact
+            and not all_null
+            and not blockers
+        ):
+            merge_status = "candidate"
+        else:
+            merge_status = "needs_review"
         evidence = {
             "지자체명": analysis.get("municipality", ""),
             "페이지": analysis.get("page_number"),
@@ -797,15 +1104,42 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
             "항목": item.get("항목") or fields.get("용도") or fields.get("감축사업명") or "",
             "연도": item.get("연도"),
             "값": item.get("값"),
+            "원문값": fields.get("원문값", item.get("값")),
+            "원문단위": fields.get("원문단위", item.get("단위") or analysis.get("unit", "")),
+            "정규화값": fields.get("정규화값"),
+            "정규화단위": fields.get("정규화단위", ""),
+            "정규화배율": fields.get("정규화배율"),
+            "값근거": value_source,
+            "계약버전": analysis.get("contract_version") or VISUAL_CONTRACT_VERSION,
             "신뢰도": confidence or analysis.get("confidence", "low"),
             "반영여부": "반영" if merged else "검토",
             "근거": evidence_text,
+            "판독필드": fields,
+            "근거ID": evidence_match.evidence_id if evidence_match is not None else (
+                evidence_ids[0] if len(evidence_ids) == 1 else ""
+            ),
+            "근거ID목록": evidence_ids,
+            "근거객체ID": ",".join(evidence_match.object_ids) if evidence_match is not None else "",
+            "근거매칭상태": evidence_match.status if evidence_match is not None else "legacy",
+            "병합상태": merge_status,
+            "병합차단사유": "" if merge_status in {"candidate", "merged"} else reason_text,
         }
         if analysis.get("target_sheet") == "summary":
             evidence["대상시트근거"] = "재추론(summary)"
         text_results.setdefault("chart_observations", []).append(evidence)
 
-    def _merge_image_results(self, text_results: dict, analyses: list[dict], municipality: str) -> dict:
+    def _merge_image_results(
+        self,
+        text_results: dict,
+        analyses: list[dict],
+        municipality: str,
+        *,
+        evidence_catalog: dict | None = None,
+    ) -> dict:
+        strict_evidence = bool(
+            evidence_catalog is not None
+            and getattr(config, "VISUAL_EVIDENCE_MERGE_ENABLED", True)
+        )
         existing_ghg = text_results.setdefault("emissions_regional", [])
         existing_regional = text_results.setdefault("regional_conditions", [])
         existing_projects = text_results.setdefault("mitigation_projects", [])
@@ -814,6 +1148,11 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         existing_financial = text_results.setdefault("financial_plan", [])
 
         for analysis in analyses:
+            evidence_match = (
+                match_evidence(analysis.get("source_evidence_ids"), evidence_catalog or {})
+                if strict_evidence
+                else None
+            )
             chart_rows = analysis.get("table", []) if analysis.get("type") == "chart_table" else []
             target_sheet = self._infer_target_sheet(analysis)
             if isinstance(chart_rows, list):
@@ -836,10 +1175,18 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
                         if _gas_sector_key(sector) in gas_sector_keys:
                             can_merge = False
                             merge_reasons = [*merge_reasons, "G3 부문에 가스종(스키마 불일치)"]
-                    auto_merge = can_merge and target_sheet != "reduction_targets"
+                    # 객체 인벤토리가 연결된 운영 경로에서는 ImageAgent가 본문 행을
+                    # 선반영하지 않는다. 근거 ID를 붙인 후보를 Organizer의 단일 게이트로 넘긴다.
+                    auto_merge = (
+                        can_merge
+                        and target_sheet != "reduction_targets"
+                        and not strict_evidence
+                    )
                     self._append_chart_observation(
                         text_results, analysis, item, target_sheet,
-                        auto_merge, final_confidence, merge_reasons
+                        auto_merge, final_confidence, merge_reasons,
+                        evidence_match=evidence_match,
+                        defer_merge=strict_evidence,
                     )
 
                     if not auto_merge:
@@ -981,6 +1328,35 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
                     year_int = _chart_year_int(year)
                     if year_int is None:
                         continue
+                    if strict_evidence:
+                        visual_item = {
+                            "항목": label,
+                            "연도": year_int,
+                            "값": val,
+                            "단위": series.get("unit") or analysis.get("unit") or "tCO2eq",
+                            "fields": {
+                                "배출유형": "직접배출",
+                                "부문": label,
+                                "연도": year_int,
+                            },
+                        }
+                        _can_merge, final_confidence, merge_reasons = self._chart_merge_decision(
+                            analysis,
+                            visual_item,
+                            "emissions_regional",
+                        )
+                        self._append_chart_observation(
+                            text_results,
+                            analysis,
+                            visual_item,
+                            "emissions_regional",
+                            False,
+                            final_confidence,
+                            merge_reasons,
+                            evidence_match=evidence_match,
+                            defer_merge=True,
+                        )
+                        continue
                     try:
                         numeric = float(str(val).replace(",", "").replace("약 ", ""))
                     except (ValueError, TypeError):
@@ -1017,6 +1393,9 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
                 "width": image.get("width"),
                 "height": image.get("height"),
                 "caption": image.get("caption", ""),
+                "source_kind": image.get("source_kind", ""),
+                "source_evidence_ids": image.get("source_evidence_ids", []),
+                "bbox": image.get("bbox"),
             })
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -1086,8 +1465,7 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         batch = list(task.get("batch", []))
         if len(batch) <= 1:
             return []
-        midpoint = max(1, len(batch) // 2)
-        groups = [batch[:midpoint], batch[midpoint:]]
+        groups = split_in_half(batch)
         children: list[dict] = []
         for index, group in enumerate((group for group in groups if group), start=1):
             children.append({
@@ -1099,21 +1477,82 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         return children
 
     def _run_vision_task(self, task: dict, municipality: str) -> list[dict]:
-        batch = list(task.get("batch", []))
-        batch_id = self._vision_batch_id(task)
+        checkpoint_task = task
+        batch_id = self._vision_batch_id(checkpoint_task)
+        forced_ids = self._forced_retry_evidence_ids(checkpoint_task)
+        restored_rows: list[dict] = []
         if self.run_state is not None:
             restored = self.run_state.restored_result(batch_id)
-            if isinstance(restored, list):
+            if isinstance(restored, list) and not forced_ids:
                 with self._counter_lock:
                     self.resumed_batches += 1
-                return [row for row in restored if isinstance(row, dict)]
+                restored_rows = [row for row in restored if isinstance(row, dict)]
+                restored_evidence = self._task_evidence_ids(task)
+                self._object_outcomes.mark_attempt(
+                    restored_evidence,
+                    label=f"vision_checkpoint:{task.get('batch_num', '?')}",
+                )
+                returned_evidence: set[str] = set()
+                for row in restored_rows:
+                    self._record_analysis_outcome(row, "체크포인트 Vision 결과 재사용")
+                    returned_evidence.update(
+                        str(value or "") for value in (row.get("source_evidence_ids") or [])
+                    )
+                for evidence_id in restored_evidence:
+                    if evidence_id not in returned_evidence:
+                        self._object_outcomes.record(
+                            evidence_id,
+                            "no_data",
+                            response_received=True,
+                            reason="체크포인트 호출 완료, 구조화 데이터 없음",
+                        )
+                return restored_rows
+            if isinstance(restored, list) and forced_ids:
+                restored_rows = [row for row in restored if isinstance(row, dict)]
+                task = self._forced_retry_task(checkpoint_task, forced_ids)
+                if not task.get("batch"):
+                    return restored_rows
+                print(
+                    "  [Vision 선택복구] "
+                    f"배치 {checkpoint_task.get('batch_num', '?')}: 근거 객체 {len(forced_ids)}개 재판독"
+                )
             if not self.run_state.should_execute(
                 batch_id,
                 is_child=int(task.get("split_depth", 0)) > 0,
-            ):
+            ) and not forced_ids:
                 with self._counter_lock:
                     self.skipped_batches += 1
                 return []
+
+        batch = list(task.get("batch", []))
+
+        task_evidence_ids = self._task_evidence_ids(task)
+        max_object_attempts = max(
+            1,
+            int(getattr(config, "VISION_RECOVERY_MAX_OBJECT_ATTEMPTS", 7) or 7),
+        )
+        retryable_evidence_ids = [
+            value for value in task_evidence_ids
+            if self._object_outcomes.attempt_count(value) < max_object_attempts
+        ]
+        if task_evidence_ids and not retryable_evidence_ids:
+            reason = f"객체별 Vision 시도 상한({max_object_attempts}회) 도달"
+            for evidence_id in task_evidence_ids:
+                self._object_outcomes.record(
+                    evidence_id,
+                    "needs_review",
+                    response_received=False,
+                    reason=reason,
+                )
+            self._persist_vision(task, "call_fail", error=reason)
+            with self._counter_lock:
+                self.failed_batches += 1
+            raise llm_client.LLMCallError(reason)
+
+        self._object_outcomes.mark_attempt(
+            retryable_evidence_ids,
+            label=f"vision_batch:{task.get('batch_num', '?')}:depth={task.get('split_depth', 0)}",
+        )
 
         try:
             if config.IMAGE_CHART_TABLE_EXTRACTION:
@@ -1121,18 +1560,49 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
             else:
                 rows = []
                 for page, image in batch:
-                    result = self._analyze_image(
-                        image,
-                        page.page_number,
-                        municipality,
-                        fail_fast=True,
-                    )
+                    try:
+                        result = self._analyze_image(
+                            image,
+                            page.page_number,
+                            municipality,
+                            fail_fast=True,
+                        )
+                    except TypeError as exc:
+                        # 기존 사용자 정의 ImageAgent가 fail_fast 추가 전 시그니처를
+                        # 오버라이드한 경우의 하위 호환 경로다.
+                        if "fail_fast" not in str(exc):
+                            raise
+                        result = self._analyze_image(
+                            image,
+                            page.page_number,
+                            municipality,
+                        )
                     if result:
                         rows.append(result)
         except llm_client.LLMQuotaExceededError as exc:
-            self._persist_vision(task, "call_fail", error=str(exc))
+            if restored_rows and forced_ids:
+                stale_rows = self._mark_forced_retry_failure(restored_rows, forced_ids, str(exc))
+                self._persist_vision(
+                    checkpoint_task,
+                    "partial",
+                    result=stale_rows,
+                    error=str(exc),
+                    recovered=True,
+                )
+            else:
+                stale_rows = []
+                self._persist_vision(checkpoint_task, "call_fail", error=str(exc))
+            for evidence_id in self._task_evidence_ids(task):
+                self._object_outcomes.record(
+                    evidence_id,
+                    "needs_review",
+                    response_received=False,
+                    reason=f"Vision quota 오류: {exc}",
+                )
             with self._counter_lock:
                 self.failed_batches += 1
+            if stale_rows:
+                return stale_rows
             raise
         except (llm_client.LLMTimeoutError, llm_client.LLMCallError) as exc:
             max_depth = max(0, int(getattr(config, "VISION_RECOVERY_MAX_SPLIT_DEPTH", 6)))
@@ -1140,6 +1610,13 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
                 bool(getattr(config, "VISION_SPLIT_ON_FAILURE", True))
                 and len(batch) > 1
                 and int(task.get("split_depth", 0)) < max_depth
+                and (
+                    not task_evidence_ids
+                    or any(
+                        self._object_outcomes.attempt_count(value) < max_object_attempts
+                        for value in task_evidence_ids
+                    )
+                )
             )
             if can_split:
                 children = self._split_vision_task(task)
@@ -1155,8 +1632,9 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
                     except (llm_client.LLMTimeoutError, llm_client.LLMCallError):
                         child_failed = True
                 merged = self._merge_vision_results(child_results)
+                merged = self._replace_forced_results(restored_rows, merged, forced_ids)
                 self._persist_vision(
-                    task,
+                    checkpoint_task,
                     "partial" if child_failed else "ok",
                     result=merged,
                     error=str(exc) if child_failed else "",
@@ -1166,22 +1644,169 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
             status = "parse_fail" if any(
                 token in str(exc) for token in ("파싱", "스키마", "누락")
             ) else "call_fail"
-            self._persist_vision(task, status, error=str(exc))
+            if restored_rows and forced_ids:
+                stale_rows = self._mark_forced_retry_failure(restored_rows, forced_ids, str(exc))
+                self._persist_vision(
+                    checkpoint_task,
+                    "partial",
+                    result=stale_rows,
+                    error=str(exc),
+                    recovered=True,
+                )
+            else:
+                self._persist_vision(checkpoint_task, status, error=str(exc))
+            for evidence_id in self._task_evidence_ids(task):
+                self._object_outcomes.record(
+                    evidence_id,
+                    "needs_review",
+                    response_received=False,
+                    reason=f"Vision 최종 미복구: {exc}",
+                )
             with self._counter_lock:
                 self.failed_batches += 1
+            if restored_rows and forced_ids:
+                return stale_rows
             raise
 
         rows = [row for row in rows if isinstance(row, dict)]
-        self._persist_vision(task, "ok", result=rows)
+        rows = self._replace_forced_results(restored_rows, rows, forced_ids)
+        self._persist_vision(checkpoint_task, "ok", result=rows, recovered=bool(forced_ids))
         return rows
 
-    def extract(self, pages: list[PageContent], text_results: dict, municipality: str) -> dict:
-        raw_images = [
-            (p, img)
-            for p in pages
-            for img in p.images
-            if _is_relevant_image(img)
-        ]
+    def extract(
+        self,
+        pages: list[PageContent],
+        text_results: dict,
+        municipality: str,
+        document: PDFContent | None = None,
+    ) -> dict:
+        selective_enabled = bool(
+            getattr(config, "SELECTIVE_OCR_ENABLED", True) and document is not None
+        )
+        native_objects = []
+        triage_decisions = []
+        backend = None
+
+        if selective_enabled:
+            native_objects = build_document_objects(pages)
+            backend = get_ocr_backend(
+                getattr(config, "OCR_BACKEND", "vlm"),
+                getattr(config, "OCR_RESULTS_DIR", "") or None,
+            )
+            triage_decisions = build_triage_plan(
+                native_objects,
+                backend=backend.name,
+                confidence_threshold=float(
+                    getattr(config, "OCR_NATIVE_CONFIDENCE_THRESHOLD", 0.78)
+                ),
+            )
+            apply_triage_metadata(native_objects, triage_decisions)
+            required = [row for row in triage_decisions if row.action == "ocr_required"]
+            self._object_outcomes.register(row.evidence_id for row in required)
+            native_kept = sum(row.action == "native_keep" for row in triage_decisions)
+            print(
+                "[에이전트2b 이미지분석] 객체 기반 선택적 OCR: "
+                f"전체 {len(native_objects)}개 → 보완 {len(required)}개 "
+                f"(PyMuPDF 충분 {native_kept}개, 백엔드 {backend.name})"
+            )
+
+            if not backend.uses_vision:
+                self._object_outcomes.mark_attempt(
+                    (row.evidence_id for row in required),
+                    label=f"ocr_backend:{backend.name}",
+                )
+            precomputed = backend.load(document, triage_decisions)
+            if not backend.uses_vision:
+                merged_objects = merge_document_objects(native_objects, precomputed)
+                completed_evidence = {
+                    str(obj.metadata.get("evidence_id") or obj.metadata.get("source_evidence_id") or "")
+                    for obj in precomputed
+                }
+                for row in triage_decisions:
+                    if row.action == "ocr_required":
+                        row.status = "loaded" if row.evidence_id in completed_evidence else "no_result"
+                        if row.evidence_id in completed_evidence:
+                            self._object_outcomes.record(
+                                row.evidence_id,
+                                "extracted",
+                                response_received=True,
+                                reason=f"{backend.name} 객체 로드 완료",
+                            )
+                        else:
+                            self._object_outcomes.record(
+                                row.evidence_id,
+                                "needs_review",
+                                response_received=False,
+                                reason=f"{backend.name} 결과 없음",
+                            )
+                self._finalize_object_states(
+                    triage_decisions,
+                    unresolved_reason=f"{backend.name} 결과 없음",
+                )
+                apply_triage_metadata(merged_objects, triage_decisions)
+                text_results["object_triage"] = [row.to_dict() for row in triage_decisions]
+                text_results["ocr_document_objects"] = [obj.to_dict() for obj in precomputed]
+                text_results["document_objects"] = [obj.to_dict() for obj in merged_objects]
+                self._triage_stats = {
+                    "raw": len(native_objects),
+                    "passed": len(required),
+                    "filtered": native_kept,
+                    "min_score": getattr(config, "OCR_NATIVE_CONFIDENCE_THRESHOLD", 0.78),
+                    "reference_filtered": 0,
+                    "backend": backend.name,
+                    "ocr_objects": len(precomputed),
+                    "object_total": len(native_objects),
+                    "object_candidates": len(required),
+                }
+                self._update_final_status_stats(triage_decisions)
+                print(
+                    f"[에이전트2b 이미지분석] {backend.name} 객체 "
+                    f"{len(precomputed)}개 로드·병합 완료"
+                )
+                return text_results
+
+            decision_by_object = {row.object_id: row for row in triage_decisions}
+            required_by_page: dict[int, list] = {}
+            for row in required:
+                required_by_page.setdefault(row.page_number, []).append(row)
+
+            raw_images: list[tuple[PageContent, dict]] = []
+            covered_evidence: set[str] = set()
+            for page in pages:
+                page_required = required_by_page.get(page.page_number, [])
+                if not page_required:
+                    continue
+                for image_index, source_image in enumerate(page.images or [], start=1):
+                    image = dict(source_image)
+                    source_kind = str(image.get("source_kind") or "embedded")
+                    own = decision_by_object.get(f"p{page.page_number}_image_{image_index}")
+                    selected = []
+                    if source_kind == "page_render":
+                        selected = page_required
+                    elif own is not None and own.action == "ocr_required":
+                        selected = [own]
+                    elif any(row.object_type in {"chart", "figure"} for row in page_required):
+                        # 삽입 이미지와 그림 캡션의 좌표 연결이 불완전한 PDF는 같은 페이지의
+                        # 시각 후보를 보수적으로 연결하고 이후 근거 ID 병합에서 중복을 제거한다.
+                        selected = [row for row in page_required if row.object_type in {"chart", "figure"}]
+                    if not selected or not _is_relevant_image(image):
+                        continue
+                    image["source_object_ids"] = [row.object_id for row in selected]
+                    image["source_evidence_ids"] = [row.evidence_id for row in selected]
+                    image["ocr_required"] = True
+                    raw_images.append((page, image))
+                    covered_evidence.update(image["source_evidence_ids"])
+
+            uncovered = [row for row in required if row.evidence_id not in covered_evidence]
+            rendered = render_ocr_candidate_images(document, native_objects, uncovered)
+            raw_images.extend(rendered)
+        else:
+            raw_images = [
+                (p, img)
+                for p in pages
+                for img in p.images
+                if _is_relevant_image(img)
+            ]
         coverage_images = _coverage_reduce_images(raw_images)
         if len(coverage_images) != len(raw_images):
             print(
@@ -1195,6 +1820,10 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
             reference_filtered = 0
             for page, image in raw_images:
                 item = _triage_image(page, image)
+                if image.get("ocr_required"):
+                    item["passed"] = True
+                    item["score"] = max(item["score"], int(config.IMAGE_TRIAGE_MIN_SCORE))
+                    item["reasons"].append("document_object_ocr_required")
                 if config.IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT:
                     is_reference, ref_hits = _has_reference_context(page, image, municipality)
                     if is_reference:
@@ -1251,6 +1880,19 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
 
         if total == 0:
             print("[에이전트2b 이미지분석] 분석할 이미지 없음.")
+            if selective_enabled:
+                for row in triage_decisions:
+                    if row.action == "ocr_required":
+                        row.status = "no_renderable_candidate"
+                self._finalize_object_states(
+                    triage_decisions,
+                    unresolved_reason="렌더 가능한 OCR/VLM 후보 없음",
+                )
+                self._update_final_status_stats(triage_decisions)
+                apply_triage_metadata(native_objects, triage_decisions)
+                text_results["object_triage"] = [row.to_dict() for row in triage_decisions]
+                text_results["ocr_document_objects"] = []
+                text_results["document_objects"] = [obj.to_dict() for obj in native_objects]
             return text_results
 
         analyses = []
@@ -1318,7 +1960,54 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         self._image_results = analyses
         print(f"[에이전트2b 이미지분석] 유효 분석 {len(analyses)}개 완료")
 
-        merged_results = self._merge_image_results(text_results, analyses, municipality)
+        ocr_objects = []
+        merged_objects = []
+        evidence_catalog = None
+        if selective_enabled:
+            # 병합 후보를 만들기 전에 객체별 판독 결과를 종결한다. 이 시점의
+            # extracted 단일 객체만 이후 Organizer 자동 병합 게이트를 통과한다.
+            for analysis in analyses:
+                if isinstance(analysis, dict):
+                    self._record_analysis_outcome(analysis)
+            completed_evidence = {
+                str(evidence)
+                for analysis in analyses
+                if isinstance(analysis, dict)
+                for evidence in (analysis.get("source_evidence_ids") or [])
+            }
+            attempted_evidence = {
+                str(evidence)
+                for _page, image in pages_with_images
+                for evidence in (image.get("source_evidence_ids") or [])
+            }
+            for row in triage_decisions:
+                if row.action != "ocr_required":
+                    continue
+                if row.evidence_id in completed_evidence:
+                    row.status = "completed"
+                elif row.evidence_id in attempted_evidence:
+                    row.status = "attempted_no_result"
+                else:
+                    row.status = "not_attempted"
+            self._finalize_object_states(
+                triage_decisions,
+                unresolved_reason="VLM 판독 결과 미확보",
+            )
+            self._update_final_status_stats(triage_decisions)
+            ocr_objects = vision_analyses_to_objects(analyses)
+            merged_objects = merge_document_objects(native_objects, ocr_objects)
+            apply_triage_metadata(merged_objects, triage_decisions)
+            evidence_catalog = build_evidence_catalog(
+                [obj.to_dict() for obj in merged_objects],
+                [row.to_dict() for row in triage_decisions],
+            )
+
+        merged_results = self._merge_image_results(
+            text_results,
+            analyses,
+            municipality,
+            evidence_catalog=evidence_catalog,
+        )
         observed_pages = {
             row.get("페이지")
             for row in merged_results.get("chart_observations", [])
@@ -1342,6 +2031,17 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
                 f"페이지 렌더/표 주변 텍스트 기반 검토 후보 {fallback_count}건 보존"
             )
 
+        if selective_enabled:
+            merged_results["object_triage"] = [row.to_dict() for row in triage_decisions]
+            merged_results["ocr_document_objects"] = [obj.to_dict() for obj in ocr_objects]
+            merged_results["document_objects"] = [obj.to_dict() for obj in merged_objects]
+            self._triage_stats.update({
+                "backend": backend.name if backend is not None else "vlm",
+                "ocr_objects": len(ocr_objects),
+                "object_total": len(native_objects),
+                "object_candidates": sum(row.action == "ocr_required" for row in triage_decisions),
+            })
+
         return merged_results
 
     def report(self) -> str:
@@ -1353,11 +2053,24 @@ fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣
         triage = self._triage_stats or {}
         triage_line = ""
         if triage:
-            triage_line = (
-                f"\n  - triage: 원본 {triage.get('raw', 0)}개 → "
-                f"통과 {triage.get('passed', 0)}개 / 필터 {triage.get('filtered', 0)}개"
-                f" / 참고자료 제외 {triage.get('reference_filtered', 0)}개"
-            )
+            if triage.get("object_total") is not None:
+                triage_line = (
+                    f"\n  - 객체 triage: 전체 {triage.get('object_total', 0)}개 → "
+                    f"OCR/VLM 후보 {triage.get('object_candidates', 0)}개, "
+                    f"보완 객체 {triage.get('ocr_objects', 0)}개 "
+                    f"(백엔드 {triage.get('backend', 'vlm')})"
+                    f"\n  - 이미지 triage: 원본 {triage.get('raw', 0)}개 → "
+                    f"통과 {triage.get('passed', 0)}개 / 필터 {triage.get('filtered', 0)}개"
+                    f" / 참고자료 제외 {triage.get('reference_filtered', 0)}개"
+                    f"\n  - 객체 최종상태: "
+                    f"{json.dumps(triage.get('final_statuses', {}), ensure_ascii=False, sort_keys=True)}"
+                )
+            else:
+                triage_line = (
+                    f"\n  - triage: 원본 {triage.get('raw', 0)}개 → "
+                    f"통과 {triage.get('passed', 0)}개 / 필터 {triage.get('filtered', 0)}개"
+                    f" / 참고자료 제외 {triage.get('reference_filtered', 0)}개"
+                )
         checkpoint_line = ""
         if self.run_state is not None:
             checkpoint_line = (

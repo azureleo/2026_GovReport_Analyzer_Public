@@ -18,6 +18,7 @@ from utils.pdf_reader import extract_pdf, PDFContent, PageContent
 from utils.hwp_reader import extract_hwp, is_hwp_file
 from utils import llm_cache, llm_client
 from utils.run_state import RunState, sha256_json
+from utils.visual_merge_ab import write_visual_merge_snapshot
 from utils.semantic_routing import SemanticRoutingReport, validate_and_reclassify
 from utils.source_verifier import (
     QualityAssessment,
@@ -251,7 +252,11 @@ class Supervisor:
     def _llm_quality_review(self, final_data: dict) -> dict:
         assessment = self._quality_assessment_for_review or assess_quality(final_data)
         municipality = final_data.get("municipality_name", "?")
-        sheet_counts = {k: len(v) for k, v in final_data.items() if isinstance(v, list) and v}
+        internal_keys = getattr(config, "INTERNAL_OBJECT_KEYS", set())
+        sheet_counts = {
+            k: len(v) for k, v in final_data.items()
+            if isinstance(v, list) and v and k not in internal_keys
+        }
         prompt = f"""다음은 '{municipality}' 탄소중립 계획 추출 결과 요약입니다:
 - 시트별 행 수: {json.dumps(sheet_counts, ensure_ascii=False)}
 - 총 추출 행: {sum(sheet_counts.values())}
@@ -530,6 +535,7 @@ class Supervisor:
                         pages=pdf_content.pages,
                         text_results=raw_data,
                         municipality=municipality,
+                        document=pdf_content,
                     )
                 except llm_client.LLMQuotaExceededError as exc:
                     logger.warning("이미지 분석 quota/한도 문제로 기존 텍스트 결과로 계속 진행: %s", exc)
@@ -541,6 +547,16 @@ class Supervisor:
                 self._log("[에이전트2b 이미지분석] 비활성화 (--no-images)")
 
             raw_data["execution_info"] = execution_info
+            if getattr(config, "VISUAL_MERGE_SNAPSHOT_ENABLED", True):
+                snapshot_path = output_path.with_name(
+                    f"{output_path.stem}_visual_merge_input.json.gz"
+                )
+                try:
+                    write_visual_merge_snapshot(snapshot_path, raw_data)
+                except (OSError, TypeError, ValueError) as exc:
+                    logger.warning("시각 병합 A/B 스냅샷 저장 실패: %s", exc)
+                else:
+                    self._log(f"[감독관] 시각 병합 A/B 스냅샷: {snapshot_path}")
             organizer = OrganizerAgent()
             t0 = time.time()
             final_data = organizer.organize(
@@ -893,7 +909,10 @@ class Supervisor:
                 semantic_result_hash=sha256_json({
                     key: value
                     for key, value in final_data.items()
-                    if isinstance(value, list) or key in {"municipality_name", "pipeline_metrics"}
+                    if (
+                        (isinstance(value, list) and key not in getattr(config, "INTERNAL_OBJECT_KEYS", set()))
+                        or key in {"municipality_name", "pipeline_metrics"}
+                    )
                 }),
                 extra={
                     "quality_score": quality_assessment.score,

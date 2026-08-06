@@ -7,6 +7,7 @@ from utils.excel_writer import write_excel
 from utils.pdf_reader import PDFContent, PageContent
 from utils.source_verifier import (
     SourceVerificationReport,
+    _build_terms,
     _numeric_variants,
     assess_quality,
     build_source_object_inventory,
@@ -18,6 +19,23 @@ from utils.source_verifier import (
 def test_numeric_variants_keep_deterministic_order():
     assert _numeric_variants("2023") == ["2023", "2,023"]
     assert _numeric_variants("2,023") == ["2,023", "2023"]
+
+
+def test_source_terms_ignore_embedded_json_key_order_and_use_field_priority():
+    summaries = [
+        '서부선 2031 700 | {"기간원문": "’31", "사업명": "서부선", "원문값": 700}',
+        '서부선 2031 700 | {"원문값": 700, "사업명": "서부선", "기간원문": "’31"}',
+    ]
+
+    terms = [
+        _build_terms(["추출값요약"], {"추출값요약": summary}, 12)
+        for summary in summaries
+    ]
+    signatures = [[(term.text, term.header, term.priority) for term in rows] for rows in terms]
+
+    assert signatures[0] == signatures[1]
+    assert signatures[0][0] == ("서부선", "사업명", 0)
+    assert all(term[0] != "사업명" for term in signatures[0])
 
 
 def _document(*texts: str) -> PDFContent:
@@ -151,6 +169,47 @@ def test_source_object_inventory_marks_unlinked_table():
 
     assert inventory.unconfirmed_objects == 1
     assert inventory.coverage_ratio == 0.0
+    assert inventory.rows[0].final_status == "needs_review"
+    assert inventory.rows[0].as_excel_row("서울")["최종상태"] == "needs_review"
+
+
+def test_source_object_inventory_exports_terminal_retry_metadata():
+    document = PDFContent(
+        total_pages=1,
+        pages=[PageContent(
+            page_number=1,
+            text="표 1-1 연도별 배출량",
+            tables=[],
+            images=[],
+        )],
+        full_text="표 1-1 연도별 배출량",
+    )
+    final_data = {
+        "document_objects": [{
+            "object_id": "p1_table_1",
+            "object_type": "table",
+            "page_number": 1,
+            "sequence": 1,
+            "rows": [["연도", "배출량"], ["2030", ""]],
+            "number": "표 1-1",
+            "caption": "연도별 배출량",
+            "metadata": {
+                "evidence_id": "ev-p1-table-test",
+                "triage_action": "ocr_required",
+                "final_status": "no_data",
+                "attempt_count": 3,
+                "terminal_reason": "판독 완료, 명시 수치 없음",
+            },
+        }],
+    }
+
+    row = build_source_object_inventory(final_data, document).rows[0]
+    excel_row = row.as_excel_row("서울")
+
+    assert excel_row["최종상태"] == "no_data"
+    assert excel_row["시도횟수"] == 3
+    assert excel_row["종결사유"] == "판독 완료, 명시 수치 없음"
+    assert excel_row["근거ID"] == "ev-p1-table-test"
 
 
 def test_source_verification_rows_are_written_to_optional_sheet(tmp_path: Path):
@@ -176,14 +235,20 @@ def test_source_object_inventory_rows_are_written_to_optional_sheet(tmp_path: Pa
             "출처페이지": 1, "번호": "표 1-1", "캡션": "표 1-1 계획",
             "섹션": "계획", "행수": 2, "열수": 2, "연결상태": "확인",
             "완전성점수": 1.0, "연결시트": "08_감축사업목록", "연결행수": 1,
-            "검수메시지": "확인",
+            "검수메시지": "확인", "최종상태": "needs_review", "시도횟수": 3,
+            "종결사유": "최종 응답 누락",
         }],
     }
     output = write_excel(data, tmp_path / "inventory.xlsx")
 
     workbook = load_workbook(output, read_only=True)
     assert "21_원문객체인벤토리" in workbook.sheetnames
-    assert workbook["21_원문객체인벤토리"].cell(2, 10).value == "확인"
+    sheet = workbook["21_원문객체인벤토리"]
+    headers = [cell.value for cell in sheet[1]]
+    assert sheet.cell(2, 10).value == "확인"
+    assert sheet.cell(2, headers.index("최종상태") + 1).value == "needs_review"
+    assert sheet.cell(2, headers.index("시도횟수") + 1).value == 3
+    assert sheet.cell(2, headers.index("종결사유") + 1).value == "최종 응답 누락"
 
 
 def test_marked_pdf_is_created_for_exact_matched_term(tmp_path: Path):

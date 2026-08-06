@@ -8,11 +8,243 @@
 
 - 입력: PDF, HWP, HWPX
 - 출력: `00_문서메타`부터 `16_시각자료목록`까지 17개 기본 시트 + `90_코드북`
-- 선택 출력: `17_보조검수후보`, `18_보조병합로그`, `19_검증리포트`
-- 데이터 시트에는 행 단위 `출처페이지`·`데이터상태` 컬럼이 붙어 원문 대조와 우선 검토가 가능
+- 선택 출력: `17_보조검수후보`, `18_보조병합로그`, `19_검증리포트`, `20_원문대조`, `21_원문객체인벤토리`
+- 데이터 시트에는 행 단위 `근거ID`·`출처페이지`·`데이터상태` 컬럼이 붙어 원문 대조와 우선 검토가 가능
+- 최종 행은 LLM 호출 없이 원문과 재대조되며, 대응 좌표를 표시한 마킹 PDF도 함께 생성
 - 기본 LLM 백엔드: Gemini API (단계별로 `STAGE_PROVIDER_*` 분리 가능)
 - 선택 백엔드: OpenAI API, Codex CLI, Claude Code CLI
 - 기본 정책: 정확도와 검증 가능성을 우선하고, 위험한 최적화는 opt-in으로만 사용
+
+## v8 객체 근거 파이프라인 스냅숏 (2026-08-05)
+
+현재 개발 브랜치는 `codex/v8-object-evidence-pipeline`입니다. `codex/v7-fidelity-integration`의 재개 실행·결정론적 검증 기반에서 분기해, Unlimited-OCR 실험에서 확인한 객체 우선 처리 원리를 특정 OCR 엔진에 종속되지 않는 운영 구조로 확장합니다.
+
+### 개발 브랜치 구조
+
+| 브랜치 | 역할과 관계 |
+|---|---|
+| `main` | 공개·통합 기준 브랜치 |
+| `feat/v6-measurement-baseline` | 골든셋·시각 인벤토리·회귀 평가 기반. 현재 로컬 통합 계열의 커밋 조상 |
+| `codex/v7-fidelity-integration` | 실행 재개, 배치 원장, 결정론적 원문 대조를 보존한 v8의 직접 분기점 |
+| `origin/feat/v7-extraction-fidelity` | 동료가 관리하는 원격 v7 추출 충실도 브랜치. 현재 v8의 직접 부모가 아니라 비교·선별 도입 대상 |
+| `codex/experiment-v7-model-resolver` | 모델 resolver 회귀 테스트용 별도 worktree |
+| `codex/v8-object-evidence-pipeline` | 현재 worktree. 객체 인벤토리, 선택적 OCR/VLM, 근거 병합, 문서 비종속 라우팅과 선택 복구를 통합 |
+
+### 최근 구현 타임라인
+
+| 날짜 | 간단한 구현 내용 |
+|---|---|
+| 2026-07-19 | 실행 매니페스트·배치 원장·중단 재개·실패 배치 선택 복구와 원문 객체 완전성 검증 추가 |
+| 2026-07-28 | 개발/홀드아웃 평가 계약, 셀 정확도·객체 재현율·라우팅 오류율 독립 평가 추가 |
+| 2026-07-30 | 로컬 v7 통합 기준점을 보존하고 모델 resolver 실험을 별도 worktree로 분리 |
+| 2026-08-01 | PDF를 `text/table/chart/image` `DocumentObject`로 분해하고 저신뢰 객체만 OCR/VLM으로 보내는 선택적 파이프라인 추가 |
+| 2026-08-02 | 해시가 고정된 시각 표본, 적응형 분할 재시도, 객체별 최종 상태와 `needs_review` 계약 추가 |
+| 2026-08-03 | 근거 ID 기반 병합 계약 v3, 값·단위 보존, 선택 복구, 무API 병합 A/B 스냅샷 추가 |
+| 2026-08-04 | 목차·본문 객체 연결, PyMuPDF/OCR/VLM 중복 제거, 복수 허용 시트와 선택적 고정 라우팅 분모 추가 |
+| 2026-08-05 | 전체 무캐시 실행의 저장공간 실패 45배치를 47회 호출·8분 23초에 전부 복구. `1692/1692` 성공, 품질점수 `89.18`, 경고 `370`, 객체 재현율 `0.9024`, 객체 라우팅 오류율 `0.1429` 확인 |
+
+이 타임라인은 구현 완료 여부를 기록하는 개발 스냅숏입니다. 정확도 수치는 서울 개발용 초벌 골든셋 기준이며, 강원·경기 일반화와 사람 확정 고정 라우팅 분모는 후속 검증 대상입니다.
+
+## 문서 비종속 객체 라우팅 보강 (2026-08-04)
+
+서울 보고서의 특정 페이지나 표 번호에 맞추지 않고, 서울·강원·경기 기본계획에서 공통으로 확인되는 문서 구조 신호를 사용하도록 원문 객체 평가 계층을 보강했습니다.
+
+1. `목차`, `차례`, `CONTENTS`, `TABLES`, `PICTURES`, `표/그림 목차`, 점선 리더와 반복 참조 번호를 조합해 목차 페이지를 판별합니다. 목차의 표·그림 항목은 라우팅 평가 객체로 세지 않습니다.
+2. 목차 참조는 표·그림 번호와 캡션 유사도로 실제 본문 객체에 연결합니다. 본문 객체에는 참조 페이지를 남기되 근거 페이지는 실제 본문 페이지를 사용합니다.
+3. 같은 페이지·근거에서 생성된 PyMuPDF, OCR, VLM 객체는 번호·캡션·엔진 정보를 이용해 하나로 합치고 원래 객체 ID는 별칭으로 보존합니다.
+4. `16_시각자료목록`은 보조 목록으로 분리합니다. 이 시트에만 기록된 객체는 본문 시트에 정상 배치된 것으로 간주하지 않고 `본문미연결`로 표시합니다.
+5. 하나의 객체가 둘 이상의 본문 시트에 합법적으로 대응하면 `허용시트` 집합을 기록하고, 그중 하나와 연결되면 정상으로 판정합니다. 기존의 보수적인 행 자동 재분류 규칙은 그대로 유지합니다.
+6. `21_원문객체인벤토리`에는 `허용시트`, `보조연결시트`, `목차참조페이지`, `중복객체ID`가 추가됩니다.
+7. 평가 매니페스트에 선택적인 `routing_inventory`와 SHA256을 등록하면 사람 확정 객체 전체를 고정 분모로 사용합니다. 출력에서 사라진 객체도 `미추출`로 남습니다. 인벤토리가 없는 강원·경기 문서는 기존 동적 보조 지표로 안전하게 폴백합니다.
+
+전체 페이지 판별 점검에서 서울은 `p3~20`, 강원은 `p3`, `p5~13`, 경기는 `p3`, `p5`, `p7~14`의 실제 목차·표목차·그림목차 페이지만 분류됐으며, 세 문서의 본문 오탐은 확인되지 않았습니다. 서울의 현재 시각요소 인벤토리는 `관련시트`가 아직 사람 확정되지 않아 고정 라우팅 분모에는 연결하지 않았습니다.
+
+## 선택 복구·근거 병합 계약 v3 (2026-08-03)
+
+전체 문서를 다시 호출하지 않고 실패 구간을 복구하면서, 시각값을 본문에 넣는 조건을 더 엄격하게 만들었습니다.
+
+1. 텍스트 실패 배치는 `--retry-failed-only`, 시각 객체는 `--retry-vision-evidence` 또는 `--retry-vision-pages`로 선택 재처리합니다. 지정하지 않은 성공 체크포인트는 그대로 보존됩니다.
+2. 캡션 프록시와 실제 렌더 이미지처럼 같은 물리 객체에서 파생된 ID는 하나의 정규 근거로 묶고 원래 ID는 별칭으로 유지합니다.
+3. 근거 병합 계약을 `05_배출전망`, `06_감축목표`, `08_감축사업목록`까지 확장했습니다. 기간값은 임의의 단일 연도로 바꾸지 않고 `needs_review`로 격리합니다.
+4. 원문 값·단위는 보존하고 비교용 정규화 값·단위·배율을 별도로 기록합니다. 예를 들어 `31.5 천tCO2eq`와 `31,500 tCO2eq`를 같은 양으로 비교할 수 있습니다.
+5. 병합 판정은 `accept`, `fix_then_merge`, `duplicate`, `reject`, `needs_review`로 고정합니다. 자동 반영은 앞의 두 상태만 허용하며 기존의 채워진 텍스트 값은 덮어쓰지 않습니다.
+6. 운영 실행은 결과 파일과 함께 `*_visual_merge_input.json.gz`를 남깁니다. 이 스냅샷은 API 호출 없이 기존 정책과 근거 기반 정책을 재생하는 A/B 입력입니다.
+
+```powershell
+# 텍스트 실패 배치와 특정 시각 객체만 재처리
+# <실제_근거ID>는 16_시각자료목록 또는 21_원문객체인벤토리에서 복사합니다.
+py main.py "서울특별시_탄소중립계획.pdf" `
+  --retry-failed-only `
+  --retry-vision-evidence "<실제_근거ID>"
+
+# 페이지를 지정하면 그 페이지의 저신뢰 시각 객체를 선택 재처리
+py main.py "서울특별시_탄소중립계획.pdf" `
+  --resume --retry-vision-pages "71,89,131"
+
+# 저장된 동일 관찰값으로 병합 정책만 무API 비교
+# 스냅샷은 결과 xlsx와 같은 디렉터리에 생성됩니다.
+py scripts/compare_operational_visual_merge.py `
+  "<결과파일명>_visual_merge_input.json.gz" `
+  --output-dir "output\visual_merge_ab"
+
+# 양쪽 정책을 평가 가능한 Excel로 만들고 같은 골든셋으로 즉시 비교
+py scripts/compare_operational_visual_merge.py `
+  "<결과파일명>_visual_merge_input.json.gz" `
+  --output-dir "output\visual_merge_ab_eval" `
+  --source "서울특별시_탄소중립계획.pdf" `
+  --dataset "seoul-development-v1-draft" `
+  --allow-draft-evaluation
+```
+
+기본 실행도 `legacy_merge.xlsx`와 `evidence_merge.xlsx`를 함께 생성합니다. `--source`를 지정하면 두 파일 모두 동일한 시트 의미 검증, 원문 대조, 원문 객체 인벤토리를 거치며, `--dataset`까지 지정하면 `cell_accuracy`, 행 재현율·정밀도, 객체 재현율, 라우팅 오류율을 자동 비교합니다. 운영 A/B는 정책별 반영·격리량을 비교하는 도구이므로, 사람 확정 정답이 없으면 정확도 자체를 증명하지 않습니다.
+
+## 객체 우선 선택적 OCR/VLM 파이프라인 (2026-08-01)
+
+Unlimited-OCR 실험에서 확인한 원리를 외부 엔진 종속 없이 운영 파이프라인에 반영했습니다.
+
+1. PDF 페이지를 좌표가 있는 `text`, `table`, `chart`, `image` `DocumentObject`로 분리합니다. 각 객체에는 페이지, bbox, 표·그림 번호, 캡션, 섹션, 근처 본문이 저장됩니다.
+2. PyMuPDF 표의 셀 채움률, 행 불균일도, 행·열 수, 추출 전략을 코드로 평가합니다. 충분히 읽힌 객체는 OCR을 생략하고, 캡션만 있고 표가 없거나 부분 인식된 복잡표와 데이터 차트만 보완 후보가 됩니다.
+3. 후보 페이지에 기존 전체 렌더가 있으면 재사용하고, 없을 때만 객체 좌표를 지연 렌더링합니다. 따라서 `MAX_IMAGES` 이전에 실제 호출 분모가 축소됩니다.
+4. OCR/VLM 결과는 Markdown/HTML 표를 포함한 `DocumentObject`로 정규화합니다. 원본과 보완 객체는 페이지·번호·좌표로 만든 `근거ID`를 기준으로 중복 제거되며, 신뢰도가 낮은 원본만 보완 결과로 교체됩니다.
+5. `OCR_BACKEND=vlm|unlimited_ocr|none`으로 백엔드를 교체할 수 있습니다. `unlimited_ocr` 모드는 모델 서버를 파이프라인이 직접 구동하지 않고 사전 생성된 Markdown/JSONL 결과를 읽습니다.
+6. `21_원문객체인벤토리`에는 좌표, 원본신뢰도, Triage판정·사유, 보완백엔드·상태, 객체별 `최종상태·시도횟수·종결사유`, 근거ID가 기록됩니다. 최종 성능은 기존 `--evaluate` 골든셋 계약으로 비교합니다.
+7. 시각 판독값은 `근거ID`가 단 하나이고 원문 원장의 단 하나의 `extracted` 객체와 정확히 일치할 때만 병합 후보가 됩니다. 텍스트 충돌, 복수 ID·객체, 미등록 ID, 전부 null인 판독값은 본문 시트에 넣지 않고 `16_시각자료목록`에 `needs_review`와 차단 사유를 남깁니다.
+
+```text
+PDF 객체 인벤토리 -> 결정론적 Triage -> PyMuPDF 기본 추출
+                    -> 저신뢰 객체만 OCR/VLM -> 근거 기반 병합 -> 골든셋 평가
+```
+
+```powershell
+# 기본: 기존 Vision 모델을 저신뢰 객체에만 사용
+py main.py "서울특별시_탄소중립계획.pdf" --ocr-backend vlm --evaluate
+
+# Unlimited-OCR가 미리 생성한 Markdown/JSONL 결과를 선택적으로 병합
+py main.py "서울특별시_탄소중립계획.pdf" `
+  --ocr-backend unlimited_ocr `
+  --ocr-results-dir "runs\seoul_uocr_v1\official_uocr_raw" `
+  --evaluate
+
+# OCR/VLM 없이 PyMuPDF 객체 기준선만 측정
+py main.py "서울특별시_탄소중립계획.pdf" --ocr-backend none --evaluate
+```
+
+## 고정 시각 표본 무캐시 벤치마크 (2026-08-02)
+
+전체 515페이지를 매번 무캐시로 실행하기 전에, 같은 객체만 대상으로 유실 복구와 회귀를 비교하는 고정 표본 도구를 추가했습니다. 원본 PDF를 그대로 기준으로 두고 최근 `vision_유실` 전부, 정상 양성 대조군, 음성 대조군을 결정론적으로 선택합니다. 원본·인벤토리·감사 결과·렌더 이미지의 SHA256과 객체 ID가 `manifest.json`에 고정되므로 서로 다른 실행이 실제로 같은 입력을 본 것인지 검증할 수 있습니다.
+
+```powershell
+# 서울 개발 표본 생성 및 해시 검증
+py scripts/fixed_visual_sample.py build `
+  "출력 결과 모음집\서울특별시_탄소중립계획.pdf" `
+  --inventory "data\golden\서울_시각요소_인벤토리_v1.xlsx" `
+  --audit "output\evaluation_20260801_233926\visual\visual_inventory_audit_20260802_083515.json" `
+  --dataset-id "seoul-visual-fixed-v1" `
+  --output-dir "output\fixed_visual_samples\seoul-visual-fixed-v1"
+
+py scripts/fixed_visual_sample.py validate `
+  "output\fixed_visual_samples\seoul-visual-fixed-v1\manifest.json"
+
+# 현재 기준선: 새 응답만 측정하고 개별 재시도는 끔
+py scripts/fixed_visual_sample.py run `
+  "output\fixed_visual_samples\seoul-visual-fixed-v1\manifest.json" `
+  --provider codex --model "gpt-5.6-luna" `
+  --cache-mode off --retry-missing none `
+  --output-dir "output\fixed_visual_samples\runs\baseline"
+```
+
+기본 자동 지표는 응답 커버리지, 기대 객체 리콜, 음성 특이도, 분류 정확도, 수치값 보유 커버리지입니다. 원본 대조 주석을 전달하면 임시 매니페스트와 별개로 `검토 정답 분류 정확도`, `구조화 셀 정확도`, `숫자값 재현율`, `숫자값 정밀도`를 따로 계산합니다. 따라서 숫자는 맞지만 항목명·기간·단위가 틀린 경우와 숫자 자체가 틀린 경우를 구분할 수 있습니다. `expected_visual_rows`는 이미지에서 직접 판독해야 할 원시 값, `expected_merged_rows`는 최종 엑셀에 자동 병합되어야 할 행입니다. 개별 재시도 A/B, 버전 관리, 정답 작성과 합격 기준은 [고정 시각 표본 실험 절차](docs/benchmark/고정_시각표본_실험_절차.md)를 따릅니다.
+
+### 시각 값 계약 v3
+
+- 항목명·범례명·부호·기간·단위를 원문 그대로 요구하며, 공백·유니코드 단위처럼 의미가 같은 표기만 평가 시 정규화합니다.
+- `21~30년` 같은 기간은 잘못된 단일 연도로 확장하지 않고 `기간원문`으로 보존합니다.
+- BAU·감축량·감축률·신규·누계·예산은 값 하나당 한 행으로 원자화합니다.
+- 각 값은 `명시라벨`, `표셀`, `축추정`, `계산값`, `불명` 중 하나의 `값근거`를 갖습니다.
+- 자동 병합은 단일 근거 ID 정확 일치뿐 아니라 값 검증도 통과해야 합니다. 축 추정·계산값·불명, 동일 근거의 값 충돌, 명시 합계와 세부합 불일치는 `needs_review`로 격리됩니다.
+- `16_시각자료목록`에는 `값근거`, `값검증상태`, `계약버전`, 원문·정규화 값과 단위가 기록됩니다. 계약 v3 이전 캐시는 근거·단위 계약이 부족해 보수적으로 검토 대상으로 내려갈 수 있으므로 v3 성능 비교는 무캐시 실행을 기준으로 합니다.
+
+누락 복구 실험은 `--retry-missing adaptive`를 사용합니다. 호출 실패 또는 객체 ID 누락 시 실패 객체만 `배치→절반→단일 객체` 순서로 격리하고, `--max-object-attempts` 상한 이후에도 응답이 없으면 `needs_review`로 종결합니다. 새 결과는 모든 표본에 `attempt_count`, `terminal_reason`, `attempt_history`를 남기며, 데이터 객체가 `extracted`로 응답했어도 명시 값이 전부 비어 있으면 `no_data`로 정규화합니다.
+
+### 근거 기반 병합 A/B
+
+저장된 동일 Vision 결과를 기존 병합과 근거 ID 기반 병합에 각각 투입하는 무API A/B 도구도 포함합니다. 먼저 값 판독 주석을 보존한 병합 주석 계약을 만들고 검토자가 `review_status`, `expected_sheet`, `expected_merge`, `expected_visual_rows`, `expected_merged_rows`를 확정합니다. `fixture_evidence`와 `fixture_baseline_rows`는 복수 근거, 근거 누락, 텍스트 충돌 같은 실패 계약을 결정론적으로 재현할 때만 사용합니다.
+
+```powershell
+# 1. 기존 값 주석을 보존한 병합 검수 템플릿 생성
+py scripts/fixed_visual_sample.py prepare-merge-annotations `
+  "output\fixed_visual_samples\seoul-visual-fixed-v1\manifest.json" `
+  --base "output\fixed_visual_samples\seoul-visual-fixed-v1\annotations_template.jsonl" `
+  --output "output\fixed_visual_samples\seoul-visual-fixed-v1\annotations_merge.jsonl"
+
+# 2. 같은 adaptive_retry Vision 결과를 두 병합 정책으로 비교
+py scripts/fixed_visual_sample.py merge-ab `
+  "output\fixed_visual_samples\seoul-visual-fixed-v1\manifest.json" `
+  --results "output\fixed_visual_samples\runs\adaptive_retry\results.jsonl" `
+  --annotations "output\fixed_visual_samples\seoul-visual-fixed-v1\annotations_merge.jsonl" `
+  --output-dir "output\fixed_visual_samples\merge_ab\adaptive_retry"
+```
+
+출력은 `legacy_rows.jsonl`, `evidence_rows.jsonl`, `evidence_candidates.jsonl`, `needs_review.jsonl`, `ab_report.json`, `ab_report.md`입니다. 보고서는 판정 정확도, 대상 시트 정확도, 자동 병합 정밀도·재현율, 오병합 감소, 정확 근거 매칭률, 복수 근거·전부 null·텍스트 충돌 격리율을 분리합니다. 정확도 계열 지표는 원본 대조를 마친 `review_status=reviewed` 또는 독립 2차 검토까지 마친 `confirmed` 표본만 분모로 사용합니다.
+
+## 7월 보고서 평가 체계 반영 (2026-07-28)
+
+7월 보고서의 후속 계획을 실제 회귀 실험으로 검증할 수 있도록 세 가지 조건을 추가했습니다.
+
+1. `data/evaluation/benchmark_manifest.json`에서 개발용 골든셋과 홀드아웃을 역할별로 분리하고, 원문·골든셋·시각 인벤토리의 SHA256을 고정합니다. 같은 ID의 파일이 바뀌면 평가는 즉시 실패하며, 홀드아웃은 `--evaluate-holdout` 없이는 열리지 않습니다.
+2. 최종 행을 원문 표 번호·캡션·섹션 문맥과 대조해 시트 의미를 검증합니다. 자동 재분류는 계획 시작 이후의 배출현황 값이 명시적인 전망표에서 나온 경우처럼 안전한 범위에만 적용합니다. `21_원문객체인벤토리`에는 `예상시트`와 `시트정합상태`가 추가됩니다.
+3. 감독관 총점과 별도로 **셀 정확도**, **객체 재현율**, **라우팅 오류율**을 산출합니다. 셀 정확도는 고정 골든셋, 객체 재현율은 사람 확정 시각요소 인벤토리, 라우팅 오류율은 의미 판정 가능한 표·그래프 객체를 각각 분모로 사용합니다.
+
+일반 실행의 `원문 객체 완전성/자동 객체 커버리지`는 자동 연결 지표이며, 사람 확정 인벤토리를 분모로 하는 `객체 재현율`과 구분됩니다. 후자는 `--evaluate`를 지정한 고정 평가에서만 보고됩니다.
+
+현재 서울 골든셋은 파일 해시는 고정됐지만 사람 최종 확정 전 초벌이므로, 테스트할 때만 다음처럼 명시적으로 허용합니다.
+
+```powershell
+py main.py "서울특별시_탄소중립계획.pdf" --evaluate --allow-draft-evaluation
+
+# 이미 생성된 결과만 다시 평가하면 LLM 호출 없이 실행됩니다.
+py scripts/evaluate_benchmark.py `
+  "탄소중립_추출결과.xlsx" `
+  "서울특별시_탄소중립계획.pdf" `
+  --allow-draft-evaluation
+```
+
+강원·경기 문서는 홀드아웃 후보로 등록했지만 골든셋이 아직 없으므로 평가가 의도적으로 차단됩니다. 사람 확정 골든셋과 시각 인벤토리를 만든 뒤 새 버전 ID와 해시를 등록해야 합니다.
+
+## 실행 재현성·자동 복구 업데이트 (2026-07-19)
+
+장시간 실행이 중단되거나 일부 LLM 배치가 실패해도 처음부터 다시 처리하지 않도록 다음 실행 계약을 추가했습니다.
+
+1. 원문 대조 검색어, 마킹 좌표, Excel 행은 페이지·내용 해시 기준으로 정렬해 같은 입력의 출력 순서를 고정합니다.
+2. 입력·가이드라인·프롬프트·구현·설정·모델 해시를 담은 실행 매니페스트를 `.cache/runs/<run-id>/run_manifest.json`과 결과 파일 옆 `*_run_manifest.json`에 기록합니다.
+3. 각 텍스트 배치의 성공·실패·부분 성공과 결과를 append-only `ledger.jsonl`에 즉시 기록합니다. 정상 종료 전 중단되면 매니페스트 상태가 `interrupted`로 남습니다.
+4. `--resume`은 성공 배치를 체크포인트에서 복원하고 미완료 배치만 실행합니다. `--retry-failed-only`는 기존 원장의 실패·부분 배치만 다시 실행합니다.
+5. 타임아웃, API 호출 실패, JSON 파싱 실패는 설정된 깊이까지 페이지 범위를 반으로 나눠 자동 복구합니다. 일부 하위 배치만 성공해도 그 결과는 보존합니다.
+6. 병합은 안정 행 ID로 완전 중복을 제거합니다. 동일 엔터티의 값이 다르면 임의 덮어쓰기를 하지 않고 양쪽 행과 `merge_conflicts.jsonl`을 보존합니다.
+7. 실패 대체값인 빈 `{}`·잘린 JSON·오류 문자열은 LLM 캐시에 저장하지 않습니다. 매니페스트의 `complete`, `needs_review`, `partial`, `failed`, `interrupted` 상태로 실행 완결성을 판정합니다.
+
+### 대용량 배치·완전성 검증 보강 (2026-07-19)
+
+1. LLM 호출 전에 문자 수가 큰 배치를 페이지 단위로 나누며, 한 페이지가 큰 경우 본문과 표 객체를 별도 청크로 분리합니다.
+2. 큰 표는 표 번호·캡션·섹션·근처 본문을 유지하고 헤더를 반복해 행 묶음별로 재추출합니다.
+3. `21_원문객체인벤토리`는 원문의 데이터 표·그래프를 분모로 삼아 결과 행 연결 상태를 `확인/부분/미확인`으로 기록합니다.
+4. 결정론적 품질 점수는 행 근거 대조뿐 아니라 원문 객체 완전성도 반영합니다. 인벤토리가 연결된 실행에는 기존 95점 상한을 적용하지 않습니다.
+5. 중복 키 충돌은 표 출처·데이터 출처·필드 채움률로 선택 근거가 있는 경우 `정보`로 분류하고, 근거 없는 동률만 `경고`로 유지합니다. 재정 부분합 검사는 같은 사업·연도·단위 내부에서만 수행합니다.
+6. Vision 배치는 텍스트와 같은 실행 원장에 저장합니다. 실패한 이미지 묶음은 절반씩 재귀 분할하며 성공한 하위 묶음은 다음 재개 실행에서 재사용합니다.
+
+```powershell
+# 중단 지점부터 재개: 성공 배치는 재호출하지 않음
+py main.py "서울특별시_탄소중립계획.pdf" --resume
+
+# 같은 실행 지문의 실패·부분 배치만 재처리
+py main.py "서울특별시_탄소중립계획.pdf" --retry-failed-only
+
+# 성공 체크포인트 중 특정 Vision 근거만 강제 재처리
+py main.py "서울특별시_탄소중립계획.pdf" `
+  --resume --retry-vision-evidence "<16번 또는 21번 시트의 실제 근거ID>"
+```
+
+재개 식별자는 입력 파일명이나 출력 파일명이 아니라 **입력 내용, 가이드라인, 프롬프트, 구현 및 주요 실행 설정의 해시**입니다. 이 중 하나가 바뀌면 새 실행으로 분리되므로 이전 코드의 결과가 새 코드에 잘못 섞이지 않습니다. 성공 응답 캐시와 배치 원장은 역할이 다릅니다. 캐시는 동일 LLM 요청의 비용을 줄이고, 원장은 어느 배치가 완료·실패했는지를 판단해 재개 범위를 결정합니다.
 
 ## v6에서 달라진 핵심 (2026-07-07 ~ 2026-07-14)
 
@@ -37,8 +269,8 @@ v6의 방향은 하나입니다. **측정 없이는 개선도 없다** — 추�
 
 차트에서 읽은 값을 본 시트에 편입하는 것은 오염 위험이 큰 작업이라, 게이트를 통과한 값만 열었습니다.
 
-- **라벨 기반(비추정) 판독값만**, 시트 1차 키가 완성되고 텍스트 교차검증을 통과할 때만 병합합니다(`VISUAL_MERGE_LABELED_ENABLED`, 실측 검증 후 기본 활성).
-- `06_감축목표`는 시각 유입 전면 차단(감축량↔목표배출량 역할 스왑 실측 근거), `05_배출전망`은 표-고신뢰 자동병합만 허용합니다.
+- **라벨 기반(비추정) 판독값만**, 단일 근거 ID 정확 매칭, 시트 1차 키 완성, 텍스트 교차검증을 모두 통과할 때만 병합합니다(`VISUAL_MERGE_LABELED_ENABLED`, `VISUAL_EVIDENCE_MERGE_ENABLED`).
+- 계약 v3에서는 `05_배출전망`과 `06_감축목표`도 값 역할·시나리오·연도 키가 완전한 경우에만 허용합니다. 감축량과 목표배출량 역할이 불명확하거나 기간이 단일 연도가 아니면 `needs_review`로 격리합니다.
 - 3지자체 게이트 실측: 병합/생략/경고/차단 = 서울 209/15/0/1,320 · 강원 49/98/0/830 · 경기 213/2/0/1,912 — **값 오병합 0**. 병합되지 않은 판독값은 전부 `16_시각자료목록`에 보존됩니다.
 - 시각 유래 리콜 여정: 0.013 → 0.1656(13배). 남은 갭의 본류는 vision 프롬프트의 시트 키 공급(차기 라운드).
 
@@ -75,14 +307,20 @@ flowchart TD
     C --> D[시트별 페이지 라우팅]
     D --> E[텍스트·표 LLM 추출]
     E --> F[배치 원장 기록]
-    B --> G[이미지 후보 추출]
-    G --> H[이미지 triage / Vision 분석]
+    B --> G[텍스트·표·차트·이미지\nDocumentObject 인벤토리]
+    G --> H[결정론적 객체 Triage\n저신뢰 객체만 OCR / VLM]
+    H --> R[근거 ID 기반\n중복 제거·보수적 병합]
     F --> I[정리·정제\nOrganizerAgent]
-    H --> I
+    R --> I
     I --> J[검증리포트 생성]
     J --> K[GapFill 보완]
     K --> L[선택: 보조 모델 검수\n타깃 검수: 경고·충돌 행]
-    L --> M[Excel 작성]
+    L --> Q[캡션·섹션 기반\n시트 의미 검증]
+    Q --> M[결정론적 원문 대조\n추출 행의 근거 확인]
+    B --> O[원문 표·그래프 객체 인벤토리]
+    M --> P[품질 점수\n행 근거 + 객체 완전성]
+    O --> P
+    P --> N[Excel·마킹 PDF 작성]
 ```
 
 ## 출력 Excel 시트
@@ -116,6 +354,8 @@ flowchart TD
 | `17_보조검수후보` | `--hybrid-review` | 보조 모델이 찾은 누락 후보, 값 충돌, 오염 의심 항목 |
 | `18_보조병합로그` | `--hybrid-review` | 후보 판정, 원문 근거, 병합 여부와 차단 사유 |
 | `19_검증리포트` | 검증 이슈 존재 | 원장 실패, 정합성 경고, 빈 시트 원인 등 |
+| `20_원문대조` | 기본 생성 | 모든 최종 행의 원문 확인 상태, 출처/확인 페이지, 검색어와 신뢰도 |
+| `21_원문객체인벤토리` | 기본 생성 | 원문 표·그래프별 결과 연결 상태, 완전성, 예상 시트와 시트 정합 상태 |
 | `90_코드북` | 기본 생성 (`CODEBOOK_SHEET_ENABLED=0`으로 제외) | 실행에 사용된 코드 체계(달성여부·사업유형·전망방법·표준부문·데이터상태) |
 
 ## 설치
@@ -234,6 +474,10 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 | `--no-images` | 이미지·그래프 분석 생략 |
 | `--max-images` | Vision 분석 이미지 수를 명시적으로 제한 |
 | `--full-scan` | 시트 라우팅 대신 전체 페이지를 스캔 |
+| `--resume` | 같은 실행 지문의 성공 체크포인트를 복원하고 미완료 항목부터 재개 |
+| `--retry-failed-only` | 실패·부분 성공 텍스트 배치만 재실행 |
+| `--retry-vision-evidence` | 지정 근거 ID의 Vision 판독만 강제 재실행. 반복 지정 가능 |
+| `--retry-vision-pages` | 쉼표로 지정한 페이지의 저신뢰 시각 객체만 강제 재실행 |
 | `--hybrid-review` | 보조 모델 후보 검수 활성화 |
 | `--sheet-closed-loop` | v5 시트별 추출→정제→검수 폐루프 활성화(기본 비활성) |
 | `--hybrid-review-max-batches` | 보조 검수 시 시트당 최대 배치 수 |
@@ -254,6 +498,7 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 | `GEMINI_VISION_MODEL` | `gemini-2.5-pro` | API 모드 vision(차트 판독) 기본 모델. 벤치마크 실측(0.976 vs flash-lite 0.707)으로 채택. 에이전트(codex/claude) 모드 vision에는 적용되지 않음 |
 | `CODEX_VISION_MODEL` | `gpt-5.6-luna` | 에이전트(codex) 모드 vision 기본 모델. 벤치마크 실측(리콜 0.963, 환각 0)으로 채택. 빈 값이면 CLI 기본 모델 |
 | `VISUAL_MERGE_LABELED_ENABLED` | `True` | 라벨 기반 시각 판독값의 게이트 병합. 3지자체 실측(값 오병합 0)으로 기본 활성 |
+| `VISUAL_EVIDENCE_MERGE_ENABLED` | `True` | 객체 원장이 있는 실행에서 단일 `근거ID`와 단일 `extracted` 객체가 정확히 일치한 후보만 자동 병합 |
 | `GEMINI_REQUEST_TIMEOUT_SECONDS` | `180` | Gemini SDK 요청 1회 타임아웃. 초 단위 env 값을 SDK에는 ms로 전달 |
 | `LOCAL_AGENT_TIMEOUT` | `300` | Codex/Claude 1회 호출 제한 시간 |
 | `PARALLEL_PROCESSING_ENABLED` | `True` | 독립 배치 병렬 실행 |
@@ -263,9 +508,43 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 | `LLM_QUOTA_WAIT_ENABLED` | `True` | quota 발생 시 짧게 대기 후 재개 |
 | `LLM_QUOTA_WAIT_POLL_SECONDS` | `120` | quota 회복 대기 기본 간격 |
 | `LLM_QUOTA_WAIT_MAX_SECONDS` | `1800` | quota 누적 대기 상한 |
+| `LOCAL_AGENT_TIMEOUT_RETRIES` | `1` | 로컬 호출 타임아웃 뒤 허용할 추가 재시도 횟수 |
+| `EXTRACTION_SPLIT_ON_TIMEOUT` | `True` | 타임아웃된 텍스트 배치를 더 작은 페이지 묶음으로 자동 분할 |
+| `EXTRACTION_TIMEOUT_MIN_BATCH_PAGES` | `2` | 타임아웃 분할을 중단할 최소 페이지 수 |
+| `EXTRACTION_TIMEOUT_MAX_SPLIT_DEPTH` | `6` | 한 원본 배치에서 허용할 재귀 분할 깊이 |
+| `EXTRACTION_TIMEOUT_RECOVERY_BUDGET_SECONDS` | `900` | 한 원본 배치의 타임아웃 분할 복구 시간 상한 |
+| `EXTRACTION_SPLIT_ON_FAILURE` | `True` | API 호출 실패·JSON 파싱 실패도 작은 배치로 자동 분할 |
+| `EXTRACTION_MAX_BATCH_CHARS` | `18000` | LLM 호출 전 텍스트 배치 최대 문자 수 |
+| `EXTRACTION_RECOVERY_MAX_BATCH_CHARS` | `12000` | 실패 복구 하위 배치 최대 문자 수 |
+| `EXTRACTION_TABLE_ROWS_PER_BATCH` | `20` | 큰 표의 헤더 반복 행 청크 크기 |
+| `RUN_STATE_ENABLED` | `True` | 입력·프롬프트·구현·설정 해시별 배치 원장과 매니페스트 기록 |
+| `RUN_STATE_DIR` | `.cache/runs` | 실행 상태와 체크포인트 저장 위치 |
+| `EXTRACTION_RESUME` | `False` | 성공 체크포인트를 복원하고 미완료 배치를 실행 (`--resume` 권장) |
+| `EXTRACTION_RETRY_FAILED_ONLY` | `False` | 원장에 실패·부분 상태로 기록된 배치만 재실행 (`--retry-failed-only` 권장) |
+| `VISION_RETRY_EVIDENCE_IDS` | 빈 값 | 성공 체크포인트에서도 다시 판독할 시각 근거 ID 목록 |
+| `VISION_RETRY_PAGES` | 빈 값 | 다시 판독할 저신뢰 시각 객체의 페이지 번호 목록 |
+| `VISUAL_MERGE_SNAPSHOT_ENABLED` | `True` | 운영 시각 관찰값과 근거 원장을 무API A/B 스냅샷으로 저장 |
+| `LLM_TEMPERATURE` | `0` | Gemini JSON 추출의 응답 변동 최소화 |
+| `PRIOR_PLAN_MAX_PAGES` | `60` | 다음 장 경계 미검출 시 기존계획 구간 탐지를 무효화할 안전 상한 |
 | `GAP_FILL_ENABLED` | `True` | 커버리지 낮은 시트 재추출 |
 | `PROVENANCE_ENABLED` | `True` | 본문 시트에 `출처페이지` 컬럼 추가 |
+| `SOURCE_VERIFICATION_ENABLED` | `True` | 최종 행을 PDF/HWP 파싱 텍스트·표와 결정론적으로 대조 |
+| `SOURCE_VERIFICATION_GLOBAL_SEARCH` | `True` | 출처페이지에서 실패하면 문서 전체에서 근거를 재탐색 |
+| `SOURCE_VERIFICATION_MARK_PDF` | `True` | 확인된 원문 좌표를 표시한 `마킹_*.pdf` 생성 |
+| `SOURCE_OBJECT_INVENTORY_ENABLED` | `True` | 원문 표·그래프를 분모로 결과 연결 완전성 계산 |
+| `SOURCE_OBJECT_PARTIAL_WEIGHT` | `0.5` | 같은 페이지만 연결된 객체의 부분 점수 |
+| `SEMANTIC_ROUTING_ENABLED` | `True` | 표 캡션·섹션 기반 시트 의미 검증 |
+| `SEMANTIC_ROUTING_AUTO_RECLASSIFY` | `True` | 안전한 미래연도 배출현황→전망 오배치만 자동 재분류 |
+| `SEMANTIC_ROUTING_ALLOWED_SCORE_DELTA` | `1.5` | 객체의 최고 후보와 함께 허용할 복수 시트 점수 차이 |
+| `SEMANTIC_ROUTING_MAX_ALLOWED_TARGETS` | `3` | 한 객체에 기록할 허용 시트 최대 수 |
+| `EVALUATION_MANIFEST_PATH` | `data/evaluation/benchmark_manifest.json` | 고정 개발/홀드아웃 평가 계약 |
+| `QUALITY_THRESHOLD` | `70` | 근거성·필드·출처·정합성·핵심시트·추출성공률 기반 품질 통과 기준 |
+| `QUALITY_MAX_WITHOUT_SOURCE_INVENTORY` | `95` | 원문 전체 객체 인벤토리 미연결 상태의 점수 상한 |
 | `MAX_IMAGES` | `None` | 기본은 triage 통과 이미지 전수 분석 |
+| `VISION_CHECKPOINT_ENABLED` | `True` | Vision 성공·실패 배치를 실행 원장에 저장 |
+| `VISION_SPLIT_ON_FAILURE` | `True` | 실패한 Vision 묶음을 더 작은 이미지 묶음으로 분할 |
+| `VISION_RECOVERY_MAX_SPLIT_DEPTH` | `6` | Vision 재귀 분할 최대 깊이 |
+| `VISION_RECOVERY_MAX_OBJECT_ATTEMPTS` | `7` | 루트 호출을 포함한 객체별 최대 Vision 시도 횟수 |
 | `HYBRID_REVIEW_ENABLED` | `False` | 보조 모델 검수 기본 비활성 |
 | `SHEET_CLOSED_LOOP_ENABLED` | `False` | 시트별 추출→정제→검수 폐루프 기본 비활성 |
 | `HYBRID_SHEETWISE_FLOW_ENABLED` | `True` | 시트 단위 후보 탐색·묶음 판정 흐름 |
@@ -291,7 +570,10 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 ├─ carbon_guideline.md        # 환경부 가이드라인 기반 보조 지침
 ├─ data/
 │  ├─ appendix3_reduction_units.csv  # 부록3 감축원단위 114건
-│  └─ appendix4_projects.csv         # 부록4 표준 사업목록 507건
+│  ├─ appendix4_projects.csv         # 부록4 표준 사업목록 507건
+│  ├─ evaluation/
+│  │  └─ benchmark_manifest.json     # 개발용·홀드아웃 평가 파일/해시 계약
+│  └─ golden/                        # 고정 골든셋과 시각요소 인벤토리
 ├─ agents/
 │  ├─ guideline_agent.py      # 가이드라인/스키마 관리
 │  ├─ guideline_parser.py     # 앵커 기반 구조적 주입 파서
@@ -308,9 +590,13 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 │  ├─ parallel.py             # 순서 보존 병렬 실행/실패 수집
 │  ├─ pdf_reader.py           # PDF 파싱
 │  ├─ hwp_reader.py           # HWP/HWPX 파싱(kordoc)
+│  ├─ benchmark_evaluation.py # 고정 평가 계약과 독립 지표 통합
+│  ├─ semantic_routing.py     # 캡션·섹션 기반 시트 의미 검증
+│  ├─ source_verifier.py      # 원문 행·객체 대조와 결정론적 품질 평가
 │  ├─ reference_data.py       # 부록3·4 참조 사전 로드와 매칭
 │  └─ excel_writer.py         # openpyxl 기반 Excel 생성
 ├─ scripts/
+│  ├─ evaluate_benchmark.py   # 셀 정확도·객체 재현율·라우팅 오류율 통합 평가
 │  ├─ score_against_golden.py # 골든셋 대비 리콜·정밀도·값일치율 채점
 │  │                          #   (보조 모듈 golden_score_*.py — 계약/매칭/리포트/워크북)
 │  ├─ audit_visual_inventory.py # 시각 요소 인벤토리 dump/audit 리포트
@@ -325,7 +611,7 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 
 ## 테스트
 
-전체 테스트(305개)는 v4의 신뢰성 계약, v5의 기능 계약, v6의 측정·병합 계약을 함께 검증합니다.
+300개 이상의 테스트가 v4의 신뢰성 계약, v5의 기능 계약, v6의 측정·병합 계약과 고정 평가 계약을 함께 검증합니다.
 
 ```powershell
 python -m pytest tests/ -q
@@ -348,6 +634,8 @@ python -m pytest tests/ -q
 | 시트 폐루프 | `tests/test_sheet_closed_loop.py`, `tests/test_sheet_closed_loop_regressions.py` |
 | A/B 하네스 | `tests/test_ab_validation.py` |
 | 골든셋 채점·매칭 티어 | `tests/test_score_against_golden.py`, `tests/test_semantic_relax_matching.py`, `tests/test_char_similarity_matching.py` |
+| 고정 개발/홀드아웃 평가 계약 | `tests/test_benchmark_evaluation.py` |
+| 캡션·섹션 기반 시트 의미 검증 | `tests/test_semantic_routing.py`, `tests/test_source_verifier.py` |
 | 시각 인벤토리 감사·vision 벤치마크 | `tests/test_audit_visual_inventory.py`, `tests/test_benchmark_vision.py` |
 | 시각 병합 게이트·경로 | `tests/test_visual_merge_labeled.py`, `tests/test_visual_schema_extension.py`, `tests/test_m24*_*.py` |
 | 소수정 일반화 회귀 | `tests/test_v53_organizer_generalization.py`, `tests/test_v63_minor_fixes.py` |
@@ -461,6 +749,8 @@ Codex/Claude 로컬 에이전트에서 quota나 세션 한도가 감지되면 �
 - 2026-07-04: 시트 단위 보조검수·묶음 판정 도입(진행 가시성 개선, v3 팀원 개선의 v4 포팅), 하이브리드 백엔드 codex/claude/auto 지원, 검수 경로 백엔드 전환 버그 수정, `--legacy-hybrid-flow` 회귀 경로 추가
 - v5 (2026-07-05): 구조적 가이드라인 주입, 단계별 백엔드 오버라이드, 타깃 보조검수, 부록 참조 사전·`90_코드북`, 행 단위 `데이터상태`, 장 문맥 프로비넌스, organizer 정밀 보정, 시트 폐루프 opt-in 경로. 명세 대조 검수에서 발견된 치명 1건·중요 10건 수정 완료(커밋별 회귀 테스트 통과, 총 111개 테스트)
 - v6 (2026-07-07 ~ 07-14): 측정 체계 구축(골든셋 채점 하네스·시각 인벤토리 감사·서울 골든셋 3,522행·채점기 4단 매칭 티어), vision 교차 프로바이더 벤치마크와 기본값 채택(API `gemini-2.5-pro`, codex `gpt-5.6-luna`), 라벨 시각 병합 게이트 도입·기본 활성화(3지자체 실측 값 오병합 0, 시각 유래 리콜 0.013→0.1656), 소수정 v5.2/v5.3/v6.3(정규화·오염 제거, 서울 03 값일치율 0.60→0.93), 서울·강원·경기 3중 회귀 게이트 확립. 기준선(하한 구성) 텍스트 리콜 0.6129·값일치율 0.8798. 총 305개 테스트
+- v7 로컬 통합 (2026-07-19 ~ 07-30): 재현 가능한 실행 매니페스트·배치 원장, 대용량 배치 분할, 실패 배치 선택 복구, 결정론적 원문 대조·객체 완전성 평가, 개발/홀드아웃 평가 계약 도입
+- v8 (2026-08-01 ~ 08-05): `DocumentObject` 기반 선택적 OCR/VLM, 객체별 적응형 복구, 근거 ID 병합 계약 v3, 무API 병합 A/B, 문서 비종속 목차·본문 라우팅과 엔진 간 객체 중복 제거를 통합
 
 <details>
 <summary><b>이전 버전 업데이트 기록 전문</b> (내용 보존용)</summary>
@@ -602,6 +892,16 @@ v4.1에서는 불필요한 재호출을 줄이기 위해 다음 응답도 정상
 - 재정 합계와 부분합 불일치
 - 중복 키의 값 충돌
 
+정제와 보조검수가 끝나면 모든 00~16 시트 행을 다시 원문과 대조합니다. 각 행에서
+사업명·지표명·캡션·연도·수치 등 검색어를 만들고 `출처페이지 ± 반경`을 먼저 확인한 뒤,
+실패하면 설정에 따라 문서 전체를 검색합니다. 상세 결과는 `20_원문대조`, 시트별 집계
+경고는 `19_검증리포트`, 확인 좌표는 `마킹_결과파일명.pdf`에 기록됩니다.
+
+감독관 점수는 더 이상 행 수만으로 계산하지 않습니다. 인벤토리가 연결된 실행은 원문 근거 25점,
+원문 표·그래프 객체 완전성 5점, 필수 필드 20점, 출처페이지 10점, 결정론적 정합성 15점,
+핵심 시트 존재 10점, 루트 추출 배치 성공률 15점으로 계산합니다. 인벤토리를 끈 실행에만
+`QUALITY_MAX_WITHOUT_SOURCE_INVENTORY=95` 상한을 적용합니다.
+
 ### 6. GapFill 보완
 
 1차 추출 후 비어 있거나 커버리지가 낮은 핵심 시트를 다시 점검합니다. 단순히 “라우팅된 페이지”가 아니라 **성공적으로 추출된 페이지**를 기준으로 보완 대상을 정하므로, 호출 실패나 파싱 실패로 유실된 페이지도 다시 후보가 될 수 있습니다.
@@ -642,11 +942,11 @@ v4.1에서는 불필요한 재호출을 줄이기 위해 다음 응답도 정상
 **정형화·검증**
 - **단위 표기 통일**: `천 톤CO2eq.` · `천톤CO₂eq` 등 → `천톤CO2eq`로 정규화
 - **검증 리포트(`19_검증리포트`)**: 감축률 산식 재계산, 부문/목표연도 누락, 단위 스케일 혼재, 재정 합계≠부분합을 결정론적으로 점검
-- **빈 보조 시트 생략**: `17`/`18`/`19`는 데이터가 있을 때만 생성
+- **빈 보조 시트 생략**: `17`~`21`은 데이터가 있을 때만 생성
 
 **실행 안정성**
-- **한도 대기-재개**: 세션/사용량 한도에 막히면 죽지 않고, 회복 시각까지 대기 후 그 자리에서 자동 재개 (`LLM_QUOTA_WAIT_*`)
-- **타임아웃 = throttling 대응**: codex가 한도 근처에서 hang(타임아웃)으로 나타나면 연속 N회부터 대기-재개로 전환 (`LLM_TIMEOUT_AS_QUOTA_THRESHOLD`)
+- **명시적 한도 대기-재개**: quota/session-limit 메시지가 확인된 경우에만 회복 대기 후 재개 (`LLM_QUOTA_WAIT_*`)
+- **타임아웃 격리·분할**: 일반 타임아웃은 제한 횟수만 재시도하고, 큰 텍스트 배치는 반으로 나눠 복구합니다. 작은 배치도 실패하면 원장에 남기고 다음 태스크로 진행합니다 (`LOCAL_AGENT_TIMEOUT_RETRIES`, `EXTRACTION_SPLIT_ON_TIMEOUT`).
 - 디스크 캐시로 재실행 시 완료된 구간은 건너뜀
 
 ## 2026-06-28 업데이트: 하이브리드 검수·실행 안정화

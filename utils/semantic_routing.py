@@ -209,14 +209,13 @@ class SemanticRoutingReport:
         return rows
 
 
-def infer_semantic_target(
+def _semantic_candidates(
     *,
     caption: str = "",
     section: str = "",
     nearby_text: str = "",
     page_text: str = "",
-) -> SemanticTarget | None:
-    """명시적인 캡션·섹션 신호가 충분할 때만 하나의 시트를 반환한다."""
+) -> list[SemanticTarget]:
     channels = (
         (_normalize(caption), 3.0, "캡션"),
         (_normalize(section), 2.0, "섹션"),
@@ -241,17 +240,81 @@ def infer_semantic_target(
                         evidence_parts[sheet_key].append(marker)
 
     if not scores:
-        return None
+        return []
     ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
-    sheet_key, score = ordered[0]
-    runner_up = ordered[1][1] if len(ordered) > 1 else 0.0
-    margin = score - runner_up
+    candidates: list[SemanticTarget] = []
+    for index, (sheet_key, score) in enumerate(ordered):
+        runner_up = ordered[index + 1][1] if index + 1 < len(ordered) else 0.0
+        candidates.append(SemanticTarget(
+            sheet_key=sheet_key,
+            score=score,
+            margin=score - runner_up,
+            keywords=tuple(hits[sheet_key]),
+            evidence="; ".join(evidence_parts[sheet_key][:6]),
+        ))
+    return candidates
+
+
+def infer_semantic_target(
+    *,
+    caption: str = "",
+    section: str = "",
+    nearby_text: str = "",
+    page_text: str = "",
+) -> SemanticTarget | None:
+    """명시적인 캡션·섹션 신호가 충분할 때만 하나의 시트를 반환한다."""
+    candidates = _semantic_candidates(
+        caption=caption,
+        section=section,
+        nearby_text=nearby_text,
+        page_text=page_text,
+    )
+    if not candidates:
+        return None
+    target = candidates[0]
     min_score = float(getattr(config, "SEMANTIC_ROUTING_MIN_SCORE", 5.0))
     min_margin = float(getattr(config, "SEMANTIC_ROUTING_MIN_MARGIN", 1.5))
-    if score < min_score or margin < min_margin:
+    runner_up = candidates[1].score if len(candidates) > 1 else 0.0
+    margin = target.score - runner_up
+    if target.score < min_score or margin < min_margin:
         return None
-    evidence = "; ".join(evidence_parts[sheet_key][:6])
-    return SemanticTarget(sheet_key, score, margin, tuple(hits[sheet_key]), evidence)
+    return SemanticTarget(
+        target.sheet_key,
+        target.score,
+        margin,
+        target.keywords,
+        target.evidence,
+    )
+
+
+def infer_semantic_targets(
+    *,
+    caption: str = "",
+    section: str = "",
+    nearby_text: str = "",
+    page_text: str = "",
+) -> list[SemanticTarget]:
+    """한 객체가 복수 시트에 유효한 경우 허용 가능한 후보 집합을 반환한다."""
+    candidates = _semantic_candidates(
+        caption=caption,
+        section=section,
+        nearby_text=nearby_text,
+        page_text=page_text,
+    )
+    if not candidates:
+        return []
+    min_score = float(getattr(config, "SEMANTIC_ROUTING_MIN_SCORE", 5.0))
+    delta = max(
+        0.0,
+        float(getattr(config, "SEMANTIC_ROUTING_ALLOWED_SCORE_DELTA", 1.5)),
+    )
+    limit = max(1, int(getattr(config, "SEMANTIC_ROUTING_MAX_ALLOWED_TARGETS", 3)))
+    top_score = candidates[0].score
+    return [
+        candidate
+        for candidate in candidates
+        if candidate.score >= min_score and top_score - candidate.score <= delta
+    ][:limit]
 
 
 def infer_object_semantic_target(obj: DocumentObject) -> SemanticTarget | None:
@@ -262,10 +325,41 @@ def infer_object_semantic_target(obj: DocumentObject) -> SemanticTarget | None:
     )
 
 
+def infer_object_semantic_targets(obj: DocumentObject) -> list[SemanticTarget]:
+    """객체 메타데이터의 사람 확정 허용 시트를 우선하고 문맥 후보를 보조로 쓴다."""
+    raw_allowed = obj.metadata.get("allowed_sheet_keys") or obj.metadata.get("allowed_sheets")
+    if isinstance(raw_allowed, str):
+        raw_allowed = re.split(r"[,|;\n]+", raw_allowed)
+    if isinstance(raw_allowed, (list, tuple, set)):
+        name_to_key = {
+            _normalize(name): key
+            for key, name in getattr(config, "SHEET_KEY_TO_NAME", {}).items()
+        }
+        explicit: list[SemanticTarget] = []
+        for value in raw_allowed:
+            text = str(value or "").strip()
+            key = text if text in getattr(config, "EXTRACTION_SHEETS", []) else name_to_key.get(_normalize(text))
+            if key and all(item.sheet_key != key for item in explicit):
+                explicit.append(SemanticTarget(
+                    sheet_key=key,
+                    score=100.0,
+                    margin=100.0,
+                    keywords=("사람확정",),
+                    evidence="객체 메타데이터의 허용 시트",
+                ))
+        if explicit:
+            return explicit
+    return infer_semantic_targets(
+        caption=obj.caption,
+        section=obj.section,
+        nearby_text=obj.nearby_text,
+    )
+
+
 def _page_targets(document: PDFContent) -> dict[int, SemanticTarget | None]:
     by_page: dict[int, list[DocumentObject]] = defaultdict(list)
     for obj in build_document_objects(document.pages):
-        if obj.object_type in {"table", "figure"}:
+        if obj.object_type in {"table", "chart", "figure"}:
             by_page[obj.page_number].append(obj)
 
     targets: dict[int, SemanticTarget | None] = {}
@@ -326,7 +420,7 @@ def _row_summary(row: dict[str, Any]) -> str:
         for key, value in row.items()
         if key not in _NON_SEMANTIC_KEYS and value not in (None, "")
     }
-    text = json.dumps(payload, ensure_ascii=False, default=str)
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return text if len(text) <= 300 else text[:299] + "…"
 
 

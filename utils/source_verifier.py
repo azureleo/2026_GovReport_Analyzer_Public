@@ -13,8 +13,10 @@ import fitz
 
 import config
 from utils.document_objects import DocumentObject, build_document_objects
+from utils.object_routing import is_index_page, prepare_object_inventory
 from utils.pdf_reader import PDFContent
-from utils.semantic_routing import infer_object_semantic_target
+from utils.selective_ocr import apply_triage_metadata, evidence_id, merge_document_objects
+from utils.semantic_routing import infer_object_semantic_targets
 
 
 _COMMON_SKIP_VALUES = {
@@ -31,6 +33,29 @@ _SEARCH_IGNORE_HEADER_KEYWORDS = (
 _PRIORITY_HEADER_KEYWORDS = (
     "관리번호", "사업명", "항목명", "지표명", "과제명", "캡션", "유형",
     "추출값요약", "목표", "배출량", "예산", "값", "연도", "내용", "문구",
+)
+_SEARCH_FIELD_PRIORITY_GROUPS = (
+    (
+        "관리번호", "캡션", "제목", "번호", "계획명", "사업명", "과제명",
+        "항목명", "지표명", "전략명", "거버넌스기구",
+    ),
+    (
+        "부문", "세부부문", "관리부문", "지표범주", "지표세부범주",
+        "개요유형", "전략수준", "목표수준", "목표범위", "시나리오",
+        "재원구분", "직간접구분", "배출유형",
+    ),
+    (
+        "점검연도", "기준연도", "목표연도", "계획시작연도", "계획종료연도",
+        "연도", "기간원문", "발간일",
+    ),
+    (
+        "목표배출량", "목표감축량", "예상감축량", "배출량", "전망값",
+        "예산액", "감축률", "원문값", "정규화값", "값", "단위",
+    ),
+    (
+        "항목값", "연간계획", "이행실적", "내용", "문구", "역할", "설명",
+    ),
+    ("추출값요약",),
 )
 _GENERIC_TOKENS = {
     "자료", "단위", "비고", "합계", "구분", "기타", "관련시트", "참고자료",
@@ -84,6 +109,7 @@ class SearchTerm:
     text: str
     header: str
     weight: float
+    priority: int
 
 
 @dataclass(slots=True)
@@ -200,13 +226,34 @@ class SourceObjectVerification:
     linked_rows: int = 0
     message: str = ""
     expected_sheet: str = ""
+    allowed_sheets: list[str] = field(default_factory=list)
+    auxiliary_linked_sheets: list[str] = field(default_factory=list)
     routing_status: str = "판정불가"
+    bbox: tuple[float, float, float, float] | None = None
+    native_confidence: float | None = None
+    triage_action: str = ""
+    triage_reasons: list[str] = field(default_factory=list)
+    ocr_backend: str = ""
+    ocr_status: str = ""
+    final_status: str = "needs_review"
+    attempt_count: int = 0
+    terminal_reason: str = ""
+    evidence_id: str = ""
+    index_reference_pages: list[int] = field(default_factory=list)
+    duplicate_object_ids: list[str] = field(default_factory=list)
 
     def as_excel_row(self, municipality: str) -> dict[str, Any]:
+        type_labels = {
+            "table": "표",
+            "chart": "차트/그래프",
+            "figure": "그림",
+            "image": "이미지",
+            "text": "텍스트",
+        }
         return {
             "지자체명": municipality,
             "객체ID": self.object_id,
-            "객체유형": "표" if self.object_type == "table" else "그림/그래프",
+            "객체유형": type_labels.get(self.object_type, self.object_type),
             "출처페이지": self.page_number,
             "번호": self.number,
             "캡션": self.caption,
@@ -220,6 +267,23 @@ class SourceObjectVerification:
             "검수메시지": self.message,
             "예상시트": self.expected_sheet,
             "시트정합상태": self.routing_status,
+            "좌표": json.dumps(list(self.bbox), ensure_ascii=False) if self.bbox else "",
+            "원본신뢰도": (
+                round(float(self.native_confidence), 3)
+                if self.native_confidence is not None else None
+            ),
+            "Triage판정": self.triage_action,
+            "Triage사유": ", ".join(self.triage_reasons),
+            "보완백엔드": self.ocr_backend,
+            "보완상태": self.ocr_status,
+            "최종상태": self.final_status,
+            "시도횟수": self.attempt_count,
+            "종결사유": self.terminal_reason,
+            "근거ID": self.evidence_id,
+            "허용시트": ", ".join(self.allowed_sheets),
+            "보조연결시트": ", ".join(self.auxiliary_linked_sheets),
+            "목차참조페이지": ",".join(str(page) for page in self.index_reference_pages),
+            "중복객체ID": ", ".join(self.duplicate_object_ids),
         }
 
 
@@ -301,13 +365,96 @@ def _stringify(value: Any) -> str:
         return "Y" if value else "N"
     if isinstance(value, float):
         return str(int(value)) if value.is_integer() else f"{value:g}"
-    return re.sub(r"\s+", " ", str(value)).strip()
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return re.sub(r"\s+", " ", _canonicalize_json_fragments(str(value))).strip()
 
 
 def _normalize(value: str) -> str:
     text = html.unescape(_HTML_TAG_RE.sub(" ", value or "")).casefold()
     text = text.replace(",", "")
     return re.sub(r"[\s\[\](){}'\"“”‘’·ㆍ.:：;,_/\\|%]", "", text)
+
+
+def _field_priority(header: str) -> int:
+    canonical = _HEADER_ALIASES.get(str(header or ""), str(header or ""))
+    leaf = re.sub(r"\[\d+\]$", "", canonical.rsplit(".", 1)[-1])
+    for priority, group in enumerate(_SEARCH_FIELD_PRIORITY_GROUPS):
+        if any(keyword == leaf or keyword in leaf for keyword in group):
+            return priority
+    return len(_SEARCH_FIELD_PRIORITY_GROUPS)
+
+
+def _json_fragments(text: str) -> list[tuple[int, int, Any]]:
+    """문자열 안의 유효한 JSON 객체/배열 위치와 값을 순서대로 반환한다."""
+    fragments: list[tuple[int, int, Any]] = []
+    cursor = 0
+    while cursor < len(text):
+        start = next(
+            (index for index in range(cursor, len(text)) if text[index] in "{["),
+            -1,
+        )
+        if start < 0:
+            break
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        end = -1
+        for index in range(start, len(text)):
+            char = text[index]
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\" and in_string:
+                escaped = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char in "{[":
+                stack.append(char)
+            elif char in "}]":
+                if not stack:
+                    break
+                expected = "{" if char == "}" else "["
+                if stack[-1] != expected:
+                    break
+                stack.pop()
+                if not stack:
+                    end = index
+                    break
+        if end < 0:
+            cursor = start + 1
+            continue
+        try:
+            payload = json.loads(text[start:end + 1])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            cursor = start + 1
+            continue
+        fragments.append((start, end + 1, payload))
+        cursor = end + 1
+    return fragments
+
+
+def _canonicalize_json_fragments(text: str) -> str:
+    fragments = _json_fragments(text)
+    if not fragments:
+        return text
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, payload in fragments:
+        pieces.append(text[cursor:start])
+        pieces.append(json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ))
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 def _parse_pages(value: Any, page_count: int) -> list[int]:
@@ -321,7 +468,11 @@ def _parse_pages(value: Any, page_count: int) -> list[int]:
 
 def _flatten_json(value: Any, key_path: str = "") -> Iterable[tuple[str, str]]:
     if isinstance(value, dict):
-        for key, child in value.items():
+        for key in sorted(
+            value,
+            key=lambda item: (_field_priority(str(item)), _normalize(str(item)), str(item)),
+        ):
+            child = value[key]
             next_path = f"{key_path}.{key}" if key_path else str(key)
             yield from _flatten_json(child, next_path)
     elif isinstance(value, list):
@@ -412,26 +563,41 @@ def _atomic_candidates(text: str) -> list[str]:
     return candidates
 
 
-def _value_candidates(header: str, text: str) -> list[str]:
-    if text.startswith(("{", "[")):
-        try:
-            parsed = json.loads(text)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            parsed = None
-        if parsed is not None:
-            values: list[str] = []
+def _value_candidates(header: str, text: str) -> list[tuple[str, str]]:
+    fragments = _json_fragments(text)
+    if fragments:
+        values: list[tuple[str, str]] = []
+        cursor = 0
+        plain_parts: list[str] = []
+        for start, end, parsed in fragments:
+            plain_parts.append(text[cursor:start])
+            cursor = end
             for path, child in _flatten_json(parsed):
-                values.extend(_split_text(child))
-                values.extend(_atomic_candidates(child))
+                source_header = re.sub(r"\[\d+\]$", "", path.rsplit(".", 1)[-1]) or header
+                values.extend((candidate, source_header) for candidate in _split_text(child))
+                values.extend((candidate, source_header) for candidate in _atomic_candidates(child))
                 if any(keyword in path for keyword in _PRIORITY_HEADER_KEYWORDS):
-                    values.append(child)
-            return values
+                    values.append((child, source_header))
+        plain_parts.append(text[cursor:])
+        plain_text = " ".join(part for part in plain_parts if part.strip())
+        if plain_text:
+            if "캡션" in header:
+                values.extend(
+                    (match.group(0), header)
+                    for match in _VISUAL_LABEL_RE.finditer(plain_text)
+                )
+                values.extend((candidate, header) for candidate in _split_text(plain_text))
+            elif "추출값요약" in header:
+                values.extend((candidate, header) for candidate in _atomic_candidates(plain_text))
+            else:
+                values.extend((candidate, header) for candidate in _split_text(plain_text))
+        return values
     if "캡션" in header:
         labels = [match.group(0) for match in _VISUAL_LABEL_RE.finditer(text)]
-        return [*labels, *_split_text(text)]
+        return [(candidate, header) for candidate in [*labels, *_split_text(text)]]
     if "추출값요약" in header:
-        return _atomic_candidates(text)
-    return _split_text(text)
+        return [(candidate, header) for candidate in _atomic_candidates(text)]
+    return [(candidate, header) for candidate in _split_text(text)]
 
 
 def _term_weight(text: str, header: str) -> float:
@@ -454,26 +620,41 @@ def _term_weight(text: str, header: str) -> float:
 def _build_terms(headers: list[str], row: dict[str, Any], max_terms: int) -> list[SearchTerm]:
     raw: list[SearchTerm] = []
     generic = {_normalize(token) for token in _GENERIC_TOKENS}
-    for header in headers:
+    ordered_headers = sorted(
+        headers,
+        key=lambda header: (_field_priority(header), _normalize(header), header),
+    )
+    for header in ordered_headers:
         if any(keyword in header for keyword in (*_IGNORE_HEADER_KEYWORDS, *_SEARCH_IGNORE_HEADER_KEYWORDS)):
             continue
         key = _HEADER_ALIASES.get(header, header)
         text = _stringify(row.get(key))
         if len(text) < 2 or text.casefold() in _COMMON_SKIP_VALUES:
             continue
-        for candidate in _value_candidates(header, text):
+        for candidate, source_header in _value_candidates(header, text):
             for variant in _numeric_variants(candidate):
                 if len(variant) < 2 or _normalize(variant) in generic:
                     continue
-                raw.append(SearchTerm(variant, header, _term_weight(variant, header)))
+                raw.append(SearchTerm(
+                    variant,
+                    source_header,
+                    _term_weight(variant, source_header),
+                    _field_priority(source_header),
+                ))
     dedup: dict[str, SearchTerm] = {}
     for term in raw:
         key = _normalize(term.text)
-        if key and (key not in dedup or term.weight > dedup[key].weight):
+        previous = dedup.get(key)
+        if key and (
+            previous is None
+            or term.priority < previous.priority
+            or (term.priority == previous.priority and term.weight > previous.weight)
+        ):
             dedup[key] = term
     return sorted(
         dedup.values(),
         key=lambda term: (
+            term.priority,
             -term.weight,
             -len(term.text),
             _normalize(term.text),
@@ -675,21 +856,105 @@ def _object_inventory_terms(obj: DocumentObject) -> tuple[list[str], list[str]]:
 
 
 def _is_data_object(obj: DocumentObject, page_text: str) -> bool:
-    if obj.object_type not in {"table", "figure"}:
+    if obj.object_type not in {"table", "chart", "figure", "image"}:
         return False
-    compact_page = re.sub(r"\s+", "", page_text or "")
-    if any(marker in compact_page for marker in ("표목차", "그림목차")):
+    if obj.metadata.get("render_proxy") or obj.metadata.get("triage_action") == "transport_only":
+        return False
+    if obj.metadata.get("triage_action") == "skip_non_data":
+        return False
+    if obj.metadata.get("is_index_reference") or is_index_page(page_text):
         return False
     if obj.object_type == "table":
         if not obj.rows or len(obj.rows) < 2:
-            return False
+            return bool(
+                obj.metadata.get("triage_action") == "ocr_required"
+                and (obj.number or obj.caption)
+            )
         cells = " ".join(cell for row in obj.rows[:12] for cell in row[:12])
         has_data_signal = bool(_NUMBER_TOKEN_RE.search(cells)) or any(
             marker in cells
             for marker in ("연도", "배출량", "예산", "목표", "사업명", "지표", "단위", "실적")
         )
         return bool(obj.number or obj.caption or has_data_signal)
+    if obj.object_type == "chart":
+        return bool(obj.number or obj.caption or obj.rows)
+    if obj.object_type in {"figure", "image"}:
+        return bool(
+            obj.rows
+            or obj.metadata.get("triage_action") == "ocr_required"
+            or obj.metadata.get("ocr_status") in {
+                "parsed", "loaded", "added_missing_object", "enriched_native",
+                "replaced_low_confidence_native",
+            }
+        )
     return bool(obj.number or obj.caption)
+
+
+def _inventory_document_objects(
+    final_data: dict[str, Any],
+    document: PDFContent,
+) -> list[DocumentObject]:
+    """파이프라인 객체 원장을 우선 사용하고 구버전 결과는 재구성한다."""
+    serialized = final_data.get("document_objects")
+    if isinstance(serialized, list) and serialized:
+        objects: list[DocumentObject] = []
+        for row in serialized:
+            if not isinstance(row, dict):
+                continue
+            try:
+                objects.append(DocumentObject.from_dict(row))
+            except (TypeError, ValueError):
+                continue
+        if objects:
+            # 초기 A/B 스냅샷은 용량 절감을 위해 rows/text를 생략했다. 같은 PDF에서
+            # 재구성한 native 객체로 누락 payload만 복원해 평가 분모를 보존한다.
+            native = build_document_objects(document.pages)
+            native_by_id = {obj.object_id: obj for obj in native}
+            for obj in objects:
+                base = native_by_id.pop(obj.object_id, None)
+                if base is None:
+                    continue
+                if not obj.rows:
+                    obj.rows = base.rows
+                if not obj.text:
+                    obj.text = base.text
+                if not obj.nearby_text:
+                    obj.nearby_text = base.nearby_text
+                if not obj.caption:
+                    obj.caption = base.caption
+                if not obj.number:
+                    obj.number = base.number
+                if not obj.section:
+                    obj.section = base.section
+                if obj.bbox is None:
+                    obj.bbox = base.bbox
+            # 스냅샷에서 제외된 native 객체는 병합 단계에서 중복·비대상으로 정리된
+            # 객체일 수 있으므로 평가 분모에 새로 추가하지 않는다.
+            objects.sort(
+                key=lambda obj: (
+                    obj.page_number,
+                    obj.sequence,
+                    obj.object_type,
+                    obj.object_id,
+                )
+            )
+            return objects
+
+    native = build_document_objects(document.pages)
+    triage = final_data.get("object_triage")
+    if isinstance(triage, list):
+        apply_triage_metadata(native, triage)
+    ocr_objects: list[DocumentObject] = []
+    serialized_ocr = final_data.get("ocr_document_objects")
+    if isinstance(serialized_ocr, list):
+        for row in serialized_ocr:
+            if not isinstance(row, dict):
+                continue
+            try:
+                ocr_objects.append(DocumentObject.from_dict(row))
+            except (TypeError, ValueError):
+                continue
+    return merge_document_objects(native, ocr_objects) if ocr_objects else native
 
 
 def build_source_object_inventory(
@@ -699,8 +964,12 @@ def build_source_object_inventory(
     """원문의 데이터 표·그래프를 결과 행에 역방향으로 연결한다. LLM은 사용하지 않는다."""
     page_count = document.total_pages
     page_text = {page.page_number: page.text or "" for page in document.pages}
+    prepared = prepare_object_inventory(
+        _inventory_document_objects(final_data, document),
+        page_text,
+    )
     objects = [
-        obj for obj in build_document_objects(document.pages)
+        obj for obj in prepared.objects
         if _is_data_object(obj, page_text.get(obj.page_number, ""))
     ]
 
@@ -712,7 +981,12 @@ def build_source_object_inventory(
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            normalized = _normalize(json.dumps(row, ensure_ascii=False, default=str))
+            normalized = _normalize(json.dumps(
+                row,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ))
             indexed_rows.append((sheet_key, normalized, set(_source_pages(row, page_count))))
 
     partial_weight = max(
@@ -722,7 +996,7 @@ def build_source_object_inventory(
     results: list[SourceObjectVerification] = []
     for obj in objects:
         identity_terms, cell_terms = _object_inventory_terms(obj)
-        semantic_target = infer_object_semantic_target(obj)
+        semantic_targets = infer_object_semantic_targets(obj)
         same_page = [entry for entry in indexed_rows if obj.page_number in entry[2]]
         identity_matches = [
             entry for entry in indexed_rows
@@ -744,21 +1018,41 @@ def build_source_object_inventory(
             config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key)
             for sheet_key, _row_text, _pages in linked
         })
-        confirmed_sheets = {
-            config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key)
-            for sheet_key, _row_text, _pages in confirmed
+        confirmed_sheet_keys = {
+            sheet_key for sheet_key, _row_text, _pages in confirmed
         }
+        body_confirmed_keys = confirmed_sheet_keys.intersection(
+            set(getattr(config, "EXTRACTION_SHEETS", []))
+        )
+        auxiliary_confirmed_keys = confirmed_sheet_keys - body_confirmed_keys
+        body_confirmed_sheets = {
+            config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key)
+            for sheet_key in body_confirmed_keys
+        }
+        auxiliary_linked_sheets = sorted(
+            config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key)
+            for sheet_key in auxiliary_confirmed_keys
+        )
+        allowed_sheet_keys = [target.sheet_key for target in semantic_targets]
+        allowed_sheets = [
+            config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key)
+            for sheet_key in allowed_sheet_keys
+        ]
         expected_sheet = (
-            config.SHEET_KEY_TO_NAME.get(semantic_target.sheet_key, semantic_target.sheet_key)
-            if semantic_target is not None
+            allowed_sheets[0]
+            if allowed_sheets
             else ""
         )
-        if semantic_target is None or not confirmed:
+        if not semantic_targets or not confirmed:
             routing_status = "판정불가"
-        elif expected_sheet in confirmed_sheets:
+        elif any(sheet_key in body_confirmed_keys for sheet_key in allowed_sheet_keys):
             routing_status = "일치"
-        else:
+        elif body_confirmed_sheets:
             routing_status = "오배치의심"
+        elif auxiliary_confirmed_keys:
+            routing_status = "본문미연결"
+        else:
+            routing_status = "판정불가"
         if confirmed:
             status = "확인"
             score = 1.0
@@ -786,13 +1080,41 @@ def build_source_object_inventory(
             linked_rows=len(linked),
             message=message,
             expected_sheet=expected_sheet,
+            allowed_sheets=allowed_sheets,
+            auxiliary_linked_sheets=auxiliary_linked_sheets,
             routing_status=routing_status,
+            bbox=obj.bbox,
+            native_confidence=(
+                float(obj.metadata["native_confidence"])
+                if obj.metadata.get("native_confidence") is not None else None
+            ),
+            triage_action=str(obj.metadata.get("triage_action") or ""),
+            triage_reasons=[str(value) for value in (obj.metadata.get("triage_reasons") or [])],
+            ocr_backend=str(obj.metadata.get("ocr_backend") or obj.metadata.get("engine") or ""),
+            ocr_status=str(obj.metadata.get("ocr_status") or ""),
+            final_status=str(obj.metadata.get("final_status") or "needs_review"),
+            attempt_count=int(obj.metadata.get("attempt_count") or 0),
+            terminal_reason=str(obj.metadata.get("terminal_reason") or ""),
+            evidence_id=str(obj.metadata.get("evidence_id") or evidence_id(obj)),
+            index_reference_pages=sorted({
+                int(page)
+                for page in (obj.metadata.get("index_reference_pages") or [])
+                if str(page).isdigit()
+            }),
+            duplicate_object_ids=[
+                str(value)
+                for value in (obj.metadata.get("duplicate_object_ids") or [])
+                if value
+            ],
         ))
 
     total = len(results)
     coverage = sum(row.completeness_score for row in results) / total if total else 1.0
-    routing_evaluable = sum(row.routing_status in {"일치", "오배치의심"} for row in results)
-    routing_mismatches = sum(row.routing_status == "오배치의심" for row in results)
+    routing_statuses = {"일치", "오배치의심", "본문미연결"}
+    routing_evaluable = sum(row.routing_status in routing_statuses for row in results)
+    routing_mismatches = sum(
+        row.routing_status in {"오배치의심", "본문미연결"} for row in results
+    )
     return SourceObjectInventoryReport(
         rows=results,
         total_objects=total,

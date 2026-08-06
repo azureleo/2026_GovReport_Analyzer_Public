@@ -171,6 +171,22 @@ def main():
         help="이미지 분석 후보 상한. 미지정/0이면 triage 통과 후보 전부 분석",
     )
     parser.add_argument(
+        "--ocr-backend",
+        choices=["vlm", "unlimited_ocr", "none"],
+        default=None,
+        help="저신뢰 객체 보완 백엔드 (기본값: vlm)",
+    )
+    parser.add_argument(
+        "--ocr-results-dir",
+        default=None,
+        help="Unlimited-OCR가 생성한 Markdown/JSONL 결과 디렉터리",
+    )
+    parser.add_argument(
+        "--no-selective-ocr",
+        action="store_true",
+        help="객체 신뢰도 기반 선택적 OCR을 끄고 기존 이미지 triage만 사용",
+    )
+    parser.add_argument(
         "--full-scan",
         action="store_true",
         help="시트별 키워드 라우팅/상한에 의존하지 않고 전체 페이지를 추출 후보로 사용",
@@ -234,6 +250,19 @@ def main():
         help="기존 성공 체크포인트는 복원하고 실패·부분 배치만 다시 실행 (--resume 포함)",
     )
     parser.add_argument(
+        "--retry-vision-evidence",
+        action="append",
+        default=None,
+        metavar="EVIDENCE_ID",
+        help="성공 체크포인트 중 지정한 근거 ID의 Vision 판독만 강제 재실행 (반복 지정 가능)",
+    )
+    parser.add_argument(
+        "--retry-vision-pages",
+        default=None,
+        metavar="PAGES",
+        help="지정 페이지의 저신뢰 시각 객체만 강제 재실행 (예: 71,89,131)",
+    )
+    parser.add_argument(
         "--evaluate",
         action="store_true",
         help="추출 완료 후 고정 골든셋·시각 인벤토리·라우팅 독립 평가 실행",
@@ -279,6 +308,12 @@ def main():
         os.environ["LOCAL_AGENT_TIMEOUT"] = str(args.agent_timeout)
     if args.max_images is not None:
         os.environ["MAX_IMAGES"] = str(args.max_images)
+    if args.ocr_backend:
+        os.environ["OCR_BACKEND"] = args.ocr_backend
+    if args.ocr_results_dir:
+        os.environ["OCR_RESULTS_DIR"] = args.ocr_results_dir
+    if args.no_selective_ocr:
+        os.environ["SELECTIVE_OCR_ENABLED"] = "0"
     if args.full_scan:
         os.environ["FULL_DOCUMENT_SCAN"] = "1"
         os.environ.setdefault("MAX_IMAGES", "0")
@@ -304,6 +339,18 @@ def main():
         os.environ["EXTRACTION_RESUME"] = "1"
     if args.retry_failed_only:
         os.environ["EXTRACTION_RETRY_FAILED_ONLY"] = "1"
+    if args.retry_vision_evidence:
+        evidence_ids = [
+            item.strip()
+            for value in args.retry_vision_evidence
+            for item in str(value or "").split(",")
+            if item.strip()
+        ]
+        os.environ["VISION_RETRY_EVIDENCE_IDS"] = ",".join(dict.fromkeys(evidence_ids))
+        os.environ["EXTRACTION_RESUME"] = "1"
+    if args.retry_vision_pages:
+        os.environ["VISION_RETRY_PAGES"] = args.retry_vision_pages
+        os.environ["EXTRACTION_RESUME"] = "1"
 
     # API 키 설정
     if args.api_key:
@@ -320,6 +367,35 @@ def main():
         config.EXTRACTION_RESUME = True
     if args.retry_failed_only:
         config.EXTRACTION_RETRY_FAILED_ONLY = True
+    if args.retry_vision_evidence:
+        config.VISION_RETRY_EVIDENCE_IDS = list(dict.fromkeys(
+            item.strip()
+            for value in args.retry_vision_evidence
+            for item in str(value or "").split(",")
+            if item.strip()
+        ))
+        config.EXTRACTION_RESUME = True
+    if args.retry_vision_pages:
+        config.VISION_RETRY_PAGES = {
+            int(item.strip())
+            for item in str(args.retry_vision_pages).split(",")
+            if item.strip().isdigit() and int(item.strip()) > 0
+        }
+        config.EXTRACTION_RESUME = True
+    if args.ocr_backend:
+        config.OCR_BACKEND = args.ocr_backend
+    if args.ocr_results_dir:
+        config.OCR_RESULTS_DIR = args.ocr_results_dir
+    if args.no_selective_ocr:
+        config.SELECTIVE_OCR_ENABLED = False
+
+    if (
+        config.SELECTIVE_OCR_ENABLED
+        and config.OCR_BACKEND in {"unlimited_ocr", "uocr", "markdown"}
+        and not config.OCR_RESULTS_DIR
+    ):
+        print("[오류] Unlimited-OCR 백엔드에는 --ocr-results-dir가 필요합니다.")
+        return 1
 
     provider_aliases = {
         "gemini-api": "gemini",
@@ -427,6 +503,15 @@ def main():
         image_limit = "없음" if config.MAX_IMAGES is None else str(config.MAX_IMAGES)
         print(f"  이미지 상한: {image_limit}")
         print(f"  이미지 배치 크기: {config.IMAGE_ANALYSIS_BATCH_SIZE}")
+        print(
+            "  선택적 OCR/VLM: "
+            f"{'활성' if config.SELECTIVE_OCR_ENABLED else '비활성'}"
+        )
+        if config.SELECTIVE_OCR_ENABLED:
+            print(f"  OCR 백엔드: {config.OCR_BACKEND}")
+            print(f"  원본 신뢰도 임계값: {config.OCR_NATIVE_CONFIDENCE_THRESHOLD:g}")
+            if config.OCR_BACKEND in {"unlimited_ocr", "uocr", "markdown"}:
+                print(f"  OCR 결과 디렉터리: {config.OCR_RESULTS_DIR or '미지정'}")
     print(f"  LLM 캐시: {'활성' if config.LLM_CACHE_ENABLED else '비활성'}")
     if config.RUN_STATE_ENABLED:
         resume_mode = (

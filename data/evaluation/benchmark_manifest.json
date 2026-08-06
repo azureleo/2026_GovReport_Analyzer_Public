@@ -17,7 +17,9 @@
       "golden_sha256": "27265078002d0ca2d609e54c05603169c0368c1ad5747298dbab7daedf29033c",
       "visual_inventory": "../golden/서울_시각요소_인벤토리_v1.xlsx",
       "visual_inventory_sha256": "75c4623f31c05f8292bf39bd634e609b41f595f4dd96d917772d5744d2fcc39d",
-      "notes": "파일 해시는 고정했지만 골든셋 내용은 사람 최종 확정 전 초벌입니다. --allow-draft-evaluation으로만 사용합니다."
+      "routing_inventory": null,
+      "routing_inventory_sha256": "",
+      "notes": "파일 해시는 고정했지만 골든셋 내용은 사람 최종 확정 전 초벌입니다. --allow-draft-evaluation으로만 사용합니다. 라우팅 고정 분모는 사람 확정 인벤토리 등록 전까지 동적 보조 지표로 표시합니다."
     },
     {
       "id": "gangwon-holdout-v1-pending",
@@ -30,6 +32,8 @@
       "golden_sha256": "",
       "visual_inventory": null,
       "visual_inventory_sha256": "",
+      "routing_inventory": null,
+      "routing_inventory_sha256": "",
       "notes": "홀드아웃 후보. 사람 확정 골든셋과 시각 인벤토리 등록 전에는 평가할 수 없습니다."
     },
     {
@@ -43,6 +47,8 @@
       "golden_sha256": "",
       "visual_inventory": null,
       "visual_inventory_sha256": "",
+      "routing_inventory": null,
+      "routing_inventory_sha256": "",
       "notes": "홀드아웃 후보. 사람 확정 골든셋과 시각 인벤토리 등록 전에는 평가할 수 없습니다."
     }
   ]

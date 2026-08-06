@@ -11,13 +11,14 @@ import pytest
 
 import config
 from agents import organizer_agent
+from scripts.golden_score_contract import 계약헤더
 from scripts.score_against_golden import score_workbooks
 
 골든열 = ["골든_출처유형", "골든_출처페이지", "골든_채점제외", "골든_비고"]
 
 
 def _계약열(sheet_name: str) -> list[str]:
-    return [header for header in config.EXCEL_HEADERS[sheet_name] if header not in {"출처페이지", "데이터상태"}]
+    return 계약헤더(sheet_name)
 
 
 def _시트_쓰기(wb, sheet_name: str, rows: list[dict], *, golden: bool = False) -> None:
