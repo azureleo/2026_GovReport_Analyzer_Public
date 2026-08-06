@@ -16,7 +16,14 @@ def _표행(cells: list[Any]) -> str:
     return "| " + " | ".join(_비율문자(cell) for cell in cells) + " |\n"
 
 
+def _의미완화표시값(values: dict[str, Any]) -> str:
+    return "/".join(str(value) if value is not None else "" for value in values.values())
+
+
 def 마크다운(result: dict[str, Any]) -> str:
+    의미완화시트 = ",".join(dict.fromkeys(item["시트"] for item in result["의미완화매칭쌍"]))
+    if not 의미완화시트:
+        의미완화시트 = "02_지역여건"
     lines = [
         f"# 골든셋 채점 리포트 ({result['라벨']})\n\n",
         "## 실행 정보\n\n",
@@ -26,7 +33,7 @@ def 마크다운(result: dict[str, Any]) -> str:
         f"- 채점제외 행 수: {result['채점제외행수']}\n",
         f"- 형식 오류 생략 시트: {', '.join(result['생략시트']) if result['생략시트'] else '없음'}\n",
         f"- 형식 경고: {len(result.get('형식경고', []))}건\n",
-        f"- 의미완화 매칭: {result['의미완화매칭수']}건(02_지역여건)\n",
+        f"- 의미완화 매칭: {result['의미완화매칭수']}건({의미완화시트})\n",
         f"- 문자유사 매칭: {result['문자유사매칭수']}건(02_지역여건)\n",
         f"- 스케일동치 값 쌍: {result['스케일동치쌍수']}건(06_감축목표)\n",
         "- 값일치율 정의: 양쪽 값이 모두 존재하는 비교 쌍 중 일치한 값의 비율입니다.\n\n",
@@ -63,10 +70,16 @@ def 마크다운(result: dict[str, Any]) -> str:
     for item in result["의미완화매칭쌍"]:
         golden = item["골든"]
         output = item["출력"]
-        lines.append(
-            f"- 골든({golden['지표범주']}/{golden['지표세부범주']}/{golden['지표명']}/{golden['연도']}/{golden['값']}) "
-            f"⇔ 출력({output['지표범주']}/{output['지표세부범주']}/{output['지표명']}/{output['값']})\n"
-        )
+        if item["시트"] == "02_지역여건":
+            lines.append(
+                f"- 골든({golden['지표범주']}/{golden['지표세부범주']}/{golden['지표명']}/{golden['연도']}/{golden['값']}) "
+                f"⇔ 출력({output['지표범주']}/{output['지표세부범주']}/{output['지표명']}/{output['값']})\n"
+            )
+        else:
+            lines.append(
+                f"- {item['시트']} | 골든({_의미완화표시값(golden)}) "
+                f"⇔ 출력({_의미완화표시값(output)})\n"
+            )
     lines.append("\n## 문자유사 매칭 쌍\n\n")
     for item in result["문자유사매칭쌍"]:
         golden = item["골든"]

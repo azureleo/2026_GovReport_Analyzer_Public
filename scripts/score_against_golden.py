@@ -39,6 +39,31 @@ from scripts.golden_score_report import 마크다운  # noqa: E402
 from scripts.golden_score_workbook import 워크북읽기  # noqa: E402
 
 
+_의미완화표시필드 = {
+    "01_계획개요": (("개요유형", "항목명", "항목값"), ("개요유형", "항목명", "항목값")),
+    "02_지역여건": (
+        ("지표범주", "지표세부범주", "지표명", "연도", "값"),
+        ("지표범주", "지표세부범주", "지표명", "값"),
+    ),
+    "07_비전전략": (
+        ("전략수준", "전략명", "비전문구", "설명"),
+        ("전략수준", "전략명", "비전문구", "설명"),
+    ),
+    "13_이행관리환류": (("거버넌스기구", "역할"), ("거버넌스기구", "역할")),
+}
+
+
+def _의미완화매칭직렬화(sheet_name: str, match: Any) -> dict[str, Any]:
+    골든필드, 출력필드 = _의미완화표시필드[sheet_name]
+    return {
+        "시트": sheet_name,
+        "매칭방식": match.방식,
+        "유사도": match.키,
+        "골든": {field: match.골든.값.get(field) for field in 골든필드},
+        "출력": {field: match.출력.값.get(field) for field in 출력필드},
+    }
+
+
 def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_dir: str | Path = "output", label: str | None = None, write_json: bool = False) -> dict[str, Any]:
     output = Path(output_path).expanduser().resolve()
     golden = Path(golden_path).expanduser().resolve()
@@ -61,6 +86,8 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
     page_pairs = 0
     page_hits = 0
     전체의미완화매칭 = []
+    전체의미완화매칭시트 = []
+    수치시트의미완화매칭 = []
     전체문자유사매칭 = []
     전체문자유사관찰 = []
     전체스케일동치: list[dict[str, Any]] = []
@@ -93,6 +120,9 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
         all_missing_output.extend(missing_output)
         all_disagreements.extend(disagreements)
         전체의미완화매칭.extend(의미완화매칭들)
+        전체의미완화매칭시트.extend((sheet_name, match) for match in 의미완화매칭들)
+        if sheet_name in 수치시트:
+            수치시트의미완화매칭.extend(의미완화매칭들)
         전체문자유사매칭.extend(문자유사매칭들)
         전체문자유사관찰.extend(문자유사관찰들)
         전체스케일동치.extend(스케일동치쌍들)
@@ -132,26 +162,22 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
         "출처유형별_전체": 출처직렬화(all_source),
         "출처유형별_수치시트": 출처직렬화(numeric_source),
         "출처유형별_전체_의미완화포함": 의미완화포함출처직렬화(all_source, 전체의미완화매칭),
-        "출처유형별_수치시트_의미완화포함": 의미완화포함출처직렬화(numeric_source, 전체의미완화매칭),
+        "출처유형별_수치시트_의미완화포함": 의미완화포함출처직렬화(
+            numeric_source, 수치시트의미완화매칭
+        ),
         "출처유형별_전체_문자유사포함": 문자유사포함출처직렬화(
             all_source, 전체의미완화매칭, 전체문자유사매칭
         ),
         "출처유형별_수치시트_문자유사포함": 문자유사포함출처직렬화(
-            numeric_source, 전체의미완화매칭, 전체문자유사매칭
+            numeric_source, 수치시트의미완화매칭, 전체문자유사매칭
         ),
         "미매칭상세": {"골든": all_missing_golden, "출력": all_missing_output},
         "값불일치상세": all_disagreements,
         "출처페이지통계": {"비교쌍수": page_pairs, "교집합수": page_hits, "교집합비율": round(page_hits / page_pairs, 4) if page_pairs else None},
         "의미완화매칭수": len(전체의미완화매칭),
         "의미완화매칭쌍": [
-            {
-                "시트": "02_지역여건",
-                "매칭방식": match.방식,
-                "유사도": match.키,
-                "골든": {field: match.골든.값.get(field) for field in ("지표범주", "지표세부범주", "지표명", "연도", "값")},
-                "출력": {field: match.출력.값.get(field) for field in ("지표범주", "지표세부범주", "지표명", "값")},
-            }
-            for match in 전체의미완화매칭
+            _의미완화매칭직렬화(sheet_name, match)
+            for sheet_name, match in 전체의미완화매칭시트
         ],
         "문자유사매칭수": len(전체문자유사매칭),
         "문자유사매칭쌍": [

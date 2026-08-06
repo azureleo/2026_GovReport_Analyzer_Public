@@ -57,8 +57,61 @@ def _세부부문완화후보허용(sheet_name: str, golden_row: Any, output_row
     )
 
 
-def _지표토큰(row: Any) -> set[str]:
-    text = f"{row.값.get('지표명') or ''} {row.값.get('지표세부범주') or ''}"
+def _감축목표완화후보허용(
+    sheet_name: str,
+    golden_row: Any,
+    output_row: Any,
+) -> bool:
+    if sheet_name != "06_감축목표":
+        return True
+    golden_level = dedup_key_text(golden_row.값.get("목표수준"))
+    output_level = dedup_key_text(output_row.값.get("목표수준"))
+    golden_base_year = 키값("기준연도", golden_row.값.get("기준연도"))
+    output_base_year = 키값("기준연도", output_row.값.get("기준연도"))
+    level_diverged = bool(
+        golden_level and output_level and golden_level != output_level
+    )
+    base_year_diverged = bool(
+        golden_base_year
+        and output_base_year
+        and golden_base_year != output_base_year
+    )
+    if not level_diverged and not base_year_diverged:
+        return True
+    common_fields = [
+        field_name
+        for field_name in (
+            "목표감축량",
+            "목표배출량",
+            "감축률(%)",
+            "기준배출량",
+            "배출전망",
+        )
+        if 값있음(golden_row.값.get(field_name))
+        and 값있음(output_row.값.get(field_name))
+    ]
+    return bool(common_fields) and all(
+        _상대오차일치(
+            golden_row.값.get(field_name),
+            output_row.값.get(field_name),
+        )
+        for field_name in common_fields
+    )
+
+
+_의미완화토큰필드 = {
+    "01_계획개요": ("항목명", "항목값"),
+    "02_지역여건": ("지표명", "지표세부범주"),
+    "07_비전전략": ("전략명", "비전문구", "설명"),
+    "13_이행관리환류": ("거버넌스기구", "역할"),
+}
+
+
+def _지표토큰(row: Any, sheet_name: str = "02_지역여건") -> set[str]:
+    text = " ".join(
+        str(row.값.get(field_name) or "")
+        for field_name in _의미완화토큰필드[sheet_name]
+    )
     parts = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE).split()
     return {정규화토큰 for 토큰 in parts if (정규화토큰 := dedup_key_text(토큰))}
 
@@ -68,7 +121,33 @@ def _자카드(left: set[str], right: set[str]) -> float:
     return len(left & right) / len(union) if union else 0.0
 
 
-def _의미완화전제충족(golden_row: Any, output_row: Any) -> bool:
+def _의미완화전제충족(
+    golden_row: Any,
+    output_row: Any,
+    sheet_name: str = "02_지역여건",
+) -> bool:
+    if sheet_name == "01_계획개요":
+        golden_type = dedup_key_text(golden_row.값.get("개요유형"))
+        output_type = dedup_key_text(output_row.값.get("개요유형"))
+        if not golden_type and not output_type:
+            return False
+        return not (
+            golden_type
+            and output_type
+            and golden_type != output_type
+        )
+    if sheet_name == "07_비전전략":
+        golden_level = dedup_key_text(golden_row.값.get("전략수준"))
+        output_level = dedup_key_text(output_row.값.get("전략수준"))
+        return not (
+            golden_level
+            and output_level
+            and golden_level != output_level
+        )
+    if sheet_name == "13_이행관리환류":
+        return True
+    if sheet_name != "02_지역여건":
+        return False
     골든연도 = 키값("연도", golden_row.값.get("연도"))
     출력연도 = 키값("연도", output_row.값.get("연도"))
     if not 골든연도 or not 출력연도 or 골든연도 != 출력연도:
@@ -84,15 +163,26 @@ def _의미완화전제충족(golden_row: Any, output_row: Any) -> bool:
     return True
 
 
-def _의미완화후보(golden_row: Any, output_row: Any) -> float | None:
-    if not _의미완화전제충족(golden_row, output_row):
+def _의미완화후보(
+    golden_row: Any,
+    output_row: Any,
+    sheet_name: str,
+) -> float | None:
+    if not _의미완화전제충족(golden_row, output_row, sheet_name):
         return None
-    유사도 = _자카드(_지표토큰(golden_row), _지표토큰(output_row))
+    유사도 = _자카드(
+        _지표토큰(golden_row, sheet_name),
+        _지표토큰(output_row, sheet_name),
+    )
     return 유사도 if 유사도 >= SEMANTIC_MATCH_MIN_JACCARD else None
 
 
 def _의미완화매칭하기(
-    golden_rows: list, output_rows: list, remaining_golden: set[int], remaining_output: set[int]
+    golden_rows: list,
+    output_rows: list,
+    remaining_golden: set[int],
+    remaining_output: set[int],
+    sheet_name: str,
 ) -> list[매칭]:
     의미완화매칭들: list[매칭] = []
     의미완화골든잔여 = set(remaining_golden)
@@ -102,7 +192,11 @@ def _의미완화매칭하기(
     for golden_idx in sorted(remaining_golden):
         candidates: list[tuple[float, int, Any]] = []
         for output_idx in sorted(remaining_output):
-            유사도 = _의미완화후보(golden_rows[golden_idx], output_rows[output_idx])
+            유사도 = _의미완화후보(
+                golden_rows[golden_idx],
+                output_rows[output_idx],
+                sheet_name,
+            )
             if 유사도 is None:
                 continue
             candidates.append((유사도, output_idx, output_rows[output_idx]))
@@ -216,7 +310,10 @@ def _문자유사매칭하기(
 
 
 def 매칭하기(
-    golden_rows: list, output_rows: list, sheet_name: str
+    golden_rows: list,
+    output_rows: list,
+    sheet_name: str,
+    보수티어만: bool = False,
 ) -> tuple[list[매칭], set[int], set[int], list[매칭], list[매칭], list[매칭]]:
     matches: list[매칭] = []
     remaining_golden = set(range(len(golden_rows)))
@@ -236,6 +333,12 @@ def 매칭하기(
                     continue
                 if relaxed and not _세부부문완화후보허용(sheet_name, golden_row, candidate):
                     continue
+                if relaxed and not _감축목표완화후보허용(
+                    sheet_name,
+                    golden_row,
+                    candidate,
+                ):
+                    continue
                 matches.append(매칭(golden_row, candidate, label, row_key))
                 remaining_golden.remove(golden_idx)
                 remaining_output.remove(output_idx)
@@ -243,15 +346,33 @@ def 매칭하기(
     의미완화매칭들 = []
     문자유사매칭들 = []
     문자유사관찰들 = []
-    if sheet_name in 의미완화적용시트:
-        의미완화매칭들 = _의미완화매칭하기(golden_rows, output_rows, remaining_golden, remaining_output)
-        소비된골든 = {id(match.골든) for match in 의미완화매칭들}
-        소비된출력 = {id(match.출력) for match in 의미완화매칭들}
-        문자유사골든잔여 = {idx for idx in remaining_golden if id(golden_rows[idx]) not in 소비된골든}
-        문자유사출력잔여 = {idx for idx in remaining_output if id(output_rows[idx]) not in 소비된출력}
-        문자유사매칭들, 문자유사관찰들 = _문자유사매칭하기(
-            golden_rows, output_rows, 문자유사골든잔여, 문자유사출력잔여
+    if not 보수티어만 and sheet_name in 의미완화적용시트:
+        의미완화매칭들 = _의미완화매칭하기(
+            golden_rows,
+            output_rows,
+            remaining_golden,
+            remaining_output,
+            sheet_name,
         )
+        if sheet_name == "02_지역여건":
+            소비된골든 = {id(match.골든) for match in 의미완화매칭들}
+            소비된출력 = {id(match.출력) for match in 의미완화매칭들}
+            문자유사골든잔여 = {
+                idx
+                for idx in remaining_golden
+                if id(golden_rows[idx]) not in 소비된골든
+            }
+            문자유사출력잔여 = {
+                idx
+                for idx in remaining_output
+                if id(output_rows[idx]) not in 소비된출력
+            }
+            문자유사매칭들, 문자유사관찰들 = _문자유사매칭하기(
+                golden_rows,
+                output_rows,
+                문자유사골든잔여,
+                문자유사출력잔여,
+            )
     return (
         matches,
         remaining_golden,

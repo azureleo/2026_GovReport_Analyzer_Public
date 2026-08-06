@@ -481,6 +481,13 @@ def main():
         print(f"  모델: {config.MODEL}")
     elif provider == "openai":
         print(f"  모델: {config.OPENAI_MODEL}")
+    elif provider == "codex":
+        effective_model = (
+            config.STAGE_MODELS.get("extraction")
+            or config.LOCAL_AGENT_MODEL
+            or config.CODEX_TEXT_MODEL
+        )
+        print(f"  모델: {effective_model or 'Codex CLI 기본값'}")
     elif config.LOCAL_AGENT_MODEL:
         print(f"  모델: {config.LOCAL_AGENT_MODEL}")
     else:

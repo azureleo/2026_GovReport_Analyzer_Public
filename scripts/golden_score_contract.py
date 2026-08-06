@@ -27,7 +27,12 @@ from agents.organizer_agent import (  # noqa: E402
 텍스트유래 = {"본문텍스트", "텍스트표"}
 시각유래 = {"이미지표", "그래프", "이미지"}
 수치시트 = {"02_지역여건", "03_배출현황_지역", "04_배출현황_관리권한", "05_배출전망", "06_감축목표", "09_연차별이행계획", "10_정량감축량", "11_재정투자계획", "14_점검실적"}
-의미완화적용시트 = {"02_지역여건"}
+의미완화적용시트 = {
+    "01_계획개요",
+    "02_지역여건",
+    "07_비전전략",
+    "13_이행관리환류",
+}
 SEMANTIC_MATCH_MIN_JACCARD = 0.6
 CHAR_SIMILARITY_MIN_JACCARD = 0.30
 값필드 = {
@@ -49,7 +54,13 @@ CHAR_SIMILARITY_MIN_JACCARD = 0.30
     "03_배출현황_지역": ["배출유형", "부문", "세부부문", "연도"],
     "04_배출현황_관리권한": ["관리부문", "세부부문", "직간접구분", "연도"],
     "05_배출전망": ["시나리오", "부문", "연도"],
-    "06_감축목표": ["목표수준", "목표범위", "부문", "목표연도"],
+    "06_감축목표": [
+        "목표수준",
+        "목표범위",
+        "부문",
+        "기준연도",
+        "목표연도",
+    ],
     "07_비전전략": ["전략수준", "전략명"],
     "08_감축사업목록": ["관리번호"],
     "09_연차별이행계획": ["관리번호", "연도"],
@@ -169,9 +180,13 @@ def 키값(field_name: str, value: Any) -> str:
 
 def 키(row: 행, sheet_name: str, relaxed: bool) -> str | None:
     fields = 이차키.get(sheet_name) if relaxed else 일차키.get(sheet_name)
-    if sheet_name == "12_대응기반강화" and not relaxed:
-        task_id = 키값("과제ID", row.값.get("과제ID"))
-        fields = ["과제ID"] if task_id else ["대응기반영역", "과제명"]
+    if not relaxed:
+        if sheet_name == "08_감축사업목록":
+            project_id = 키값("관리번호", row.값.get("관리번호"))
+            fields = ["관리번호"] if project_id else ["부문", "사업명"]
+        elif sheet_name == "12_대응기반강화":
+            task_id = 키값("과제ID", row.값.get("과제ID"))
+            fields = ["과제ID"] if task_id else ["대응기반영역", "과제명"]
     if not fields:
         return None
     parts: list[str] = []

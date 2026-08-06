@@ -79,6 +79,7 @@ DePlot 방식처럼 그래프 이미지를 먼저 선형화된 표 데이터로 
 7. 막대/선의 값이 축 눈금만으로 추정된 값이면 fields에 {"estimated": true}를 넣고 confidence는 medium 이하로 두세요.
 8. 반드시 JSON만 반환하세요.
 9. 각 행의 fields에는 아래 시트별 필수 분류 필드를 이미지·캡션·주변 라벨에서 읽을 수 있을 때만 넣으세요. 확신이 없으면 그 필드를 생략하세요(추측 금지).
+   차트 제목·축 라벨·범례·캡션에 필수 분류 근거가 명시돼 있으면 해당 필드를 생략하지 말고 반드시 fields에 포함하세요.
 10. 감축목표 차트에서 막대·수치가 '감축량'인지 '목표배출량'인지 축·화살표·범례로 구분해 값역할에 명시하세요. 구분이 안 되면 값역할을 생략하세요.
 11. 항목명·범례명·부호·기간·단위는 이미지 원문을 그대로 보존하세요. 동의어나 축약어로 바꾸지 마세요.
 12. 하나의 정량값은 반드시 table의 한 행으로 분리하세요. BAU·감축량·감축률·신규·누계·예산을 fields 문자열 안에 묶지 마세요.
@@ -1054,6 +1055,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         reasons: list[str] | None = None,
         evidence_match: EvidenceMatch | None = None,
         defer_merge: bool = False,
+        inferred_kind: str | None = None,
     ):
         fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
         value_source = normalize_value_source(
@@ -1126,6 +1128,8 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         }
         if analysis.get("target_sheet") == "summary":
             evidence["대상시트근거"] = "재추론(summary)"
+        if inferred_kind in {"현황", "전망", "목표"}:
+            evidence["종류추론"] = inferred_kind
         text_results.setdefault("chart_observations", []).append(evidence)
 
     def _merge_image_results(
@@ -1162,6 +1166,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
                     merged_item = {**fields, **item}
                     can_merge, final_confidence, merge_reasons = self._chart_merge_decision(analysis, item, target_sheet)
+                    default_chart_kind = None
                     if can_merge and target_sheet in {"emissions_regional", "emissions_management"}:
                         if target_sheet == "emissions_regional":
                             sector = merged_item.get("부문") or merged_item.get("항목")
@@ -1175,6 +1180,18 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                         if _gas_sector_key(sector) in gas_sector_keys:
                             can_merge = False
                             merge_reasons = [*merge_reasons, "G3 부문에 가스종(스키마 불일치)"]
+                    if target_sheet in {
+                        "emissions_regional",
+                        "emissions_management",
+                        "emissions_forecast",
+                    }:
+                        default_chart_kind = _infer_chart_kind(item, analysis)
+                        if default_chart_kind == "목표":
+                            can_merge = False
+                            merge_reasons = [
+                                *merge_reasons,
+                                "종류=목표 — 06 시각 차단 정책",
+                            ]
                     # 객체 인벤토리가 연결된 운영 경로에서는 ImageAgent가 본문 행을
                     # 선반영하지 않는다. 근거 ID를 붙인 후보를 Organizer의 단일 게이트로 넘긴다.
                     auto_merge = (
@@ -1187,6 +1204,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                         auto_merge, final_confidence, merge_reasons,
                         evidence_match=evidence_match,
                         defer_merge=strict_evidence,
+                        inferred_kind=default_chart_kind,
                     )
 
                     if not auto_merge:
@@ -1266,7 +1284,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     if numeric is None:
                         continue
 
-                    kind = _infer_chart_kind(item, analysis)
+                    kind = default_chart_kind or _infer_chart_kind(item, analysis)
                     # 차트가 배출유형을 명시했으면 존중하고, 없으면 None으로 둔다(현황은 직접배출 기본).
                     emit_type = item.get("배출유형")
                     if emit_type not in ("직접배출", "간접배출", "흡수원"):
@@ -1287,21 +1305,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                             "출처페이지": analysis.get("page_number"),
                         })
                     elif kind == "목표":
-                        existing_targets.append({
-                            "지자체명": municipality,
-                            "목표수준": "총괄" if label in ("합계", "총괄", "전체") else "부문",
-                            "목표범위": "지역전체",
-                            "부문": label,
-                            "기준연도": None,
-                            "기준배출량": None,
-                            "목표연도": year_int,
-                            "배출전망": None,
-                            "목표감축량": None,
-                            "목표배출량": numeric,
-                            "감축률": None,
-                            "출처페이지": analysis.get("page_number"),
-                            "데이터상태": "visual_only",
-                        })
+                        continue
                     else:
                         existing_ghg.append({
                             "지자체명": municipality,

@@ -149,6 +149,29 @@ def test_시각_라벨병합은_실스키마의_estimated_부재만으로_G1을_
     assert "G1 판독필드 없음" in details
 
 
+def test_시각_라벨병합은_종류추론_목표만_차단하고_현황은_기존대로_병합한다(monkeypatch) -> None:
+    # Given: 동일 스키마의 라벨 판독 중 목표와 현황 관찰값이 함께 들어오면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    목표 = _관리권한_관찰값(value=200.0)
+    목표["종류추론"] = "목표"
+    현황 = _관리권한_관찰값(value=100.0)
+    현황["종류추론"] = "현황"
+
+    # When: organizer가 라벨 병합 게이트를 적용하면
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [목표, 현황],
+    })
+
+    # Then: 목표 값은 차단 사유를 남기고 목표가 아닌 값만 병합한다.
+    assert [row["배출량"] for row in cleaned["emissions_management"]] == [100.0]
+    assert any(
+        issue.get("항목") == "차단"
+        and "G4 종류=목표 — 감축 경로표 값" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
+
+
 @pytest.mark.parametrize(
     ("title", "expected_count", "expected_status"),
     [

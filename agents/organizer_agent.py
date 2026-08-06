@@ -102,6 +102,24 @@ _FORECAST_METHOD_MAP = {
     "ENPEP": "bottom_up_simulation_ENPEP",
 }
 
+_FORECAST_SCENARIO_MAP = {
+    "추가조치": "추가조치",
+    "추가 조치": "추가조치",
+    "추가대책": "추가조치",
+    "추가 대책": "추가조치",
+    "BAU 대비": "정책반영",
+    "BAU대비": "정책반영",
+    "정책반영": "정책반영",
+    "정책 반영": "정책반영",
+    "현행추세": "BAU",
+    "현행 추세": "BAU",
+    "감축": "정책반영",
+    "목표": "정책반영",
+    "정책": "정책반영",
+    "전망": "BAU",
+    "BAU": "BAU",
+}
+
 _MANAGEMENT_ENERGY_SOURCE_TERMS = {"전력", "열", "에너지"}
 _GUIDELINE_INVENTORY_SECTORS = (
     "에너지",
@@ -457,9 +475,133 @@ def _row_source_pages(row: dict) -> set[int]:
     return {int(part) for part in normalized.split(",") if part.isdigit()}
 
 
+def _raw_row_source_pages(row: dict) -> set[int]:
+    normalized = _normalize_provenance_pages([
+        row.get("출처페이지"),
+        row.get("출처페이지추정"),
+    ])
+    if not normalized:
+        return set()
+    return {int(part) for part in normalized.split(",") if part.isdigit()}
+
+
+def _card_context_pages(raw_data: dict) -> set[int]:
+    pages: set[int] = set()
+    for sheet_key in (
+        "mitigation_projects",
+        "annual_implementation",
+        "quantitative_reductions",
+    ):
+        rows = raw_data.get(sheet_key, [])
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict):
+                pages.update(_raw_row_source_pages(row))
+    return pages
+
+
+def _years_in_consecutive_runs(
+    years: set[int],
+    minimum_length: int = 4,
+) -> set[int]:
+    qualifying: set[int] = set()
+    run: list[int] = []
+    for year in sorted(years):
+        if run and year != run[-1] + 1:
+            if len(run) >= minimum_length:
+                qualifying.update(run)
+            run = []
+        run.append(year)
+    if len(run) >= minimum_length:
+        qualifying.update(run)
+    return qualifying
+
+
+def _retag_reduction_target_rows(
+    rows: list[dict],
+    municipality: str,
+    card_pages: set[int],
+) -> list[dict]:
+    """06 원행을 dedup 전에 사업카드·연차경로 키로 분리한다."""
+    for row in rows:
+        pages = _raw_row_source_pages(row)
+        target_level = str(row.get("목표수준", "") or "").strip()
+        if pages and pages.issubset(card_pages) and target_level in {"총괄", "부문"}:
+            row.setdefault("_재태깅이전목표수준", target_level)
+            row["목표수준"] = "세부사업"
+            row["_재태깅사유"] = "사업문맥페이지"
+
+    groups: dict[tuple[str, str, str, str], list[tuple[dict, int]]] = {}
+    for row in rows:
+        year = _to_int(row.get("목표연도"))
+        if year is None:
+            continue
+        page_key = _normalize_provenance_pages([
+            row.get("출처페이지"),
+            row.get("출처페이지추정"),
+        ])
+        key = (
+            page_key,
+            _dedup_key_text(row.get("목표수준")),
+            _dedup_key_text(row.get("목표범위")),
+            _dedup_key_text(row.get("부문")),
+        )
+        groups.setdefault(key, []).append((row, year))
+
+    for group_rows in groups.values():
+        run_years = _years_in_consecutive_runs({year for _row, year in group_rows})
+        if not run_years:
+            continue
+        for row, year in group_rows:
+            if year not in run_years:
+                continue
+            row.setdefault("_재태깅이전목표수준", row.get("목표수준"))
+            row["목표수준"] = "연차경로"
+            row["_재태깅사유"] = "연차시퀀스"
+
+    retagged_count = 0
+    for index, row in enumerate(rows, start=1):
+        reason = str(row.get("_재태깅사유", "") or "").strip()
+        if not reason:
+            continue
+        retagged_count += 1
+        pages = _normalize_provenance_pages([
+            row.get("출처페이지"),
+            row.get("출처페이지추정"),
+        ]) or "미상"
+        _remember_validation_issue(
+            municipality,
+            "정보",
+            _sheet_area("reduction_targets"),
+            f"목표수준 재태깅(06 원행 {index})",
+            f"출처페이지 {pages}; "
+            f"{row.get('_재태깅이전목표수준') or '빈 값'}→{row.get('목표수준')}; "
+            f"사유 {reason}",
+            "원문 표가 사업 카드 또는 연차별 감축 경로인지 확인",
+            target_sheet_key="reduction_targets",
+        )
+    print(f"[에이전트3 정리] 06_감축목표 재태깅 {retagged_count}건")
+    return rows
+
+
 def _dedup_key_text(val: Any) -> str:
     """dedup 키 생성 전용 텍스트 정규화. 원본 셀 값은 바꾸지 않는다."""
     return normalise_key_text(val).replace(" ", "")
+
+
+def _reduction_target_project_hint_key(row: dict) -> str:
+    if _dedup_key_text(row.get("목표수준")) != "세부사업":
+        return ""
+    return _dedup_key_text(row.get("_사업명힌트"))
+
+
+def _dedup_key(row: dict, key_fields: list[str]) -> tuple:
+    key = tuple(_dedup_key_text(row.get(field)) for field in key_fields)
+    if tuple(key_fields) != tuple(_REDUCTION_TARGET_KEY_FIELDS):
+        return key
+    project_hint = _reduction_target_project_hint_key(row)
+    return (*key, project_hint) if project_hint else key
 
 
 def _visual_key_text(val: Any) -> str:
@@ -872,9 +1014,17 @@ def _strip_dedup_internal_fields(rows: list[dict]) -> list[dict]:
 
 
 def _same_except_field(left: dict, right: dict, key_fields: list[str], blank_field: str) -> bool:
-    return all(
+    same_base_key = all(
         field == blank_field or _dedup_key_text(left.get(field)) == _dedup_key_text(right.get(field))
         for field in key_fields
+    )
+    if not same_base_key:
+        return False
+    if tuple(key_fields) != tuple(_REDUCTION_TARGET_KEY_FIELDS):
+        return True
+    return (
+        _reduction_target_project_hint_key(left)
+        == _reduction_target_project_hint_key(right)
     )
 
 
@@ -919,7 +1069,7 @@ def _deduplicate_rows(rows: list[dict], key_fields: list[str]) -> list[dict]:
         row = _normalize_row_provenance(dict(source_row))
         row[_DEDUP_TABLE_MARKER_FIELD] = _source_has_table_marker(source_row)
         _apply_row_data_status(row)
-        key = tuple(_dedup_key_text(row.get(f)) for f in key_fields)
+        key = _dedup_key(row, key_fields)
         if key not in seen:
             seen[key] = row
             continue
@@ -1026,6 +1176,22 @@ def _clean_emissions_management(rows: list[dict], municipality: str) -> list[dic
 def _clean_emissions_forecast(rows: list[dict], municipality: str) -> list[dict]:
     for row in rows:
         row["지자체명"] = row.get("지자체명") or municipality
+        scenario_raw = str(row.get("시나리오", "") or "").strip()
+        normalized_scenario = scenario_raw
+        for keyword, scenario in sorted(
+            _FORECAST_SCENARIO_MAP.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
+            if keyword.casefold() in scenario_raw.casefold():
+                normalized_scenario = scenario
+                break
+        row["시나리오"] = normalized_scenario
+        if (
+            normalized_scenario != scenario_raw
+            and not _has_cell_value(row.get("전망방법원문"))
+        ):
+            row["전망방법원문"] = scenario_raw
         row["연도"] = _to_int(row.get("연도"))
         row["전망값"] = _to_float(row.get("전망값"))
         row["단위"] = _normalize_co2_unit(row.get("단위", ""))
@@ -1041,6 +1207,10 @@ def _clean_emissions_forecast(rows: list[dict], municipality: str) -> list[dict]
 
 def _clean_reduction_targets(rows: list[dict], municipality: str) -> list[dict]:
     for row in rows:
+        if "사업명힌트" in row:
+            project_hint = row.pop("사업명힌트")
+            if _has_cell_value(project_hint):
+                row["_사업명힌트"] = str(project_hint).strip()
         row["지자체명"] = row.get("지자체명") or municipality
         row["부문"] = _normalise_sector_with_raw(row, "부문", "부문원문")
         row["기준연도"] = _to_int(row.get("기준연도"))
@@ -1051,6 +1221,86 @@ def _clean_reduction_targets(rows: list[dict], municipality: str) -> list[dict]:
         row["목표배출량"] = _to_float(row.get("목표배출량"))
         row["감축률"] = _to_float(row.get("감축률"))
     return _deduplicate_rows(rows, _REDUCTION_TARGET_KEY_FIELDS)
+
+
+def _target_value_fields_within_tolerance(left: dict, right: dict) -> list[str]:
+    matching: list[str] = []
+    for field in ("목표감축량", "목표배출량"):
+        left_value = _to_float(left.get(field))
+        right_value = _to_float(right.get(field))
+        if left_value is None or right_value is None:
+            continue
+        scale = max(abs(left_value), abs(right_value), 1.0)
+        if abs(left_value - right_value) / scale <= 0.005:
+            matching.append(field)
+    return matching
+
+
+def _is_overall_reduction_target(row: dict) -> bool:
+    return (
+        str(row.get("목표수준", "") or "").strip() == "총괄"
+        and str(row.get("부문", "") or "").strip() in {"", "합계", "전체"}
+    )
+
+
+def _absorb_suspected_target_scope_mixture(
+    rows: list[dict],
+    municipality: str,
+) -> list[dict]:
+    """값이 같은 지역전체 총괄 오분류를 관리권한 총괄 행에 흡수한다."""
+    management_rows = [
+        row
+        for row in rows
+        if _is_overall_reduction_target(row)
+        and str(row.get("목표범위", "") or "").strip() == "관리권한"
+        and (
+            _has_cell_value(row.get("감축률"))
+            or _has_cell_value(row.get("목표배출량"))
+        )
+    ]
+    absorbed_ids: set[int] = set()
+    events: list[tuple[dict, dict, list[str]]] = []
+    for regional in rows:
+        if not _is_overall_reduction_target(regional):
+            continue
+        if str(regional.get("목표범위", "") or "").strip() != "지역전체":
+            continue
+        for management in management_rows:
+            if regional.get("목표연도") != management.get("목표연도"):
+                continue
+            matching_fields = _target_value_fields_within_tolerance(
+                regional,
+                management,
+            )
+            if not matching_fields:
+                continue
+            management["출처페이지"] = _merge_provenance(
+                management.get("출처페이지"),
+                regional.get("출처페이지"),
+            )
+            absorbed_ids.add(id(regional))
+            events.append((regional, management, matching_fields))
+            break
+
+    retained = [row for row in rows if id(row) not in absorbed_ids]
+    for regional, management, matching_fields in events:
+        target_row_number = retained.index(management) + 1
+        regional_pages = (
+            _normalize_provenance_pages(regional.get("출처페이지")) or "미상"
+        )
+        _remember_validation_issue(
+            municipality,
+            "경고",
+            _sheet_area("reduction_targets"),
+            f"목표범위혼입의심(06 행 {target_row_number})",
+            f"목표연도 {management.get('목표연도')}; "
+            f"지역전체 출처페이지 {regional_pages}; 관리권한 행과 "
+            f"{', '.join(matching_fields)} 값이 0.5% 이내여서 흡수",
+            "지역전체 목표가 별도로 존재하는지 원문 구조표를 확인",
+            target_sheet_key="reduction_targets",
+            target_row_number=target_row_number,
+        )
+    return retained
 
 
 def _clean_vision_strategy(rows: list[dict], municipality: str) -> list[dict]:
@@ -1963,6 +2213,8 @@ def _apply_visual_labeled_merge(
         reference_observation = _is_reference_visual_observation(observation)
         if reference_observation:
             blockers.append("G4 참고자료/사례 판정")
+        if str(observation.get("종류추론", "") or "").strip() == "목표":
+            blockers.append("G4 종류=목표 — 감축 경로표 값")
 
         candidate = None
         key_fields = _VISUAL_MERGE_KEY_FIELDS.get(sheet_key)
@@ -2689,13 +2941,25 @@ class OrganizerAgent:
         _RECORDED_VALIDATION_ISSUES.clear()
         raw_counts: dict[str, int] = {}
         cleaned: dict = {"municipality_name": municipality}
+        card_pages = _card_context_pages(raw_data)
         for sheet_key, cleaner in _CLEANERS.items():
             rows = raw_data.get(sheet_key, [])
             if not isinstance(rows, list):
                 rows = []
             rows = [dict(r) for r in rows if isinstance(r, dict)]
             raw_counts[sheet_key] = len(rows)
+            if sheet_key == "reduction_targets":
+                rows = _retag_reduction_target_rows(
+                    rows,
+                    municipality,
+                    card_pages,
+                )
             cleaned_rows = cleaner(rows, municipality)
+            if sheet_key == "reduction_targets":
+                cleaned_rows = _absorb_suspected_target_scope_mixture(
+                    cleaned_rows,
+                    municipality,
+                )
             _restore_visual_fill_placeholders(
                 sheet_key,
                 rows,

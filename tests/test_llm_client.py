@@ -17,6 +17,7 @@ class LLMClientTests(unittest.TestCase):
                 "CODEX_COMMAND",
                 "CLAUDE_COMMAND",
                 "LOCAL_AGENT_MODEL",
+                "CODEX_TEXT_MODEL",
                 "CODEX_VISION_MODEL",
                 "LOCAL_AGENT_TIMEOUT",
                 "GEMINI_API_KEY",
@@ -281,17 +282,18 @@ class LLMClientTests(unittest.TestCase):
 
         self.assertEqual(parsed["model"], "gpt-테스트모델")
 
-    def test_codex_텍스트호출은_vision_기본모델의_영향을_받지_않는다(self):
+    def test_codex_텍스트호출은_텍스트_기본모델을_지정한다(self):
         with tempfile.TemporaryDirectory() as tmp:
             llm_client.config.LLM_PROVIDER = "codex"
             llm_client.config.CODEX_COMMAND = self._fake_codex_command(Path(tmp))
             llm_client.config.LOCAL_AGENT_TIMEOUT = 5
             llm_client.config.LOCAL_AGENT_MODEL = ""
+            llm_client.config.CODEX_TEXT_MODEL = "gpt-5.6-luna"
 
             raw = llm_client.call_text('{"answer": true}', system="system", max_retries=1, stage="extraction")
             parsed = llm_client.parse_json(raw)
 
-        self.assertEqual(parsed["model"], "")
+        self.assertEqual(parsed["model"], "gpt-5.6-luna")
 
 
     def test_call_text_reuses_identical_successful_response_from_cache(self):
