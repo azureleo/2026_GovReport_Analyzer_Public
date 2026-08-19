@@ -557,6 +557,11 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 | `GUIDELINE_STRUCTURED_INJECTION` | `True` | 가이드라인 구조적 주입. `0`이면 기존 스니펫 방식 |
 | `GUIDELINE_PROMPT_MAX_CHARS` | `3000` | 시트당 가이드라인 주입 상한(섹션 경계 절단) |
 | `STAGE_PROVIDER_*` / `STAGE_MODEL_*` | 빈 값 | 추출·비전·보완·검수 단계별 백엔드/모델 오버라이드 |
+| `LLM_CAPACITY_CIRCUIT_ENABLED` | `True` | 명시적인 model-at-capacity 응답 후 같은 모델의 호출 폭주 차단 |
+| `LLM_CAPACITY_FAILURE_THRESHOLD` | `1` | capacity 회로를 여는 연속 오류 수 |
+| `LLM_CAPACITY_COOLDOWN_SECONDS` | `120` | 원 모델을 다시 시험하기 전 차단 시간 |
+| `LLM_CAPACITY_FALLBACK_MODEL` | 빈 값 | 단계별 값이 없을 때 사용하는 공통 대체 모델 |
+| `STAGE_FALLBACK_MODEL_*` | 빈 값 | capacity 시에만 사용하는 단계별 대체 모델. 빈 값이면 자동 전환하지 않음 |
 | `HYBRID_REVIEW_TARGETED` | `True` | 보조검수를 검증리포트 경고·충돌 행 타깃으로 한정 |
 | `DATA_STATUS_ENABLED` | `True` | 데이터 시트에 `데이터상태` 컬럼 추가 |
 | `CODEBOOK_SHEET_ENABLED` | `True` | `90_코드북` 시트 생성 |

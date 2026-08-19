@@ -240,6 +240,21 @@ STAGE_MODELS = {
     "review": os.environ.get("STAGE_MODEL_REVIEW", "").strip(),
 }
 
+# 로컬 에이전트가 명시적으로 "model at capacity"를 반환하면 같은 모델에 대한
+# 후속 호출을 잠시 차단한다. 대체 모델은 단계별로 명시한 경우에만 사용해, 기본
+# 실행의 모델·정확도 계약이 조용히 바뀌지 않게 한다.
+LLM_CAPACITY_CIRCUIT_ENABLED = _env_bool("LLM_CAPACITY_CIRCUIT_ENABLED", True)
+LLM_CAPACITY_FAILURE_THRESHOLD = _env_int("LLM_CAPACITY_FAILURE_THRESHOLD", 1)
+LLM_CAPACITY_COOLDOWN_SECONDS = _env_int("LLM_CAPACITY_COOLDOWN_SECONDS", 120)
+LLM_CAPACITY_FALLBACK_ENABLED = _env_bool("LLM_CAPACITY_FALLBACK_ENABLED", True)
+LLM_CAPACITY_FALLBACK_MODEL = os.environ.get("LLM_CAPACITY_FALLBACK_MODEL", "").strip()
+STAGE_FALLBACK_MODELS = {
+    "extraction": os.environ.get("STAGE_FALLBACK_MODEL_EXTRACTION", "").strip(),
+    "vision": os.environ.get("STAGE_FALLBACK_MODEL_VISION", "").strip(),
+    "gap_fill": os.environ.get("STAGE_FALLBACK_MODEL_GAP_FILL", "").strip(),
+    "review": os.environ.get("STAGE_FALLBACK_MODEL_REVIEW", "").strip(),
+}
+
 # GPT-Mini/OpenAI 기본본 + Gemini 타깃 검수 구조.
 # 기본값은 비용/시간 보호를 위해 비활성이고, 테스트 시 --hybrid-review 또는
 # HYBRID_REVIEW_ENABLED=1로 켠다. 검수 결과는 자동 병합하지 않고 별도 후보 시트에 남긴다.

@@ -290,6 +290,15 @@ class Supervisor:
                 f"타임아웃 {llm_stats.get('timeouts', 0)}), "
                 f"quota 대기 누적 {_fmt_seconds(float(wait_seconds))}"
             )
+            if llm_stats.get("capacity_errors", 0) or llm_stats.get("capacity_circuit_rejected", 0):
+                self._log(
+                    "  - 모델 과부하: "
+                    f"감지 {llm_stats.get('capacity_errors', 0)}, "
+                    f"회로 개방 {llm_stats.get('capacity_circuit_opened', 0)}, "
+                    f"차단 {llm_stats.get('capacity_circuit_rejected', 0)}, "
+                    f"fallback {llm_stats.get('capacity_fallback_successes', 0)}/"
+                    f"{llm_stats.get('capacity_fallback_calls', 0)} 성공"
+                )
             call_seconds = sum(
                 float(value) for value in llm_stats.get("call_seconds", {}).values()
             )
@@ -978,11 +987,11 @@ class Supervisor:
                 )
             self._quality_assessment_for_review = quality_assessment
             review = self._llm_quality_review(final_data)
-        except llm_client.LLMQuotaExceededError as exc:
+        except (llm_client.LLMQuotaExceededError, llm_client.LLMCapacityError) as exc:
             elapsed = time.time() - t0
             self._add_timing("LLM 최종 검수", elapsed)
-            logger.warning("저장 후 LLM 최종 검수 quota/한도 문제로 생략: %s", exc)
-            self._log(f"한도 초과로 최종 검수는 생략했습니다. 결과 파일은 저장되어 있습니다: {result_path}")
+            logger.warning("저장 후 LLM 최종 검수 capacity/quota 문제로 생략: %s", exc)
+            self._log(f"모델 과부하 또는 한도 초과로 최종 검수는 생략했습니다. 결과 파일은 저장되어 있습니다: {result_path}")
         else:
             elapsed = time.time() - t0
             self._add_timing("LLM 최종 검수", elapsed)

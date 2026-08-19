@@ -252,3 +252,13 @@ def cached_response(request: LLMCacheRequest, producer: Callable[[], str]) -> st
         return response
 
     return _singleflight(request, load_or_produce)
+
+
+def cached_response_if_present(request: LLMCacheRequest) -> str | None:
+    """회로 차단 중에도 이미 성공한 원 모델 캐시는 우선 재사용한다."""
+    if not _is_enabled():
+        return None
+    cached = _read_response(request)
+    if cached is not None:
+        _bump_stat("hit")
+    return cached

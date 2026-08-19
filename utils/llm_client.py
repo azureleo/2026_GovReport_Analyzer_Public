@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import config
-from utils.llm_cache import LLMCacheRequest, cached_response
+from utils.llm_cache import LLMCacheRequest, cached_response, cached_response_if_present
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +53,10 @@ class LLMTimeoutError(LLMCallError):
     """로컬 에이전트가 제한 시간 안에 응답하지 못한 실패."""
 
 
+class LLMCapacityError(LLMCallError):
+    """선택한 모델이 일시적인 수용량 한도에 도달한 실패."""
+
+
 _QUOTA_ERROR_MARKERS = (
     "session limit",
     "you've hit your session limit",
@@ -65,6 +69,14 @@ _QUOTA_ERROR_MARKERS = (
     "429",
     "한도",
     "할당량",
+)
+
+
+_CAPACITY_ERROR_MARKERS = (
+    "selected model is at capacity",
+    "model is at capacity",
+    "model capacity is temporarily unavailable",
+    "model overloaded",
 )
 
 
@@ -104,7 +116,17 @@ _LLM_STATS = {
     "retries": 0,
     "quota_wait_seconds": 0.0,
     "timeouts": 0,
+    "capacity_errors": 0,
+    "capacity_circuit_opened": 0,
+    "capacity_circuit_rejected": 0,
+    "capacity_fallback_calls": 0,
+    "capacity_fallback_successes": 0,
+    "capacity_fallback_failures": 0,
+    "capacity_fallbacks": {},
 }
+
+_CAPACITY_CIRCUIT_LOCK = threading.Lock()
+_CAPACITY_CIRCUITS: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 
 def reset_llm_stats() -> None:
@@ -120,6 +142,14 @@ def reset_llm_stats() -> None:
         _LLM_STATS["retries"] = 0
         _LLM_STATS["quota_wait_seconds"] = 0.0
         _LLM_STATS["timeouts"] = 0
+        _LLM_STATS["capacity_errors"] = 0
+        _LLM_STATS["capacity_circuit_opened"] = 0
+        _LLM_STATS["capacity_circuit_rejected"] = 0
+        _LLM_STATS["capacity_fallback_calls"] = 0
+        _LLM_STATS["capacity_fallback_successes"] = 0
+        _LLM_STATS["capacity_fallback_failures"] = 0
+        _LLM_STATS["capacity_fallbacks"] = {}
+    _reset_capacity_circuits()
 
 
 def get_llm_stats() -> dict[str, Any]:
@@ -144,6 +174,13 @@ def get_llm_stats() -> dict[str, Any]:
             "retries": int(_LLM_STATS["retries"]),
             "quota_wait_seconds": float(_LLM_STATS["quota_wait_seconds"]),
             "timeouts": int(_LLM_STATS["timeouts"]),
+            "capacity_errors": int(_LLM_STATS["capacity_errors"]),
+            "capacity_circuit_opened": int(_LLM_STATS["capacity_circuit_opened"]),
+            "capacity_circuit_rejected": int(_LLM_STATS["capacity_circuit_rejected"]),
+            "capacity_fallback_calls": int(_LLM_STATS["capacity_fallback_calls"]),
+            "capacity_fallback_successes": int(_LLM_STATS["capacity_fallback_successes"]),
+            "capacity_fallback_failures": int(_LLM_STATS["capacity_fallback_failures"]),
+            "capacity_fallbacks": dict(_LLM_STATS["capacity_fallbacks"]),
         }
 
 
@@ -155,6 +192,14 @@ def _inc_stat(name: str, amount: int = 1) -> None:
 def _add_wait_seconds(seconds: float) -> None:
     with _LLM_STATS_LOCK:
         _LLM_STATS["quota_wait_seconds"] = float(_LLM_STATS["quota_wait_seconds"]) + seconds
+
+
+def _record_capacity_fallback(stage: str | None, primary: str, fallback: str) -> None:
+    key = f"{stage or 'default'}:{primary or 'default'}->{fallback or 'default'}"
+    with _LLM_STATS_LOCK:
+        values = dict(_LLM_STATS["capacity_fallbacks"])
+        values[key] = int(values.get(key, 0)) + 1
+        _LLM_STATS["capacity_fallbacks"] = values
 
 
 def _record_call(
@@ -315,6 +360,11 @@ def _is_quota_error_message(message: str) -> bool:
     return any(marker in normalized for marker in _QUOTA_ERROR_MARKERS)
 
 
+def _is_capacity_error_message(message: str) -> bool:
+    normalized = message.casefold()
+    return any(marker in normalized for marker in _CAPACITY_ERROR_MARKERS)
+
+
 def _is_transient_error_message(message: str) -> bool:
     normalized = message.casefold()
     return any(marker in normalized for marker in _TRANSIENT_ERROR_MARKERS)
@@ -327,6 +377,102 @@ def _is_openai_quota_error_message(message: str) -> bool:
 
 def _stage_model(stage: str | None) -> str:
     return _stage_config_value("STAGE_MODELS", stage)
+
+
+def _stage_fallback_model(stage: str | None) -> str:
+    if not getattr(config, "LLM_CAPACITY_FALLBACK_ENABLED", True):
+        return ""
+    return _stage_config_value("STAGE_FALLBACK_MODELS", stage) or str(
+        getattr(config, "LLM_CAPACITY_FALLBACK_MODEL", "") or ""
+    ).strip()
+
+
+def _reset_capacity_circuits() -> None:
+    with _CAPACITY_CIRCUIT_LOCK:
+        _CAPACITY_CIRCUITS.clear()
+
+
+def _capacity_key(provider: str, model: str, stage: str | None) -> tuple[str, str, str]:
+    return provider, model or "default", stage or "default"
+
+
+def _capacity_select_model(
+    provider: str,
+    primary_model: str,
+    stage: str | None,
+) -> tuple[str, bool]:
+    """열린 회로에서는 fallback을 선택하고, 없으면 추가 호출을 즉시 차단한다."""
+    if not getattr(config, "LLM_CAPACITY_CIRCUIT_ENABLED", True):
+        return primary_model, False
+
+    key = _capacity_key(provider, primary_model, stage)
+    now = time.monotonic()
+    with _CAPACITY_CIRCUIT_LOCK:
+        state = _CAPACITY_CIRCUITS.get(key)
+        if not state:
+            return primary_model, False
+        open_until = float(state.get("open_until", 0.0))
+        if open_until <= now:
+            # 반개방 상태에서는 한 호출만 원 모델을 시험하고 나머지는 우회/차단한다.
+            if not state.get("probe_in_flight"):
+                state["probe_in_flight"] = True
+                return primary_model, True
+        fallback = _stage_fallback_model(stage)
+        if fallback and fallback != primary_model:
+            _inc_stat("capacity_fallback_calls")
+            _record_capacity_fallback(stage, primary_model, fallback)
+            return fallback, False
+        remaining = max(0, int(open_until - now + 0.999))
+
+    _inc_stat("capacity_circuit_rejected")
+    raise LLMCapacityError(
+        f"{provider} 모델 {primary_model or 'default'} capacity 회로가 열려 있습니다"
+        f" (약 {remaining}초 후 재시도)"
+    )
+
+
+def _capacity_record_failure(provider: str, model: str, stage: str | None) -> None:
+    _inc_stat("capacity_errors")
+    if not getattr(config, "LLM_CAPACITY_CIRCUIT_ENABLED", True):
+        return
+    threshold = max(1, int(getattr(config, "LLM_CAPACITY_FAILURE_THRESHOLD", 1)))
+    cooldown = max(1, int(getattr(config, "LLM_CAPACITY_COOLDOWN_SECONDS", 120)))
+    key = _capacity_key(provider, model, stage)
+    opened = False
+    with _CAPACITY_CIRCUIT_LOCK:
+        state = _CAPACITY_CIRCUITS.setdefault(
+            key,
+            {"failures": 0, "open_until": 0.0, "probe_in_flight": False},
+        )
+        state["failures"] = int(state.get("failures", 0)) + 1
+        state["probe_in_flight"] = False
+        if state["failures"] >= threshold:
+            state["open_until"] = time.monotonic() + cooldown
+            opened = True
+    if opened:
+        _inc_stat("capacity_circuit_opened")
+        logger.warning(
+            "%s 모델 %s capacity 회로 개방: %s초 동안 원 모델 호출 차단",
+            provider,
+            model or "default",
+            cooldown,
+        )
+
+
+def _capacity_record_success(provider: str, model: str, stage: str | None) -> None:
+    if not getattr(config, "LLM_CAPACITY_CIRCUIT_ENABLED", True):
+        return
+    key = _capacity_key(provider, model, stage)
+    with _CAPACITY_CIRCUIT_LOCK:
+        _CAPACITY_CIRCUITS.pop(key, None)
+
+
+def _capacity_release_probe(provider: str, model: str, stage: str | None) -> None:
+    key = _capacity_key(provider, model, stage)
+    with _CAPACITY_CIRCUIT_LOCK:
+        state = _CAPACITY_CIRCUITS.get(key)
+        if state:
+            state["probe_in_flight"] = False
 
 
 def _gemini_default_model(stage: str | None) -> str:
@@ -401,6 +547,8 @@ def _run_command(command: Sequence[str], prompt: str, *, cwd: Path, timeout: int
             f"STDERR:\n{_tail(completed.stderr)}\n"
             f"STDOUT:\n{_tail(completed.stdout)}"
         )
+        if _is_capacity_error_message(message):
+            raise LLMCapacityError(message)
         if _is_quota_error_message(message):
             raise LLMQuotaExceededError(message)
         raise LLMCallError(message)
@@ -495,6 +643,8 @@ def _run_claude(
     command += _claude_minimal_flags(paths)
     try:
         return _run_command(command, prompt, cwd=cwd, timeout=timeout)
+    except LLMCapacityError:
+        raise
     except LLMQuotaExceededError:
         raise
     except LLMCallError:
@@ -635,6 +785,10 @@ def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
             _inc_stat("retries")
             if wait:
                 time.sleep(wait)
+        except LLMCapacityError:
+            # 같은 모델에 대한 즉시 재시도는 과부하를 악화한다. 호출 상위의 회로
+            # 차단기가 fallback 전환 또는 부분 실패 격리를 결정한다.
+            raise
         except LLMQuotaExceededError as exc:
             if not getattr(config, "LLM_QUOTA_WAIT_ENABLED", True):
                 raise
@@ -664,6 +818,104 @@ def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
             logger.warning("%s 오류: %s. %s초 후 재시도 (%s/%s)", label, exc, wait, attempt, max_retries)
             _inc_stat("retries")
             time.sleep(wait)
+
+
+def _local_model_identity(provider: str, model: str) -> str:
+    if provider == "codex":
+        return ":".join([str(getattr(config, "CODEX_COMMAND", "codex")), model])
+    if provider == "claude":
+        return ":".join([str(getattr(config, "CLAUDE_COMMAND", "claude")), model])
+    return model
+
+
+def _call_local_with_capacity(
+    *,
+    kind: str,
+    provider: str,
+    stage: str | None,
+    primary_model: str,
+    prompt: str,
+    system: str,
+    max_retries: int,
+    images_b64: Sequence[str] = (),
+) -> str:
+    """모델별 capacity 회로와 캐시 키를 일치시키며 로컬 에이전트를 호출한다."""
+    tried_models: set[str] = set()
+    fallback_model = _stage_fallback_model(stage)
+    primary_request = LLMCacheRequest(
+        call_kind=kind,
+        provider=provider,
+        model=_local_model_identity(provider, primary_model),
+        system=system,
+        prompt=prompt,
+        images_b64=tuple(images_b64),
+    )
+    cached_primary = cached_response_if_present(primary_request)
+    if cached_primary is not None:
+        return cached_primary
+    while True:
+        selected_model, is_probe = _capacity_select_model(provider, primary_model, stage)
+        if selected_model in tried_models:
+            raise LLMCapacityError(
+                f"{provider} capacity fallback 후보를 모두 시도했습니다: "
+                f"{', '.join(sorted(tried_models))}"
+            )
+        tried_models.add(selected_model)
+        is_fallback = bool(selected_model != primary_model)
+        request = LLMCacheRequest(
+            call_kind=kind,
+            provider=provider,
+            model=_local_model_identity(provider, selected_model),
+            system=system,
+            prompt=prompt,
+            images_b64=tuple(images_b64),
+        )
+
+        try:
+            response = cached_response(
+                request,
+                lambda: _record_call(
+                    kind,
+                    provider,
+                    lambda: _retry_local_call(
+                        lambda: _call_local_agent(
+                            prompt,
+                            system,
+                            images_b64=images_b64,
+                            provider=provider,
+                            model=selected_model or None,
+                        ),
+                        max_retries=max_retries,
+                        label=(
+                            f"{provider} {kind} fallback({selected_model})"
+                            if is_fallback
+                            else f"{provider} {kind}"
+                        ),
+                    ),
+                    request=request,
+                    stage=stage,
+                ),
+            )
+        except LLMCapacityError:
+            _capacity_record_failure(provider, selected_model, stage)
+            if is_fallback:
+                _inc_stat("capacity_fallback_failures")
+                raise
+            if fallback_model and fallback_model != primary_model:
+                continue
+            raise
+        except Exception:
+            if is_probe:
+                _capacity_release_probe(provider, primary_model, stage)
+            if is_fallback:
+                _inc_stat("capacity_fallback_failures")
+            raise
+
+        if is_fallback:
+            _inc_stat("capacity_fallback_successes")
+        else:
+            _capacity_record_success(provider, primary_model, stage)
+        return response
 
 
 def call_text(
@@ -716,25 +968,17 @@ def call_text(
     local_model = stage_model
     if provider == "codex" and not local_model:
         local_model = _codex_default_model(stage)
+    if provider == "claude" and not local_model:
+        local_model = str(getattr(config, "LOCAL_AGENT_MODEL", "") or "").strip()
 
-    return cached_response(
-        request,
-        lambda: _record_call(
-            "text",
-            provider,
-            lambda: _retry_local_call(
-                lambda: _call_local_agent(
-                    prompt,
-                    system,
-                    provider=provider,
-                    model=local_model or None,
-                ),
-                max_retries=max_retries,
-                label=provider,
-            ),
-            request=request,
-            stage=stage,
-        ),
+    return _call_local_with_capacity(
+        kind="text",
+        provider=provider,
+        stage=stage,
+        primary_model=local_model,
+        prompt=prompt,
+        system=system,
+        max_retries=max_retries,
     )
 
 
@@ -788,25 +1032,20 @@ def call_vision(
             ),
         )
 
-    return cached_response(
-        request,
-        lambda: _record_call(
-            "vision",
-            provider,
-            lambda: _retry_local_call(
-                lambda: _call_local_agent(
-                    prompt,
-                    system,
-                    image_b64=image_b64,
-                    provider=provider,
-                    model=(stage_model or (_codex_default_model(stage) if provider == "codex" else "")) or None,
-                ),
-                max_retries=max_retries,
-                label=f"{provider} vision",
-            ),
-            request=request,
-            stage=stage,
-        ),
+    local_model = stage_model or (
+        _codex_default_model(stage)
+        if provider == "codex"
+        else str(getattr(config, "LOCAL_AGENT_MODEL", "") or "").strip()
+    )
+    return _call_local_with_capacity(
+        kind="vision",
+        provider=provider,
+        stage=stage,
+        primary_model=local_model,
+        prompt=prompt,
+        system=system,
+        max_retries=max_retries,
+        images_b64=(image_b64,),
     )
 
 
@@ -865,25 +1104,20 @@ def call_vision_batch(
             ),
         )
 
-    return cached_response(
-        request,
-        lambda: _record_call(
-            "vision_batch",
-            provider,
-            lambda: _retry_local_call(
-                lambda: _call_local_agent(
-                    prompt,
-                    system,
-                    images_b64=images_b64,
-                    provider=provider,
-                    model=(stage_model or (_codex_default_model(stage) if provider == "codex" else "")) or None,
-                ),
-                max_retries=max_retries,
-                label=f"{provider} vision batch",
-            ),
-            request=request,
-            stage=stage,
-        ),
+    local_model = stage_model or (
+        _codex_default_model(stage)
+        if provider == "codex"
+        else str(getattr(config, "LOCAL_AGENT_MODEL", "") or "").strip()
+    )
+    return _call_local_with_capacity(
+        kind="vision_batch",
+        provider=provider,
+        stage=stage,
+        primary_model=local_model,
+        prompt=prompt,
+        system=system,
+        max_retries=max_retries,
+        images_b64=images_b64,
     )
 
 
