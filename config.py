@@ -148,6 +148,26 @@ SEMANTIC_ROUTING_ALLOWED_SCORE_DELTA = _env_float(
 SEMANTIC_ROUTING_MAX_ALLOWED_TARGETS = _env_int(
     "SEMANTIC_ROUTING_MAX_ALLOWED_TARGETS", 3
 )
+# 06_감축목표의 세부사업·연차경로를 페이지 겹침만으로 재태깅하지 않고,
+# 근거 객체/캡션/섹션/사업 식별자/연도 구조를 함께 평가한다.
+# context: 새 분류기, legacy: v7-1 페이지·연속연도 규칙, off: 재태깅 없음.
+REDUCTION_TARGET_CONTEXT_MODE = os.environ.get(
+    "REDUCTION_TARGET_CONTEXT_MODE", "context"
+).strip().lower()
+if REDUCTION_TARGET_CONTEXT_MODE not in {"context", "legacy", "off"}:
+    REDUCTION_TARGET_CONTEXT_MODE = "context"
+REDUCTION_TARGET_CONTEXT_MIN_SCORE = _env_float(
+    "REDUCTION_TARGET_CONTEXT_MIN_SCORE", 6.0
+)
+REDUCTION_TARGET_CONTEXT_MIN_MARGIN = _env_float(
+    "REDUCTION_TARGET_CONTEXT_MIN_MARGIN", 2.0
+)
+REDUCTION_TARGET_CONTEXT_REVIEW_SCORE = _env_float(
+    "REDUCTION_TARGET_CONTEXT_REVIEW_SCORE", 4.0
+)
+REDUCTION_TARGET_CONTEXT_MIN_ANNUAL_RUN = _env_int(
+    "REDUCTION_TARGET_CONTEXT_MIN_ANNUAL_RUN", 4
+)
 QUALITY_THRESHOLD = _env_float("QUALITY_THRESHOLD", 70.0)
 QUALITY_MAX_WITHOUT_SOURCE_INVENTORY = _env_float("QUALITY_MAX_WITHOUT_SOURCE_INVENTORY", 95.0)
 
@@ -322,8 +342,9 @@ EXCEL_HEADERS = {
     ],
     "06_감축목표": [
         "지자체명", "목표수준", "목표범위", "부문",
-        "기준연도", "기준배출량", "목표연도", "배출전망",
-        "목표감축량", "목표배출량", "감축률(%)",
+        "기준연도", "기준배출량", "기준배출량기준",
+        "목표연도", "배출전망", "목표감축량", "목표배출량",
+        "목표배출량기준", "감축률(%)", "감축률계산값",
     ],
     "07_비전전략": [
         "지자체명", "비전문구", "전략수준", "전략명",
@@ -342,7 +363,8 @@ EXCEL_HEADERS = {
     "10_정량감축량": [
         "지자체명", "관리번호", "사업명", "연도",
         "모니터링인자", "활동량", "활동단위",
-        "감축원단위ID", "감축원단위값", "예상감축량", "단위",
+        "감축원단위ID", "감축원단위값", "예상감축량",
+        "감축량유형", "시간기준", "단위",
     ],
     "11_재정투자계획": [
         "지자체명", "계획구분", "부문", "사업명",
@@ -351,6 +373,9 @@ EXCEL_HEADERS = {
     "12_대응기반강화": [
         "지자체명", "대응기반영역", "과제ID", "과제명",
         "정책방향", "주요내용", "대상", "주관부서", "기간",
+        "평가유형", "기후변수", "시나리오", "기준기간", "미래기간",
+        "공간단위", "부문", "리스크항목", "취약성지표", "값", "단위",
+        "리스크등급", "방법론", "자료출처", "연계적응과제",
     ],
     "13_이행관리환류": [
         "지자체명", "거버넌스기구", "역할", "담당부서",
@@ -358,7 +383,8 @@ EXCEL_HEADERS = {
     ],
     "14_점검실적": [
         "지자체명", "점검연도", "부문", "관리번호", "사업명",
-        "연간계획", "이행실적", "소요예산", "달성여부", "사업유형",
+        "연간계획", "이행실적", "소요예산", "예산액", "예산유형",
+        "예산단위", "예산집행률", "달성여부", "사업유형",
     ],
     "15_변경과제_조치": [
         "지자체명", "점검연도", "부문", "관리번호", "사업명",
@@ -371,6 +397,8 @@ EXCEL_HEADERS = {
         "정규화값", "정규화단위", "정규화배율",
         "값근거", "값검증상태", "계약버전",
         "디지타이징필요", "관련시트",
+        "참고자료여부", "참고자료근거", "시각구조유형",
+        "음성재검증상태", "음성재검증근거", "자동병합정책",
         "근거ID", "근거매칭상태", "병합상태", "병합차단사유",
     ],
     "17_보조검수후보": [
@@ -396,6 +424,7 @@ EXCEL_HEADERS = {
         "연결행수", "검수메시지", "예상시트", "시트정합상태", "좌표",
         "원본신뢰도", "Triage판정", "Triage사유", "보완백엔드", "보완상태",
         "최종상태", "시도횟수", "종결사유", "근거ID",
+        "근거매칭단계", "일치근거ID", "평가분모상태", "Triage평가상태",
         "허용시트", "보조연결시트", "목차참조페이지", "중복객체ID",
     ],
     "90_코드북": [
@@ -471,13 +500,18 @@ OPTIONAL_EXCEL_SHEETS = {
 
 # 원문 객체 검증 단계에서만 사용하는 내부 원장. Excel 시트 행 수, 최종 LLM 요약,
 # 사용자용 작성 데이터 집계에는 포함하지 않는다.
-INTERNAL_OBJECT_KEYS = {"object_triage", "ocr_document_objects", "document_objects"}
+INTERNAL_OBJECT_KEYS = {
+    "object_triage", "ocr_document_objects", "document_objects",
+    "reduction_target_context",
+}
 
 # 행 단위 원문 대조를 위한 페이지 근거. 헤더에는 항상 맨 뒤에 추가하되,
 # 실제 엑셀 출력에서만 PROVENANCE_ENABLED=0으로 v3 스키마를 복원할 수 있다.
 PROVENANCE_ENABLED = _env_bool("PROVENANCE_ENABLED", True)
 _PROVENANCE_DATA_SHEETS = [name for name in EXCEL_HEADERS if name[:2].isdigit() and int(name[:2]) <= 15]
 for _sheet_name in _PROVENANCE_DATA_SHEETS:
+    if "derivation_type" not in EXCEL_HEADERS[_sheet_name]:
+        EXCEL_HEADERS[_sheet_name].append("derivation_type")
     if "근거ID" not in EXCEL_HEADERS[_sheet_name]:
         EXCEL_HEADERS[_sheet_name].append("근거ID")
     if "출처페이지" not in EXCEL_HEADERS[_sheet_name]:
@@ -585,6 +619,9 @@ ROUTE_STRONG_UBIQUITY_RATIO = _env_float("ROUTE_STRONG_UBIQUITY_RATIO", 0.6)
 # 순수하게 벽시계 시간만 줄인다(품질·토큰 변화 없음).
 # Gemini API/로컬 에이전트 동시성 한도를 고려해 보수적 기본값을 둔다.
 PARALLEL_PROCESSING_ENABLED = _env_bool("PARALLEL_PROCESSING_ENABLED", True)
+# 같은 시트 계약·페이지 집합·주입 프롬프트·payload인 텍스트 작업은 enqueue 전에 제거한다.
+# 서로 다른 시트나 복구 청크는 fingerprint가 달라 합쳐지지 않는다.
+TEXT_QUEUE_DEDUP_ENABLED = _env_bool("TEXT_QUEUE_DEDUP_ENABLED", True)
 # 텍스트 추출(extractor/gap_fill) 동시 호출 수.
 TEXT_WORKERS = _env_int("TEXT_WORKERS", 4)
 # 이미지 vision 동시 호출 수. vision은 호출당 페이로드가 커 보수적으로 둔다.
@@ -593,6 +630,9 @@ VISION_WORKERS = _env_int("VISION_WORKERS", 2)
 LLM_CACHE_ENABLED = _env_bool("LLM_CACHE_ENABLED", True)
 LLM_CACHE_DIR = os.environ.get("LLM_CACHE_DIR", ".cache/llm_responses").strip()
 LLM_CACHE_VERSION = os.environ.get("LLM_CACHE_VERSION", "carbon-report-llm-cache-v1").strip()
+# 병렬 작업에서 동일한 요청이 동시에 캐시 미스가 나도 실제 LLM 호출은 한 번만 수행한다.
+# 디스크 캐시를 끈 무캐시 실행에서도 동시에 겹친 요청만 공유하며 순차 요청은 재호출한다.
+LLM_SINGLEFLIGHT_ENABLED = _env_bool("LLM_SINGLEFLIGHT_ENABLED", True)
 
 # 이미지 분석 최대 개수. 기본값은 없음(=triage 통과 후보 전부 분석).
 # 테스트/디버그 때만 MAX_IMAGES=30처럼 명시적으로 제한한다.
@@ -616,6 +656,14 @@ VISION_RECOVERY_MAX_SPLIT_DEPTH = _env_int("VISION_RECOVERY_MAX_SPLIT_DEPTH", 6)
 # 루트 호출도 1회로 계산한다. 기본 7회는 최대 분할 깊이 6과 같은 상한이다.
 VISION_RECOVERY_MAX_OBJECT_ATTEMPTS = _env_int(
     "VISION_RECOVERY_MAX_OBJECT_ATTEMPTS", 7
+)
+# 강한 캡션·수치·단위 신호가 있는데도 비데이터로 판정된 객체만 전용 프롬프트로
+# 근거 ID당 한 번 재확인한다. 0은 실행 전체 객체 수 상한 없음이다.
+VISION_NEGATIVE_REVALIDATION_ENABLED = _env_bool(
+    "VISION_NEGATIVE_REVALIDATION_ENABLED", True
+)
+VISION_NEGATIVE_REVALIDATION_MAX_OBJECTS = _env_int(
+    "VISION_NEGATIVE_REVALIDATION_MAX_OBJECTS", 0
 )
 # 재개 실행에서 성공 체크포인트 전체를 버리지 않고, 지정한 근거 객체나
 # 페이지가 포함된 Vision 배치만 다시 판독한다. 새 결과는 같은 배치의 기존
@@ -642,8 +690,13 @@ IMAGE_CHART_REFERENCE_KEYWORDS = [
     "COP", "IPCC", "UN", "EU", "OECD", "사례", "동향", "목차",
     "우리나라", "국가 온실가스", "국가 감축목표", "중앙정부", "NDC",
 ]
-# True이면 참고자료/해외사례/목차성 페이지 이미지를 Vision 호출 전에 제외한다.
-IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT = True
+# 참고자료도 먼저 판독해 감사 가능한 관찰값을 남기고, 본문 시트 자동 병합만 차단한다.
+# False로 바꾸고 아래 레거시 제외를 켜면 P3 이전의 호출 전 필터 동작을 재현할 수 있다.
+IMAGE_REFERENCE_ANALYZE_THEN_BLOCK = _env_bool("IMAGE_REFERENCE_ANALYZE_THEN_BLOCK", True)
+# P3 이전 비교 실험용 레거시 설정. ocr_required 객체에는 적용되지 않는다.
+IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT = _env_bool(
+    "IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT", False
+)
 
 # ──────────────────────────────────────────────────────────────────────
 # 문서 객체 기반 선택적 OCR/VLM
@@ -658,6 +711,16 @@ OCR_NATIVE_CONFIDENCE_THRESHOLD = _env_float("OCR_NATIVE_CONFIDENCE_THRESHOLD", 
 OCR_COMPLEX_TABLE_ROWS = _env_int("OCR_COMPLEX_TABLE_ROWS", 45)
 OCR_COMPLEX_TABLE_COLUMNS = _env_int("OCR_COMPLEX_TABLE_COLUMNS", 12)
 OCR_RENDER_DPI = _env_int("OCR_RENDER_DPI", 200)
+# 한 실행 안에서 같은 페이지·좌표를 요구하는 물리 객체는 동일 PNG를 재사용한다.
+# 후보·프롬프트·판독 순서는 바뀌지 않고 PDF rasterization 비용만 제거한다.
+OCR_RENDER_CACHE_ENABLED = _env_bool("OCR_RENDER_CACHE_ENABLED", True)
+# 캡션만 검출된 객체는 페이지 전체 대신 인접 이미지·표·벡터 영역을 먼저 복원한다.
+OCR_SPATIAL_RECONSTRUCTION_ENABLED = _env_bool("OCR_SPATIAL_RECONSTRUCTION_ENABLED", True)
+OCR_FULL_PAGE_CONTEXT_ENABLED = _env_bool("OCR_FULL_PAGE_CONTEXT_ENABLED", True)
+OCR_MULTI_PANEL_GAP = _env_int("OCR_MULTI_PANEL_GAP", 24)
+OCR_CAPTION_REGION_MAX_HEIGHT_RATIO = _env_float(
+    "OCR_CAPTION_REGION_MAX_HEIGHT_RATIO", 0.45
+)
 
 # 1차 추출 후 빈칸이 큰 행만 좁은 문맥으로 다시 보완
 GAP_FILL_ENABLED = _env_bool("GAP_FILL_ENABLED", True)

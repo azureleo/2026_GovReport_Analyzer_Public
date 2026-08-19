@@ -34,16 +34,16 @@ class GapFillTriggerTests(unittest.TestCase):
         self.assertFalse(needs)
         self.assertEqual(reason, "")
 
-    def test_reduction_targets_backfills_when_2050_missing(self):
+    def test_reduction_targets_does_not_force_numeric_2050_row(self):
         # Given: 2030 목표만 존재하면
         cleaned = {"reduction_targets": [{"목표연도": 2030, "목표배출량": 10}]}
 
         # When: 목표연도 커버리지를 평가하면
         needs, reason = GapFillAgent()._needs_backfill("reduction_targets", cleaned)
 
-        # Then: 2050 누락을 이유로 보완한다.
-        self.assertTrue(needs)
-        self.assertIn("2050", reason)
+        # Then: 2050은 비전 탐색 대상일 뿐 정량 목표 행을 강제하지 않는다.
+        self.assertFalse(needs)
+        self.assertEqual(reason, "")
 
     def test_relevant_pages_require_strong_keyword(self):
         # Given: weak 키워드만 있는 페이지와 strong 키워드가 있는 페이지

@@ -2,13 +2,38 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import unicodedata
 from typing import Any, Sequence
 
 
-VISUAL_CONTRACT_VERSION = 3
+VISUAL_CONTRACT_VERSION = 4
+
+VISUAL_CHART_TYPES = frozenset({
+    "막대", "꺾은선", "영역", "원", "표", "복합", "기타",
+    "diagram", "infographic", "flow", "strategy_map", "risk_map", "risk_matrix",
+})
+STRUCTURED_VISUAL_TYPES = frozenset({
+    "diagram", "infographic", "flow", "strategy_map", "risk_map", "risk_matrix",
+})
+VISUAL_TARGET_SHEETS = frozenset({
+    "regional_conditions",
+    "emissions_regional",
+    "emissions_management",
+    "emissions_forecast",
+    "reduction_targets",
+    "vision_strategy",
+    "mitigation_projects",
+    "financial_plan",
+    "foundation_measures",
+    "other",
+})
+
+
+def is_structured_visual_type(value: Any) -> bool:
+    return str(value or "").strip().casefold() in STRUCTURED_VISUAL_TYPES
 
 _RANGE_RE = re.compile(r"(?:\d{1,4}\s*(?:~|〜|–|—)\s*\d{1,4})")
 _NUMBER_RE = re.compile(r"[-+−]?\s*\d[\d,]*(?:\.\d+)?")
@@ -372,15 +397,29 @@ def normalize_visual_table_rows(
         normalized.extend(generated)
 
     deduplicated: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, str, str]] = set()
+    seen: set[tuple[str, ...]] = set()
     for row in normalized:
         fields = row.get("fields") if isinstance(row.get("fields"), dict) else {}
+        structural_key = json.dumps(
+            {
+                key: fields.get(key)
+                for key in (
+                    "구조역할", "상위항목", "관계", "순서", "단계",
+                    "담당주체", "노드ID", "연결노드ID", "설명",
+                )
+                if fields.get(key) not in (None, "")
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
         key = (
             normalize_comparison_text(row.get("항목")),
             normalize_comparison_text(row.get("연도")),
             normalize_comparison_text(row.get("값")),
             normalize_comparison_text(row.get("단위"), "단위"),
             normalize_comparison_text(fields.get("값역할")),
+            structural_key,
         )
         if key in seen:
             continue

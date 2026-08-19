@@ -25,6 +25,7 @@ from scripts.golden_score_contract import (  # noqa: E402
     데이터시트,
     페이지집합,
     수치시트,
+    산출유형그룹,
 )
 from scripts.golden_score_matching import (  # noqa: E402
     문자유사포함출처직렬화,
@@ -53,6 +54,63 @@ _의미완화표시필드 = {
 }
 
 
+def _산출유형집계초기화() -> dict[str, dict[str, int]]:
+    return {
+        name: {
+            "골든행수": 0,
+            "매칭수": 0,
+            "값비교수": 0,
+            "값일치수": 0,
+            "산출유형비교수": 0,
+            "산출유형일치수": 0,
+        }
+        for name in ("reported", "normalized", "calculated", "inferred", "external_lookup")
+    }
+
+
+def _산출유형집계반영(
+    target: dict[str, dict[str, int]], golden_rows: list[Any], matches: list[Any], row_values: dict[int, Any]
+) -> None:
+    matched = {match.골든.번호: match for match in matches}
+    for row in golden_rows:
+        group = 산출유형그룹(row.값.get("골든_산출유형"))
+        stat = target[group]
+        stat["골든행수"] += 1
+        match = matched.get(row.번호)
+        if match is None:
+            continue
+        stat["매칭수"] += 1
+        value_stat = row_values.get(row.번호)
+        if value_stat is not None:
+            stat["값비교수"] += value_stat.전체
+            stat["값일치수"] += value_stat.일치
+        stat["산출유형비교수"] += 1
+        output_group = 산출유형그룹(match.출력.값.get("derivation_type"))
+        if output_group == group:
+            stat["산출유형일치수"] += 1
+
+
+def _산출유형직렬화(stats: dict[str, dict[str, int]]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for name, stat in stats.items():
+        result[name] = {
+            **stat,
+            "리콜": (
+                round(stat["매칭수"] / stat["골든행수"], 4)
+                if stat["골든행수"] else None
+            ),
+            "값일치율": (
+                round(stat["값일치수"] / stat["값비교수"], 4)
+                if stat["값비교수"] else None
+            ),
+            "산출유형일치율": (
+                round(stat["산출유형일치수"] / stat["산출유형비교수"], 4)
+                if stat["산출유형비교수"] else None
+            ),
+        }
+    return result
+
+
 def _의미완화매칭직렬화(sheet_name: str, match: Any) -> dict[str, Any]:
     골든필드, 출력필드 = _의미완화표시필드[sheet_name]
     return {
@@ -79,6 +137,7 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
     all_disagreements: list[dict[str, Any]] = []
     all_source = 출처집계초기화()
     numeric_source = 출처집계초기화()
+    derivation_stats = _산출유형집계초기화()
     format_errors: list[str] = []
     format_warnings: list[str] = []
     skipped: list[str] = []
@@ -128,6 +187,7 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
         전체스케일동치.extend(스케일동치쌍들)
         if golden_sheet.상태 == "정상" and sheet_name != "00_문서메타":
             출처집계반영(all_source, golden_sheet.행들, matches, row_values)
+            _산출유형집계반영(derivation_stats, golden_sheet.행들, matches, row_values)
             if sheet_name in 수치시트:
                 출처집계반영(numeric_source, golden_sheet.행들, matches, row_values)
         for match in matches:
@@ -161,6 +221,7 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
         "시트별": sheet_results,
         "출처유형별_전체": 출처직렬화(all_source),
         "출처유형별_수치시트": 출처직렬화(numeric_source),
+        "산출유형별_전체": _산출유형직렬화(derivation_stats),
         "출처유형별_전체_의미완화포함": 의미완화포함출처직렬화(all_source, 전체의미완화매칭),
         "출처유형별_수치시트_의미완화포함": 의미완화포함출처직렬화(
             numeric_source, 수치시트의미완화매칭

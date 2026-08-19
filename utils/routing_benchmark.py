@@ -13,6 +13,7 @@ from typing import Any
 from openpyxl import load_workbook
 
 import config
+from utils.object_evidence_match import descriptor, match_object_evidence
 from utils.object_routing import normalize_object_label, normalize_object_number
 
 
@@ -32,6 +33,8 @@ class FixedRoutingItem:
     caption: str
     allowed_sheets: tuple[str, ...]
     note: str = ""
+    evidence_id: str = ""
+    key_values: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +48,8 @@ class RoutingEvaluationDetail:
     linked_body_sheets: tuple[str, ...]
     status: str
     message: str
+    match_stage: str = ""
+    match_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -165,6 +170,8 @@ def load_fixed_routing_inventory(path: str | Path) -> list[FixedRoutingItem]:
             caption=_text(_row_value(row, "캡션", "제목")),
             allowed_sheets=allowed,
             note=_text(_row_value(row, "비고", "검수메모")),
+            evidence_id=_text(_row_value(row, "근거ID")),
+            key_values=_text(_row_value(row, "핵심값", "대표값")),
         ))
     return items
 
@@ -214,28 +221,33 @@ def _caption_similarity(item: FixedRoutingItem, row: dict[str, Any]) -> float:
     return SequenceMatcher(None, left[:500], right[:500]).ratio()
 
 
-def _matches(item: FixedRoutingItem, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    exact_id = [row for row in rows if item.item_id in _row_ids(row)]
-    if exact_id:
-        return exact_id
-    same_page = [row for row in rows if _page(row.get("출처페이지")) == item.page]
-    item_number = normalize_object_number(item.number or item.caption)
-    if item_number:
-        numbered = [
-            row for row in same_page
-            if normalize_object_number(row.get("번호") or row.get("캡션")) == item_number
-        ]
-        if numbered:
-            return numbered
-    ranked = sorted(
-        ((_caption_similarity(item, row), row) for row in same_page),
-        key=lambda pair: pair[0],
-        reverse=True,
+def _matches(item: FixedRoutingItem, rows: list[dict[str, Any]]):
+    candidates = [
+        descriptor(
+            key=str(index),
+            page=_page(row.get("출처페이지")),
+            evidence_ids=row.get("근거ID"),
+            object_ids=[row.get("객체ID"), *_SPLIT_RE.split(_text(row.get("중복객체ID")))],
+            number=row.get("번호"),
+            caption=row.get("캡션"),
+            content=json.dumps(row, ensure_ascii=False, sort_keys=True, default=str),
+        )
+        for index, row in enumerate(rows)
+    ]
+    match = match_object_evidence(
+        descriptor(
+            key=item.item_id,
+            page=item.page,
+            evidence_ids=item.evidence_id,
+            object_ids=item.item_id,
+            number=item.number or item.caption,
+            caption=item.caption,
+            content=item.key_values or item.caption,
+        ),
+        candidates,
     )
-    if not ranked or ranked[0][0] < 0.72:
-        return []
-    threshold = max(0.72, ranked[0][0] - 0.03)
-    return [row for score, row in ranked if score >= threshold]
+    matched = [rows[int(key)] for key in match.matched_keys if key.isdigit()]
+    return matched, match
 
 
 def evaluate_fixed_routing_inventory(
@@ -246,10 +258,16 @@ def evaluate_fixed_routing_inventory(
     rows = _output_inventory_rows(Path(output_path).expanduser().resolve())
     details: list[RoutingEvaluationDetail] = []
     for item in items:
-        matched = _matches(item, rows)
+        matched, evidence_match = _matches(item, rows)
         body_sheets = sorted({sheet for row in matched for sheet in _body_sheets(row)})
         allowed = set(item.allowed_sheets)
-        if not matched:
+        if evidence_match.status == "ambiguous":
+            status = "복수객체_검토필요"
+            message = evidence_match.reason
+        elif evidence_match.status == "partial":
+            status = "근거불충분"
+            message = evidence_match.reason
+        elif not evidence_match.confirmed:
             status = "미추출"
             message = "고정 인벤토리 객체가 출력 원문 객체 인벤토리에 없습니다."
         elif allowed.intersection(body_sheets):
@@ -273,6 +291,8 @@ def evaluate_fixed_routing_inventory(
             linked_body_sheets=tuple(body_sheets),
             status=status,
             message=message,
+            match_stage=evidence_match.status,
+            match_reason=evidence_match.reason,
         ))
     evaluable = len(details)
     mismatches = sum(detail.status != "일치" for detail in details)

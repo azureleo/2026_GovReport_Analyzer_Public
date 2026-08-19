@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from utils.pdf_reader import PDFContent, PageContent
+from utils.document_objects import build_document_objects
 from utils.semantic_routing import validate_and_reclassify
+from utils.selective_ocr import evidence_id
 from utils.source_verifier import build_source_object_inventory
 
 
@@ -18,6 +20,14 @@ def _forecast_document() -> PDFContent:
     )
     page = PageContent(page_number=10, text=text, tables=[table], images=[])
     return PDFContent(total_pages=10, pages=[page], full_text=text)
+
+
+def _forecast_evidence_id() -> str:
+    table = next(
+        obj for obj in build_document_objects(_forecast_document().pages)
+        if obj.object_type == "table"
+    )
+    return evidence_id(table)
 
 
 def test_future_current_emission_on_forecast_table_is_reclassified() -> None:
@@ -73,6 +83,7 @@ def test_source_object_inventory_reports_wrong_sheet_semantics() -> None:
             "배출량": 100,
             "단위": "천톤CO2eq",
             "출처페이지": 10,
+            "근거ID": _forecast_evidence_id(),
         }],
     }
 
@@ -133,6 +144,7 @@ def test_visual_inventory_is_auxiliary_not_a_body_routing_match() -> None:
             "유형": "차트",
             "캡션": "표 4-2 부문별 온실가스 배출량 전망(BAU)",
             "출처페이지": 10,
+            "근거ID": _forecast_evidence_id(),
         }],
     }
 
@@ -166,6 +178,7 @@ def test_object_can_match_any_human_allowed_body_sheet() -> None:
             "rows": [["구분", "2030"], ["목표", "100"]],
             "metadata": {
                 "allowed_sheet_keys": ["plan_overview", "reduction_targets"],
+                "evidence_id": "ev-plan-target",
             },
         }],
         "reduction_targets": [{
@@ -175,6 +188,7 @@ def test_object_can_match_any_human_allowed_body_sheet() -> None:
             "목표연도": 2030,
             "목표배출량": 100,
             "출처페이지": 20,
+            "근거ID": "ev-plan-target",
         }],
     }
 

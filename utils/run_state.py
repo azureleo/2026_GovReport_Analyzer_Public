@@ -195,6 +195,80 @@ def merge_rows_stably(
     return rows, conflicts
 
 
+def _has_checkpoint_payload(result: Any) -> bool:
+    if isinstance(result, list):
+        return bool(result)
+    if isinstance(result, dict):
+        return any(_has_checkpoint_payload(value) for value in result.values())
+    return result not in (None, "")
+
+
+def _merge_checkpoint_payloads(
+    kind: str,
+    sheet_keys: list[str],
+    existing: Any,
+    incoming: Any,
+) -> Any:
+    """부분 체크포인트끼리 합치되 완전 성공 결과의 권위는 건드리지 않는다."""
+    if kind == "sheet" and isinstance(existing, list):
+        incoming_rows = incoming if isinstance(incoming, list) else []
+        sheet_key = sheet_keys[0] if sheet_keys else "unknown"
+        rows, _ = merge_rows_stably(sheet_key, existing, incoming_rows)
+        return rows
+    if kind == "cluster" and isinstance(existing, dict):
+        incoming_by_sheet = incoming if isinstance(incoming, dict) else {}
+        merged: dict[str, Any] = {}
+        for sheet_key in sorted(set(existing) | set(incoming_by_sheet)):
+            previous_rows = existing.get(sheet_key)
+            fresh_rows = incoming_by_sheet.get(sheet_key)
+            if isinstance(previous_rows, list):
+                rows, _ = merge_rows_stably(
+                    sheet_key,
+                    previous_rows,
+                    fresh_rows if isinstance(fresh_rows, list) else [],
+                )
+                merged[sheet_key] = rows
+            else:
+                merged[sheet_key] = fresh_rows if fresh_rows is not None else previous_rows
+        return merged
+    return incoming if _has_checkpoint_payload(incoming) else existing
+
+
+def _coalesce_batch_record(
+    previous: dict[str, Any] | None,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """실패한 재시도가 이전 부분 성공 결과를 지우지 않도록 원장 레코드를 합친다."""
+    if not previous or incoming.get("status") == "ok":
+        return incoming
+    if (
+        previous.get("status") not in FAILED_BATCH_STATUSES
+        or incoming.get("status") not in FAILED_BATCH_STATUSES
+        or not _has_checkpoint_payload(previous.get("result"))
+    ):
+        return incoming
+
+    record = dict(incoming)
+    record["result"] = _merge_checkpoint_payloads(
+        str(incoming.get("kind") or previous.get("kind") or ""),
+        [str(value) for value in (incoming.get("sheet_keys") or previous.get("sheet_keys") or [])],
+        previous.get("result"),
+        incoming.get("result"),
+    )
+    if not _has_checkpoint_payload(record["result"]):
+        return incoming
+
+    record["status"] = "partial"
+    record["recovered"] = True
+    marker = "이전 부분 결과 보존"
+    latest_error = str(incoming.get("error") or "")
+    record["error"] = (
+        latest_error if marker in latest_error
+        else f"{latest_error} | {marker}".strip(" |")
+    )[:1000]
+    return record
+
+
 class RunState:
     """동일 입력·프롬프트·모델 조합의 배치 실행 상태를 영속화한다."""
 
@@ -312,7 +386,10 @@ class RunState:
                 continue
             batch_id = str(record.get("batch_id") or "")
             if batch_id:
-                self._records[batch_id] = record
+                self._records[batch_id] = _coalesce_batch_record(
+                    self._records.get(batch_id),
+                    record,
+                )
 
     def _load_conflicts(self) -> None:
         try:
@@ -331,13 +408,22 @@ class RunState:
             }))
             self._conflict_ids.add(conflict_id)
 
-    def batch_id(self, *, kind: str, sheet_keys: Iterable[str], page_nums: Iterable[int], batch_text: str) -> str:
+    def batch_id(
+        self,
+        *,
+        kind: str,
+        sheet_keys: Iterable[str],
+        page_nums: Iterable[int],
+        batch_text: str,
+        request_fingerprint: str = "",
+    ) -> str:
         return sha256_json({
             "run_id": self.run_id,
             "kind": kind,
             "sheet_keys": sorted(str(key) for key in sheet_keys),
             "page_nums": [int(page) for page in page_nums],
             "batch_text_sha256": hashlib.sha256((batch_text or "").encode("utf-8")).hexdigest(),
+            "request_fingerprint": str(request_fingerprint or ""),
         })[:32]
 
     def register_expected(self, batch_id: str, metadata: dict[str, Any]) -> None:
@@ -380,7 +466,7 @@ class RunState:
         split_depth: int = 0,
         recovered: bool = False,
     ) -> None:
-        record = {
+        incoming = {
             "batch_id": batch_id,
             "kind": kind,
             "sheet_keys": sorted(str(key) for key in sheet_keys),
@@ -392,8 +478,9 @@ class RunState:
             "recovered": bool(recovered),
             "updated_at": _utc_now(),
         }
-        encoded = json.dumps(record, ensure_ascii=False, sort_keys=True, default=_json_default)
         with self._lock:
+            record = _coalesce_batch_record(self._records.get(batch_id), incoming)
+            encoded = json.dumps(record, ensure_ascii=False, sort_keys=True, default=_json_default)
             self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
             with self.ledger_path.open("a", encoding="utf-8") as stream:
                 stream.write(encoded + "\n")

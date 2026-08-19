@@ -12,10 +12,11 @@ import io
 import json
 import re
 import threading
+from collections.abc import Sequence
 
 import config
 from agents.organizer_agent import _IPCC_GAS_NAMES, _gas_sector_key
-from utils.document_objects import build_document_objects
+from utils.document_objects import DocumentObject, build_document_objects
 from utils.evidence_merge import (
     EvidenceMatch,
     build_evidence_catalog,
@@ -28,6 +29,7 @@ from utils.selective_ocr import (
     build_triage_plan,
     get_ocr_backend,
     merge_document_objects,
+    reconcile_triage_decisions,
     render_ocr_candidate_images,
     vision_analyses_to_objects,
 )
@@ -41,6 +43,8 @@ from utils.vision_recovery import (
 )
 from utils.visual_contract import (
     VISUAL_CONTRACT_VERSION,
+    VISUAL_TARGET_SHEETS,
+    is_structured_visual_type,
     normalize_value_source,
     normalize_visual_table_rows,
 )
@@ -57,21 +61,21 @@ IMAGE_SYSTEM = """당신은 한국 지자체 탄소중립 계획 보고서의 �
 1. 그래프 축의 값은 직접 수치 라벨이 있을 때만 정확값으로 반환하세요.
 2. 단위(tCO2eq, 천 tCO2eq 등)를 반드시 기록하세요.
 3. 값이 불분명하면 "약 XXX"를 만들지 말고 null로 반환하세요.
-4. 텍스트가 포함된 표(도표)도 분석하세요.
-5. 그래프가 아닌 이미지(사진, 로고 등)는 type을 "해당없음"으로 반환하세요.
+4. 텍스트가 포함된 표와 diagram, infographic, flow, strategy_map, risk_map, risk_matrix도 분석하세요.
+5. 실제로 데이터가 없는 사진, 로고, 장식만 type을 "해당없음"으로 반환하세요.
 6. 반드시 JSON만 반환하세요."""
 
 
-CHART_TABLE_SYSTEM = """당신은 한국 지자체 탄소중립 계획 보고서의 그래프를 표로 변환하는 전문가입니다.
+CHART_TABLE_SYSTEM = """당신은 한국 지자체 탄소중립 계획 보고서의 표·그래프·구조 도표를 구조화하는 전문가입니다.
 
 DePlot 방식처럼 그래프 이미지를 먼저 선형화된 표 데이터로 바꾸세요.
 추론이나 보간보다 이미지에 보이는 축, 범례, 라벨, 수치만 우선합니다.
 
 규칙:
-1. 막대그래프, 꺾은선그래프, 영역그래프, 원그래프, 데이터 표만 변환하세요.
-2. 지도, 사진, 포스터, 목차, 설명용 삽화는 type을 "해당없음"으로 반환하세요.
-3. target_sheet는 이미지 내용에 따라 vehicle, energy, ghg, forecast, target, strategy, summary 중 하나로 분류하세요.
-- 온실가스 배출·흡수 전망(BAU, 목표 시나리오, 배출량 추계) 차트는 forecast로 분류하세요. 기후 시나리오(SSP·RCP 등의 기온·강수 전망)는 forecast가 아니라 summary로 분류하세요.
+1. 막대그래프, 꺾은선그래프, 영역그래프, 원그래프, 데이터 표뿐 아니라 diagram, infographic, flow, strategy_map, risk_map, risk_matrix도 구조화하세요.
+2. 일반 사진, 로고, 장식, 데이터가 없는 홍보물만 type을 "해당없음"으로 반환하세요. 기후위험·취약성 지도, 리스크 행렬, 전략 체계도, 단계 흐름도는 구조화 대상입니다.
+3. target_sheet는 regional_conditions, emissions_regional, emissions_management, emissions_forecast, reduction_targets, vision_strategy, mitigation_projects, financial_plan, foundation_measures, other 중 하나로 분류하세요.
+- 온실가스 배출·흡수 전망(BAU, 목표 시나리오, 배출량 추계) 차트는 forecast로 분류하세요. 기후 시나리오(SSP·RCP 등의 기온·강수 전망), 영향·취약성·리스크 자료는 foundation으로 분류하세요.
 - 감축목표 차트(기준연도 대비 목표배출량·감축량·감축률, 부문별 목표)는 target으로 분류하세요.
 4. 단위가 "천 tCO2eq", "천톤CO2eq"이면 unit에 그대로 적고 값은 이미지에 보이는 숫자 그대로 반환하세요.
 5. 25,432.000처럼 천 단위/소수 표기가 있으면 25432000으로 붙이지 말고 25432 또는 25432.0으로 반환하세요.
@@ -86,19 +90,82 @@ DePlot 방식처럼 그래프 이미지를 먼저 선형화된 표 데이터로 
 13. `21~30년` 같은 기간은 임의의 단일 연도나 `21~1930`으로 확장하지 말고 연도=null, fields.기간원문="21~30년"으로 기록하세요.
 14. fields.값근거는 명시라벨, 표셀, 축추정, 계산값, 불명 중 하나로 기록하세요. 축추정·계산값은 자동 병합되지 않습니다.
 15. 합계와 세부값이 함께 보이면 합계도 별도 행으로 반환하고 동일한 fields.합계그룹과 집계수준(합계|세부)을 기록하세요.
+16. 구조 도표는 수치가 없어도 노드·단계·관계를 행 단위로 분리하고 fields에 구조역할, 상위항목, 관계, 순서, 단계, 담당주체, 설명을 기록하세요.
+17. 전략 체계도는 target_sheet=vision_strategy, 기후위험 지도·리스크 행렬은 foundation_measures, 지역 현황 인포그래픽은 regional_conditions로 분류하세요.
+18. 구조를 읽을 수 있지만 기존 시트에 안전하게 매핑할 수 없으면 target_sheet=other로 두고 내용을 버리지 마세요.
 
 시트별 fields 예시:
 - vehicle: {"용도": "승용", "차종": "전기", "대수": 123, "주행거리": 45.1}
 - energy: {"용도": "가정", "전력": 123, "가스": 456, "석유_에너지유": 12}
 - ghg: {"연도": 2030, "항목": "건물", "종류": "목표", "값": 12345}
 - strategy: {"감축전략_부문": "건물", "감축사업명": "공공건물 그린리모델링", "종류": "계획(감축량)", "연도": 2030, "값": 123}
+- foundation: {"평가유형": "projection|impact|vulnerability|risk|disaster", "기후변수": "폭염일수", "시나리오": "SSP5-8.5", "기준기간": "2000~2019", "미래기간": "2041~2060", "공간단위": "자치구", "부문": "건강", "리스크항목": "폭염 건강피해", "취약성지표": "취약성지수", "리스크등급": "높음", "값": 0.82, "단위": "지수"}
 - 지역여건 통계(차량·에너지·인구 등): {"지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "연도": 2022}
 - 배출현황: {"배출유형": "직접배출|간접배출|흡수원", "부문": "건물", "세부부문": "(보이면)", "연도": 2021}
 - 관리권한 배출: {"관리부문": "건물", "직간접구분": "직접|간접", "연도": 2021}
 - 배출전망(forecast): {"시나리오": "차트·캡션의 시나리오 표기 그대로(BAU|목표|전망 등), 없으면 생략", "부문": "건물", "연도": 2030}
 - 감축목표(target): {"값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "부문": "건물", "목표연도": 2030}
 - 재정계획: {"계획구분": "...", "사업명": "...", "재원구분": "...", "연도": 2030}
+- 전략·흐름 도표: {"구조역할": "비전|목표|전략|과제|단계|주체|지표|기타", "상위항목": "...", "관계": "포함|연결|선행|후속", "순서": 1, "단계": "...", "담당주체": "...", "설명": "..."}
 """
+
+
+NEGATIVE_REVALIDATION_SYSTEM = """당신은 탄소중립 보고서의 시각자료 음성 판정을 재검증하는 검수자입니다.
+
+첫 판독이 비데이터로 분류했지만 결정론적 데이터 신호가 확인된 객체만 전달됩니다.
+표·그래프뿐 아니라 전략 체계도, 흐름도, 인포그래픽, 기후위험 지도와 리스크 행렬을 다시 확인하세요.
+보이는 텍스트·수치·단위·노드·관계만 기록하고 추측하거나 계산하지 마세요.
+실제로 사진·로고·장식·데이터 없는 홍보물이면 type을 해당없음으로 유지하세요.
+반드시 JSON만 반환하세요."""
+
+
+_NEGATIVE_VISUAL_TYPES = frozenset({"해당없음", "not_relevant", "none", "irrelevant"})
+_REVALIDATION_CAPTION_RE = re.compile(
+    r"(?i)(?:그림|표|figure|fig\.?|table)\s*[\[\(]?[A-Za-z가-힣]*\s*\d+(?:[.\-–—]\d+)*[\]\)]?"
+)
+_REVALIDATION_YEAR_PERIOD_RE = re.compile(
+    r"(?:19|20)\d{2}|\d{1,4}\s*(?:~|〜|–|—)\s*\d{1,4}\s*년?"
+)
+_REVALIDATION_UNIT_RE = re.compile(
+    r"(?i)(?:%|t\s*co2(?:eq|e)?|co2(?:eq|e)?|천\s*톤|백만\s*톤|억원|백만원|만원|명|대|건|개|km|ha|℃|mm|지수|등급)"
+)
+_REVALIDATION_NUMBER_RE = re.compile(r"[-+−]?\s*\d[\d,]*(?:\.\d+)?")
+
+
+def _is_negative_visual_result(result: dict | None) -> bool:
+    return isinstance(result, dict) and str(result.get("type") or "").strip().casefold() in {
+        value.casefold() for value in _NEGATIVE_VISUAL_TYPES
+    }
+
+
+def _negative_revalidation_signals(image: dict) -> list[str]:
+    """Return strong local signals that justify one second look at a negative result."""
+    propagated = [
+        str(value)
+        for value in (image.get("negative_revalidation_signals") or [])
+        if str(value).startswith((
+            "strong:table_structure",
+            "strong:chart_structure",
+            "strong:year_or_period",
+            "strong:quantified_unit",
+            "strong:numeric_value",
+            "strong:data_terms:",
+            "strong:context_terms:",
+            "strong:visual_features:",
+        ))
+    ]
+    caption = re.sub(r"\[render:[^\]]+\]", " ", str(image.get("caption") or ""))
+    local = _REVALIDATION_CAPTION_RE.sub(" ", caption)
+    captioned = bool(_REVALIDATION_CAPTION_RE.search(caption))
+    if captioned and _REVALIDATION_YEAR_PERIOD_RE.search(local):
+        propagated.append("caption:year_or_period")
+    if captioned and _REVALIDATION_UNIT_RE.search(local):
+        propagated.append("caption:quantified_unit")
+    if captioned and _REVALIDATION_NUMBER_RE.search(local) and any(
+        token in caption for token in _CHART_CONTEXT_KEYWORDS
+    ):
+        propagated.append("caption:numeric_data")
+    return list(dict.fromkeys(propagated))
 
 
 def _is_relevant_image(image: dict) -> bool:
@@ -127,12 +194,34 @@ def _coverage_reduce_images(raw_images: list[tuple[PageContent, dict]]) -> list[
             item for item in items
             if "full render" in str(item[1].get("caption", "")).lower()
         ]
-        candidates = full_renders or items
+        reconstructed = [item for item in items if item[1].get("render_variant")]
+        if reconstructed:
+            # P2 객체 렌더는 panel/composite/context가 서로 다른 역할을 가진다.
+            # 자체 full-page context가 있으면 기존 전송용 page_render만 제거한다.
+            has_context = any(
+                item[1].get("render_variant") in {"full_page_context", "fallback_full_page"}
+                for item in reconstructed
+            )
+            candidates = [
+                item for item in items
+                if not (
+                    has_context
+                    and str(item[1].get("source_kind") or "") == "page_render"
+                )
+            ]
+        else:
+            candidates = full_renders or items
         for page, image in candidates:
             digest = hashlib.sha1(str(image.get("base64", "")).encode("utf-8")).hexdigest()
             if digest in seen_hashes:
                 _, existing = reduced[seen_hashes[digest]]
-                for key in ("source_object_ids", "source_evidence_ids"):
+                for key in (
+                    "source_object_ids",
+                    "source_evidence_ids",
+                    "source_physical_object_ids",
+                    "triage_reasons",
+                    "negative_revalidation_signals",
+                ):
                     current = existing.get(key) if isinstance(existing.get(key), list) else []
                     incoming = image.get(key) if isinstance(image.get(key), list) else []
                     existing[key] = list(dict.fromkeys([*current, *incoming]))
@@ -185,6 +274,10 @@ def _target_sheet_from_visual_text(text: str, title: str) -> str:
         return "reduction_targets"
     if any(k in combined for k in ["재정", "투자", "예산계획"]):
         return "financial_plan"
+    if any(k in combined for k in ["전략체계", "추진체계", "전략맵", "비전 및 목표"]):
+        return "vision_strategy"
+    if any(k in combined for k in ["취약성", "리스크", "위험도", "SSP", "RCP", "재난"]):
+        return "foundation_measures"
     return "emissions_regional"
 
 
@@ -368,8 +461,9 @@ def _has_reference_context(page: PageContent, image: dict, municipality: str) ->
     """
     보고서 작성 지자체의 직접 데이터가 아니라 참고자료/해외사례/목차성 페이지인지 판별한다.
 
-    이 단계는 Vision 호출 전 비용 절감용 필터다. 지자체명과 직접 데이터 키워드가 함께 있으면
-    참고 키워드가 일부 있어도 보존한다.
+    이 단계는 참고자료 상태를 붙이는 결정론적 판별기다. 지자체명과 직접 데이터 키워드가
+    함께 있으면 참고 키워드가 일부 있어도 보존한다. 기본 정책에서는 이 판정만으로
+    Vision 호출을 막지 않고, 판독 후 자동 병합 게이트에서 사용한다.
     """
     text = " ".join([page.text or "", image.get("caption", "") or ""])
     lowered = text.casefold()
@@ -388,6 +482,47 @@ def _has_reference_context(page: PageContent, image: dict, municipality: str) ->
     if has_local_name and has_direct_data:
         return False, hits
     return True, hits
+
+
+def _apply_reference_context_policy(
+    page: PageContent,
+    image: dict,
+    item: dict,
+    municipality: str,
+    *,
+    allow_legacy_prefilter: bool = True,
+) -> tuple[bool, bool]:
+    """참고자료 상태를 보존하고, 명시적인 레거시 모드에서만 호출 전에 제외한다."""
+    is_reference, ref_hits = _has_reference_context(page, image, municipality)
+    image["reference_context"] = is_reference
+    image["reference_context_hits"] = list(ref_hits)
+    image["reference_merge_policy"] = "block_auto_merge" if is_reference else "standard"
+    if not is_reference:
+        return False, False
+
+    reason = "reference_context:" + ",".join(ref_hits[:4])
+    item_reasons = item.setdefault("reasons", [])
+    if reason not in item_reasons:
+        item_reasons.append(reason)
+
+    analyze_then_block = bool(
+        getattr(config, "IMAGE_REFERENCE_ANALYZE_THEN_BLOCK", True)
+    )
+    legacy_prefilter = bool(
+        getattr(config, "IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT", False)
+    )
+    # ocr_required는 레거시 비교 모드에서도 반드시 판독한다. 참고자료 여부는
+    # 이후 병합 게이트에서만 사용해 Triage 오판으로 인한 영구 누락을 막는다.
+    filtered = bool(
+        allow_legacy_prefilter
+        and legacy_prefilter
+        and not analyze_then_block
+        and not image.get("ocr_required")
+    )
+    if filtered:
+        item["passed"] = False
+        item["score"] -= 20
+    return True, filtered
 
 
 def _triage_image(page: PageContent, image: dict) -> dict:
@@ -457,6 +592,9 @@ def _chart_year_int(year) -> int | None:
 
 def _is_reference_chart(analysis: dict) -> bool:
     """해외사례/참고자료성 이미지는 본 데이터 자동 반영에서 제외."""
+    explicit = analysis.get("reference_context")
+    if explicit is True or str(explicit or "").strip().casefold() in {"1", "true", "yes"}:
+        return True
     text = " ".join(
         str(analysis.get(k, "") or "")
         for k in ["title", "summary", "unit", "chart_type"]
@@ -515,6 +653,7 @@ class ImageAgent:
         self.skipped_batches = 0
         self._counter_lock = threading.Lock()
         self._object_outcomes = ObjectOutcomeLedger()
+        self._negative_revalidation_seen: set[str] = set()
 
     @staticmethod
     def _image_evidence_ids(image: dict) -> list[str]:
@@ -531,6 +670,135 @@ class ImageAgent:
             for _page, image in task.get("batch", [])
             for evidence_id in self._image_evidence_ids(image)
         ))
+
+    def _negative_revalidation_key(self, image: dict, page_num: int) -> str:
+        evidence_ids = self._image_evidence_ids(image)
+        if evidence_ids:
+            return "evidence:" + "|".join(sorted(evidence_ids))
+        payload = json.dumps(
+            {
+                "page": page_num,
+                "caption": image.get("caption", ""),
+                "bbox": image.get("bbox"),
+                "render_group_id": image.get("render_group_id", ""),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        return "image:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _claim_negative_revalidation(
+        self,
+        image: dict,
+        page_num: int,
+    ) -> list[str]:
+        if not getattr(config, "VISION_NEGATIVE_REVALIDATION_ENABLED", True):
+            return []
+        signals = _negative_revalidation_signals(image)
+        if not signals:
+            return []
+        key = self._negative_revalidation_key(image, page_num)
+        with self._counter_lock:
+            if key in self._negative_revalidation_seen:
+                return []
+            maximum = max(
+                0,
+                int(getattr(config, "VISION_NEGATIVE_REVALIDATION_MAX_OBJECTS", 0) or 0),
+            )
+            if maximum and len(self._negative_revalidation_seen) >= maximum:
+                self._triage_stats["negative_revalidation_limited"] = (
+                    int(self._triage_stats.get("negative_revalidation_limited", 0)) + 1
+                )
+                return []
+            self._negative_revalidation_seen.add(key)
+            self._triage_stats["negative_revalidation_attempted"] = (
+                int(self._triage_stats.get("negative_revalidation_attempted", 0)) + 1
+            )
+        return signals
+
+    def _revalidate_negative_result(
+        self,
+        image: dict,
+        page_num: int,
+        municipality: str,
+        initial: dict,
+    ) -> dict:
+        """Recheck a strong-signal negative once without retrying the whole parent batch."""
+        if not _is_negative_visual_result(initial):
+            return initial
+        signals = self._claim_negative_revalidation(image, page_num)
+        if not signals:
+            return initial
+
+        evidence_ids = self._image_evidence_ids(image)
+        self._object_outcomes.mark_attempt(
+            evidence_ids,
+            label="vision_negative_revalidation",
+        )
+        prompt = f"""이 이미지는 '{municipality}' 탄소중립 기본계획 보고서 {page_num}페이지의 시각 객체입니다.
+첫 판독은 type=해당없음이었지만 다음 데이터 신호가 확인되었습니다: {', '.join(signals)}
+캡션: {str(image.get('caption') or '')[:500]}
+
+이미지를 다시 확인하여 다음 JSON 형식으로 반환하세요:
+{{
+  "contract_version": {VISUAL_CONTRACT_VERSION},
+  "type": "chart_table|structured_visual|해당없음",
+  "target_sheet": "regional_conditions|emissions_regional|emissions_management|emissions_forecast|reduction_targets|vision_strategy|mitigation_projects|financial_plan|foundation_measures|other",
+  "chart_type": "막대|꺾은선|영역|원|표|복합|diagram|infographic|flow|strategy_map|risk_map|risk_matrix|기타",
+  "title": "원문 제목 또는 캡션",
+  "unit": "단위 원문",
+  "table": [{{"연도": null, "항목": "원문 항목", "종류": "현황|전망|목표|구조|기타", "값": null, "단위": "", "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "구조역할": "비전|목표|전략|과제|단계|주체|지표|기타", "상위항목": "", "관계": "", "순서": null, "단계": "", "담당주체": "", "설명": ""}}}}],
+  "summary": "보이는 내용만 요약",
+  "confidence": "high|medium|low",
+  "negative_reason": "해당없음을 유지하는 경우 그 이유"
+}}
+
+수치가 없는 구조 도표도 노드·단계·관계를 table 행으로 기록하세요.
+실제로 데이터가 없는 사진·로고·장식이면 type=해당없음을 유지하세요."""
+
+        try:
+            parsed, parse_ok = llm_client.call_vision_json(
+                image["base64"],
+                prompt,
+                system=NEGATIVE_REVALIDATION_SYSTEM,
+                stage="vision",
+            )
+        except (
+            llm_client.LLMQuotaExceededError,
+            llm_client.LLMTimeoutError,
+            llm_client.LLMCallError,
+        ) as exc:
+            parsed, parse_ok = {}, False
+            failure_reason = f"{type(exc).__name__}: {exc}"
+        else:
+            failure_reason = "Vision 재검증 JSON 파싱 실패"
+
+        if not parse_ok or not isinstance(parsed, dict):
+            with self._counter_lock:
+                self._triage_stats["negative_revalidation_failed"] = (
+                    int(self._triage_stats.get("negative_revalidation_failed", 0)) + 1
+                )
+            failed = dict(initial)
+            failed["negative_revalidation"] = {
+                "attempted": True,
+                "outcome": "failed",
+                "signals": signals,
+                "reason": failure_reason,
+            }
+            return failed
+
+        outcome = "confirmed_negative" if _is_negative_visual_result(parsed) else "recovered"
+        with self._counter_lock:
+            key = f"negative_revalidation_{outcome}"
+            self._triage_stats[key] = int(self._triage_stats.get(key, 0)) + 1
+        parsed["negative_revalidation"] = {
+            "attempted": True,
+            "outcome": outcome,
+            "signals": signals,
+            "initial_type": initial.get("type", ""),
+        }
+        return parsed
 
     def _forced_retry_evidence_ids(self, task: dict) -> set[str]:
         configured = {
@@ -616,8 +884,25 @@ class ImageAgent:
             )
 
     def _record_parsed_image_outcome(self, image: dict, parsed: dict) -> None:
-        if parsed.get("type") == "해당없음":
-            self._record_image_outcome(image, "not_relevant", "VLM 비데이터 판정")
+        revalidation = parsed.get("negative_revalidation")
+        revalidation_outcome = (
+            str(revalidation.get("outcome") or "") if isinstance(revalidation, dict) else ""
+        )
+        if revalidation_outcome == "failed":
+            self._record_image_outcome(
+                image,
+                "needs_review",
+                str(revalidation.get("reason") or "음성 판정 재검증 실패"),
+                response_received=False,
+            )
+            return
+        if _is_negative_visual_result(parsed):
+            reason = (
+                "음성 재검증 후 비데이터 확정"
+                if revalidation_outcome == "confirmed_negative"
+                else "VLM 비데이터 판정"
+            )
+            self._record_image_outcome(image, "not_relevant", reason)
             return
         table = parsed.get("table")
         if isinstance(table, list):
@@ -632,11 +917,20 @@ class ImageAgent:
         if not isinstance(evidence_ids, list):
             return
         retry_failed = analysis.get("targeted_retry_status") == "failed"
+        revalidation = analysis.get("negative_revalidation")
+        revalidation_outcome = (
+            str(revalidation.get("outcome") or "") if isinstance(revalidation, dict) else ""
+        )
         if retry_failed:
             status = "needs_review"
             reason = str(analysis.get("targeted_retry_reason") or "선택 재처리 실패")
-        elif analysis.get("type") == "해당없음":
+        elif revalidation_outcome == "failed":
+            status = "needs_review"
+            reason = str(revalidation.get("reason") or "음성 판정 재검증 실패")
+        elif _is_negative_visual_result(analysis):
             status = "not_relevant"
+            if revalidation_outcome == "confirmed_negative":
+                reason = "음성 재검증 후 비데이터 확정"
         elif isinstance(analysis.get("table"), list):
             status = "extracted" if has_usable_table_value(analysis.get("table")) else "no_data"
         else:
@@ -673,10 +967,30 @@ class ImageAgent:
         """Vision 결과를 원본 DocumentObject 근거 ID에 연결한다."""
         evidence_ids = image.get("source_evidence_ids")
         object_ids = image.get("source_object_ids")
+        physical_object_ids = image.get("source_physical_object_ids")
         result["source_evidence_ids"] = list(evidence_ids) if isinstance(evidence_ids, list) else []
         result["source_object_ids"] = list(object_ids) if isinstance(object_ids, list) else []
+        result["source_physical_object_ids"] = (
+            list(physical_object_ids) if isinstance(physical_object_ids, list) else []
+        )
         if image.get("bbox") is not None:
             result["source_bbox"] = image.get("bbox")
+        for key in (
+            "render_variant",
+            "reconstruction_method",
+            "render_group_id",
+            "panel_index",
+            "panel_count",
+        ):
+            if image.get(key) not in (None, "", 0):
+                result[key] = image.get(key)
+        if "reference_context" in image:
+            result["reference_context"] = bool(image.get("reference_context"))
+            hits = image.get("reference_context_hits")
+            result["reference_context_hits"] = list(hits) if isinstance(hits, list) else []
+            result["reference_merge_policy"] = (
+                "block_auto_merge" if result["reference_context"] else "standard"
+            )
         result["ocr_backend"] = "vlm"
         return result
 
@@ -695,7 +1009,7 @@ class ImageAgent:
 
 이미지를 분석하여 다음 JSON 형식으로 반환하세요:
 {{
-  "type": "그래프유형(막대/꺾은선/파이/표/기타/해당없음)",
+  "type": "시각자료유형(막대/꺾은선/파이/표/diagram/infographic/flow/strategy_map/기타/해당없음)",
   "title": "그래프/표 제목",
   "unit": "단위 (예: tCO2eq, 천tCO2eq, %)",
   "description": "이미지 내용 요약 (1~3문장)",
@@ -717,11 +1031,11 @@ class ImageAgent:
         # list나 빈 값이 반환되면 건너뜀
         if not parsed or not isinstance(parsed, dict):
             return None
+        parsed = self._revalidate_negative_result(image, page_num, municipality, parsed)
         self._record_parsed_image_outcome(image, parsed)
-        if parsed.get("type") == "해당없음":
-            return None
         parsed["page_number"] = page_num
         parsed["municipality"] = municipality
+        parsed["contract_version"] = VISUAL_CONTRACT_VERSION
         return self._attach_source_metadata(parsed, image)
 
     def _chart_to_table(
@@ -737,9 +1051,9 @@ class ImageAgent:
 이미지가 그래프/차트/표라면 DePlot 방식으로 다음 JSON 형식의 표 데이터로 변환하세요:
 {{
   "contract_version": {VISUAL_CONTRACT_VERSION},
-  "type": "chart_table|해당없음",
-  "target_sheet": "vehicle|energy|ghg|strategy|summary",
-  "chart_type": "막대|꺾은선|영역|원|표|복합|기타",
+  "type": "chart_table|structured_visual|해당없음",
+  "target_sheet": "regional_conditions|emissions_regional|emissions_management|emissions_forecast|reduction_targets|vision_strategy|mitigation_projects|financial_plan|foundation_measures|other",
+  "chart_type": "막대|꺾은선|영역|원|표|복합|diagram|infographic|flow|strategy_map|risk_map|risk_matrix|기타",
   "title": "그래프/표 제목",
   "unit": "단위 원문",
   "page_number": {page_num},
@@ -750,22 +1064,25 @@ class ImageAgent:
       "종류": "현황|전망|목표|기타",
       "값": 12345,
       "단위": "단위 원문",
-      "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "..."}}
+      "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU 또는 SSP/RCP", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "...", "평가유형": "projection|impact|vulnerability|risk|disaster", "기후변수": "...", "기준기간": "...", "미래기간": "...", "공간단위": "...", "리스크항목": "...", "취약성지표": "...", "리스크등급": "...", "구조역할": "비전|목표|전략|과제|단계|주체|지표|기타", "상위항목": "...", "관계": "포함|연결|선행|후속", "순서": 1, "단계": "...", "담당주체": "...", "설명": "..."}}
     }}
   ],
   "summary": "이미지 내용 요약 1문장",
   "confidence": "high|medium|low"
 }}
 
-온실가스 배출량/전망/목표 그래프라면 target_sheet는 ghg, 항목에는 건물, 수송, 폐기물, 기타, 합계 같은 부문명을 넣으세요.
-감축사업별 계획/실적/예산/감축량 표라면 target_sheet는 strategy로 두고 fields에 사업명과 부문을 넣으세요.
-차량 등록대수/주행거리 표라면 target_sheet는 vehicle, 에너지 소비량 표라면 target_sheet는 energy로 두세요.
+온실가스 배출량은 emissions_regional, 전망은 emissions_forecast, 목표는 reduction_targets로 분류하세요.
+감축사업별 계획/실적/감축량은 mitigation_projects, 재정·예산 표는 financial_plan으로 분류하세요.
+기후 시나리오·영향·취약성·리스크·재난 자료는 foundation_measures로 분류하세요.
+전략 체계도·비전 맵은 vision_strategy, 차량·에너지·인구 등 지역 통계는 regional_conditions로 분류하세요.
 fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣고, 확신이 없으면 생략하세요(추측 금지).
 이미지에 숫자축만 있고 정확한 값을 읽기 어려우면 대략값을 만들지 말고 null로 반환하세요.
 항목명·범례명·부호·기간·단위는 원문 그대로 기록하고 동의어나 축약어로 바꾸지 마세요.
 `21~30년` 같은 기간은 연도=null, fields.기간원문="21~30년"으로 기록하세요.
 BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에 묶지 말고 값 하나당 table 한 행으로 분리하세요.
 합계와 세부값이 함께 보이면 모두 별도 행으로 반환하고 동일한 fields.합계그룹을 부여하세요.
+구조 도표는 수치가 없어도 노드·단계·관계를 행별로 분리하고 구조역할·상위항목·관계·순서·설명을 fields에 기록하세요.
+기존 시트에 안전하게 매핑할 수 없는 구조는 target_sheet=other로 보존하세요.
 모든 값 행에 fields.값근거를 반드시 기록하세요."""
 
         parsed, parse_ok = llm_client.call_vision_json(image["base64"], prompt, system=CHART_TABLE_SYSTEM, stage="vision")
@@ -777,20 +1094,27 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             if fail_fast:
                 raise llm_client.LLMCallError("Vision 응답 스키마 불일치")
             return None
+        parsed = self._revalidate_negative_result(image, page_num, municipality, parsed)
         self._record_parsed_image_outcome(image, parsed)
-        if parsed.get("type") == "해당없음":
-            return None
+        parsed["contract_version"] = VISUAL_CONTRACT_VERSION
+        parsed["page_number"] = page_num
+        parsed["municipality"] = municipality
+        if _is_negative_visual_result(parsed):
+            return self._attach_source_metadata(parsed, image)
         table = parsed.get("table", [])
         if not isinstance(table, list) or not table:
-            return None
+            parsed["table"] = []
+            return self._attach_source_metadata(parsed, image)
         table = normalize_visual_table_rows(
             table,
             chart_type=str(parsed.get("chart_type") or ""),
             title=str(parsed.get("title") or ""),
         )
         if not table:
-            return None
+            parsed["table"] = []
+            return self._attach_source_metadata(parsed, image)
         parsed["table"] = table
+        parsed["visual_result_type"] = parsed.get("type", "chart_table")
         parsed["contract_version"] = VISUAL_CONTRACT_VERSION
         parsed["type"] = "chart_table"
         parsed["page_number"] = page_num
@@ -824,8 +1148,8 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             )
 
         prompt = f"""아래 첨부 이미지는 '{municipality}' 탄소중립 기본계획 보고서에서 추출한 서로 다른 페이지 렌더/이미지입니다.
-각 첨부 이미지를 빠짐없이 순서대로 확인하고, 그래프/차트/표로 볼 수 있는 이미지만 표 데이터로 변환하세요.
-관련 없는 사진/홍보물/장식 이미지는 해당 image_index에 대해 type을 "해당없음"으로 반환하세요.
+각 첨부 이미지를 빠짐없이 순서대로 확인하고, 표·그래프뿐 아니라 전략 체계도·흐름도·인포그래픽·기후위험 도표도 구조화하세요.
+관련 없는 사진/로고/장식 이미지만 해당 image_index에 대해 type을 "해당없음"으로 반환하세요.
 
 [첨부 이미지 매핑]
 {chr(10).join(image_lines)}
@@ -837,9 +1161,9 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
       "image_index": 1,
       "page_number": 123,
       "contract_version": {VISUAL_CONTRACT_VERSION},
-      "type": "chart_table|해당없음",
-      "target_sheet": "vehicle|energy|ghg|strategy|summary",
-      "chart_type": "막대|꺾은선|영역|원|표|복합|기타",
+      "type": "chart_table|structured_visual|해당없음",
+      "target_sheet": "regional_conditions|emissions_regional|emissions_management|emissions_forecast|reduction_targets|vision_strategy|mitigation_projects|financial_plan|foundation_measures|other",
+      "chart_type": "막대|꺾은선|영역|원|표|복합|diagram|infographic|flow|strategy_map|risk_map|risk_matrix|기타",
       "title": "그래프/표 제목",
       "unit": "단위 원문",
       "table": [
@@ -849,7 +1173,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
           "종류": "현황|전망|목표|기타",
           "값": 12345,
           "단위": "단위 원문",
-          "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "..."}}
+          "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU 또는 SSP/RCP", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "...", "평가유형": "projection|impact|vulnerability|risk|disaster", "기후변수": "...", "기준기간": "...", "미래기간": "...", "공간단위": "...", "리스크항목": "...", "취약성지표": "...", "리스크등급": "...", "구조역할": "비전|목표|전략|과제|단계|주체|지표|기타", "상위항목": "...", "관계": "포함|연결|선행|후속", "순서": 1, "단계": "...", "담당주체": "...", "설명": "..."}}
         }}
       ],
       "summary": "이미지 내용 요약 1문장",
@@ -866,8 +1190,11 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
 - `21~30년` 같은 기간은 연도=null, fields.기간원문="21~30년"으로 기록하세요.
 - 정량값은 값 하나당 table 한 행으로 분리하고, fields에 다른 정량값을 중첩하지 마세요.
 - 합계와 세부값은 별도 행으로 반환하고 동일한 fields.합계그룹을 부여하세요.
+- 구조 도표는 수치가 없어도 노드·단계·관계를 행별로 분리하고 구조역할·상위항목·관계·순서·설명을 fields에 기록하세요.
+- 전략 체계도는 vision_strategy, 기후위험 자료는 foundation_measures, 지역 현황 인포그래픽은 regional_conditions로 분류하세요.
+- 기존 시트에 안전하게 매핑할 수 없는 구조는 target_sheet=other로 보존하세요.
 - 모든 값 행에 fields.값근거를 반드시 기록하세요.
-- 표/그래프가 아니거나 지자체 직접 데이터가 아니면 type은 "해당없음"으로 두세요.
+- 사진·로고·장식처럼 구조화할 데이터가 없으면 type은 "해당없음"으로 두세요.
 - 반드시 JSON만 반환하세요."""
 
         images = [image["base64"] for _, image in batch]
@@ -900,8 +1227,9 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         page_by_index = {idx: page.page_number for idx, (page, _) in enumerate(batch, start=1)}
         image_by_index = {idx: image for idx, (_, image) in enumerate(batch, start=1)}
 
-        # 전체 index 계약을 확인한 뒤 각 객체의 종결 상태를 기록한다. 부분 응답은
-        # 위에서 예외로 전환되어 상위 이분 분할 경로로 들어간다.
+        # 전체 index 계약을 확인한 뒤 강한 신호가 있는 음성 판정만 객체별 한 번
+        # 재검증한다. 재검증 실패는 부모 배치 전체를 다시 분할하지 않는다.
+        finalized_analyses: list[dict] = []
         for raw in raw_analyses:
             if not isinstance(raw, dict):
                 continue
@@ -909,17 +1237,32 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 image_index = int(raw.get("image_index"))
             except (TypeError, ValueError):
                 continue
-            self._record_parsed_image_outcome(
-                image_by_index.get(image_index, {}),
+            image = image_by_index.get(image_index, {})
+            page_number = page_by_index.get(image_index) or raw.get("page_number")
+            final = self._revalidate_negative_result(
+                image,
+                int(page_number or 0),
+                municipality,
                 raw,
             )
+            final["image_index"] = image_index
+            final["page_number"] = page_number
+            final["municipality"] = municipality
+            final["contract_version"] = VISUAL_CONTRACT_VERSION
+            self._record_parsed_image_outcome(image, final)
+            finalized_analyses.append(final)
 
         results: list[dict] = []
-        for raw in raw_analyses:
-            if not isinstance(raw, dict) or raw.get("type") == "해당없음":
+        for raw in finalized_analyses:
+            image_index = int(raw.get("image_index") or 0)
+            image = image_by_index.get(image_index, {})
+            if _is_negative_visual_result(raw):
+                results.append(self._attach_source_metadata(raw, image))
                 continue
             table = raw.get("table", [])
             if not isinstance(table, list) or not table:
+                raw["table"] = []
+                results.append(self._attach_source_metadata(raw, image))
                 continue
             table = normalize_visual_table_rows(
                 table,
@@ -927,18 +1270,17 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 title=str(raw.get("title") or ""),
             )
             if not table:
+                raw["table"] = []
+                results.append(self._attach_source_metadata(raw, image))
                 continue
-            try:
-                image_index = int(raw.get("image_index"))
-            except (TypeError, ValueError):
-                image_index = 0
-            page_number = page_by_index.get(image_index) or raw.get("page_number")
+            page_number = raw.get("page_number")
+            raw["visual_result_type"] = raw.get("type", "chart_table")
             raw["type"] = "chart_table"
             raw["table"] = table
             raw["contract_version"] = VISUAL_CONTRACT_VERSION
             raw["page_number"] = page_number
             raw["municipality"] = municipality
-            results.append(self._attach_source_metadata(raw, image_by_index.get(image_index, {})))
+            results.append(self._attach_source_metadata(raw, image))
         return results
 
     def _infer_target_sheet(self, analysis: dict) -> str:
@@ -951,12 +1293,9 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             "forecast": "emissions_forecast",
             "target": "reduction_targets",
             "strategy": "mitigation_projects",
+            "foundation": "foundation_measures",
         }
-        _VALID_KEYS = {
-            "regional_conditions", "emissions_regional", "emissions_management",
-            "emissions_forecast", "reduction_targets", "mitigation_projects",
-            "financial_plan", "vision_strategy",
-        }
+        _VALID_KEYS = set(VISUAL_TARGET_SHEETS)
         if target in _VALID_KEYS:
             return target
         if target in _LEGACY_MAP:
@@ -970,6 +1309,13 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             return "mitigation_projects"
         if any(k in text for k in ["예산", "재정", "투자"]):
             return "financial_plan"
+        if any(k in text for k in ["전략체계", "추진체계", "전략맵", "비전 및 목표"]):
+            return "vision_strategy"
+        if any(k.casefold() in text.casefold() for k in [
+            "취약성", "리스크", "위험도", "기후 시나리오", "기후시나리오",
+            "SSP", "RCP", "폭염 위험", "홍수 위험", "재난",
+        ]):
+            return "foundation_measures"
         if any(k in text for k in [
             "인구", "기온", "강수", "기후", "폭염", "한파", "공원", "녹지", "건축물",
             "사업체", "산업구조", "가구",
@@ -1013,6 +1359,10 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             reasons.append("요약/참고성 자료")
         if _is_reference_chart(analysis):
             reasons.append("참고자료/해외사례")
+        if is_structured_visual_type(analysis.get("chart_type")):
+            reasons.append("구조 시각자료 자동 병합 금지")
+        if target_sheet == "other":
+            reasons.append("기타 대상 시트 자동 병합 금지")
         qualitative_project = bool(
             target_sheet == "mitigation_projects"
             and (
@@ -1096,6 +1446,17 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             merge_status = "candidate"
         else:
             merge_status = "needs_review"
+        revalidation = analysis.get("negative_revalidation")
+        revalidation = revalidation if isinstance(revalidation, dict) else {}
+        structured_visual = is_structured_visual_type(analysis.get("chart_type"))
+        if _is_reference_chart(analysis):
+            auto_merge_policy = "block_auto_merge"
+        elif structured_visual:
+            auto_merge_policy = "block_structured_visual"
+        elif target_sheet == "other":
+            auto_merge_policy = "block_unsupported_target"
+        else:
+            auto_merge_policy = analysis.get("reference_merge_policy", "standard")
         evidence = {
             "지자체명": analysis.get("municipality", ""),
             "페이지": analysis.get("page_number"),
@@ -1125,6 +1486,16 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             "근거매칭상태": evidence_match.status if evidence_match is not None else "legacy",
             "병합상태": merge_status,
             "병합차단사유": "" if merge_status in {"candidate", "merged"} else reason_text,
+            "참고자료여부": _is_reference_chart(analysis),
+            "참고자료근거": ",".join(
+                str(value) for value in (analysis.get("reference_context_hits") or [])
+            ),
+            "시각구조유형": analysis.get("chart_type", "") if structured_visual else "",
+            "음성재검증상태": revalidation.get("outcome", ""),
+            "음성재검증근거": ",".join(
+                str(value) for value in (revalidation.get("signals") or [])
+            ),
+            "자동병합정책": auto_merge_policy,
         }
         if analysis.get("target_sheet") == "summary":
             evidence["대상시트근거"] = "재추론(summary)"
@@ -1150,6 +1521,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         existing_forecast = text_results.setdefault("emissions_forecast", [])
         existing_targets = text_results.setdefault("reduction_targets", [])
         existing_financial = text_results.setdefault("financial_plan", [])
+        existing_foundation = text_results.setdefault("foundation_measures", [])
 
         for analysis in analyses:
             evidence_match = (
@@ -1243,7 +1615,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                             "사업개요": "",
                             "성과지표명": merged_item.get("성과지표") or "",
                             "성과지표단위": "",
-                            "정량여부": True,
+                            "정량여부": merged_item.get("정량여부"),
                             "출처페이지": analysis.get("page_number"),
                             "데이터상태": "visual_only",
                         })
@@ -1261,6 +1633,37 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                             "연도": year_int,
                             "예산액": val,
                             "예산단위": merged_item.get("단위") or analysis.get("unit") or "",
+                            "출처페이지": analysis.get("page_number"),
+                            "데이터상태": "visual_only",
+                        })
+                        continue
+
+                    if target_sheet == "foundation_measures":
+                        existing_foundation.append({
+                            "지자체명": municipality,
+                            "대응기반영역": "적응대책",
+                            "과제ID": merged_item.get("과제ID") or "",
+                            "과제명": merged_item.get("과제명") or analysis.get("title") or "",
+                            "정책방향": "",
+                            "주요내용": analysis.get("summary") or "",
+                            "대상": "",
+                            "주관부서": "",
+                            "기간": merged_item.get("기간원문") or "",
+                            "평가유형": merged_item.get("평가유형") or "",
+                            "기후변수": merged_item.get("기후변수") or "",
+                            "시나리오": merged_item.get("시나리오") or "",
+                            "기준기간": merged_item.get("기준기간") or "",
+                            "미래기간": merged_item.get("미래기간") or "",
+                            "공간단위": merged_item.get("공간단위") or "",
+                            "부문": merged_item.get("부문") or "",
+                            "리스크항목": merged_item.get("리스크항목") or merged_item.get("항목") or "",
+                            "취약성지표": merged_item.get("취약성지표") or "",
+                            "값": _parse_chart_value(merged_item.get("값")),
+                            "단위": merged_item.get("단위") or analysis.get("unit") or "",
+                            "리스크등급": merged_item.get("리스크등급") or "",
+                            "방법론": merged_item.get("방법론") or "",
+                            "자료출처": merged_item.get("자료출처") or "",
+                            "연계적응과제": merged_item.get("연계적응과제") or "",
                             "출처페이지": analysis.get("page_number"),
                             "데이터상태": "visual_only",
                         })
@@ -1401,7 +1804,14 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 "source_evidence_ids": image.get("source_evidence_ids", []),
                 "bbox": image.get("bbox"),
             })
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        descriptor = {
+            "visual_contract_version": VISUAL_CONTRACT_VERSION,
+            "negative_revalidation_enabled": bool(
+                getattr(config, "VISION_NEGATIVE_REVALIDATION_ENABLED", True)
+            ),
+            "items": payload,
+        }
+        return json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     def _vision_batch_id(self, task: dict) -> str:
         batch_id = str(task.get("batch_id") or "")
@@ -1683,6 +2093,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         text_results: dict,
         municipality: str,
         document: PDFContent | None = None,
+        document_objects: Sequence[DocumentObject] | None = None,
     ) -> dict:
         selective_enabled = bool(
             getattr(config, "SELECTIVE_OCR_ENABLED", True) and document is not None
@@ -1690,9 +2101,14 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         native_objects = []
         triage_decisions = []
         backend = None
+        render_stats = {}
 
         if selective_enabled:
-            native_objects = build_document_objects(pages)
+            native_objects = (
+                list(document_objects)
+                if document_objects is not None
+                else build_document_objects(pages)
+            )
             backend = get_ocr_backend(
                 getattr(config, "OCR_BACKEND", "vlm"),
                 getattr(config, "OCR_RESULTS_DIR", "") or None,
@@ -1747,6 +2163,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     triage_decisions,
                     unresolved_reason=f"{backend.name} 결과 없음",
                 )
+                reconcile_triage_decisions(merged_objects, triage_decisions)
                 apply_triage_metadata(merged_objects, triage_decisions)
                 text_results["object_triage"] = [row.to_dict() for row in triage_decisions]
                 text_results["ocr_document_objects"] = [obj.to_dict() for obj in precomputed]
@@ -1773,6 +2190,9 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             required_by_page: dict[int, list] = {}
             for row in required:
                 required_by_page.setdefault(row.page_number, []).append(row)
+            spatial_reconstruction = bool(
+                getattr(config, "OCR_SPATIAL_RECONSTRUCTION_ENABLED", True)
+            )
 
             raw_images: list[tuple[PageContent, dict]] = []
             covered_evidence: set[str] = set()
@@ -1780,29 +2200,67 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 page_required = required_by_page.get(page.page_number, [])
                 if not page_required:
                     continue
+                placeholder_evidence = {
+                    row.evidence_id
+                    for row in page_required
+                    if row.caption_only or row.missing_native
+                }
                 for image_index, source_image in enumerate(page.images or [], start=1):
                     image = dict(source_image)
                     source_kind = str(image.get("source_kind") or "embedded")
                     own = decision_by_object.get(f"p{page.page_number}_image_{image_index}")
                     selected = []
+                    if spatial_reconstruction and source_kind == "page_render" and placeholder_evidence:
+                        continue
+                    if (
+                        spatial_reconstruction
+                        and own is not None
+                        and own.evidence_id in placeholder_evidence
+                    ):
+                        # 캡션 프록시와 연결된 이미지는 아래 공간 복원기가 올바른 패널로
+                        # 다시 렌더링한다. 순서 기반 오연결을 여기서 전파하지 않는다.
+                        continue
                     if source_kind == "page_render":
                         selected = page_required
                     elif own is not None and own.action == "ocr_required":
                         selected = [own]
-                    elif any(row.object_type in {"chart", "figure"} for row in page_required):
+                    elif (
+                        not spatial_reconstruction
+                        and any(row.object_type in {"chart", "figure"} for row in page_required)
+                    ):
                         # 삽입 이미지와 그림 캡션의 좌표 연결이 불완전한 PDF는 같은 페이지의
                         # 시각 후보를 보수적으로 연결하고 이후 근거 ID 병합에서 중복을 제거한다.
                         selected = [row for row in page_required if row.object_type in {"chart", "figure"}]
                     if not selected or not _is_relevant_image(image):
                         continue
-                    image["source_object_ids"] = [row.object_id for row in selected]
+                    image["source_object_ids"] = list(dict.fromkeys(
+                        object_id
+                        for row in selected
+                        for object_id in [*row.source_object_ids, row.object_id, *row.alias_object_ids]
+                        if object_id
+                    ))
                     image["source_evidence_ids"] = [row.evidence_id for row in selected]
+                    image["source_physical_object_ids"] = list(dict.fromkeys(
+                        row.physical_object_id for row in selected if row.physical_object_id
+                    ))
                     image["ocr_required"] = True
                     raw_images.append((page, image))
                     covered_evidence.update(image["source_evidence_ids"])
 
-            uncovered = [row for row in required if row.evidence_id not in covered_evidence]
-            rendered = render_ocr_candidate_images(document, native_objects, uncovered)
+            render_required = [
+                row for row in required
+                if (
+                    spatial_reconstruction
+                    and (row.caption_only or row.missing_native)
+                )
+                or row.evidence_id not in covered_evidence
+            ]
+            rendered = render_ocr_candidate_images(
+                document,
+                native_objects,
+                render_required,
+                stats=render_stats,
+            )
             raw_images.extend(rendered)
         else:
             raw_images = [
@@ -1821,6 +2279,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
 
         if config.IMAGE_TRIAGE_ENABLED:
             triaged = []
+            reference_flagged = 0
             reference_filtered = 0
             for page, image in raw_images:
                 item = _triage_image(page, image)
@@ -1828,13 +2287,11 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     item["passed"] = True
                     item["score"] = max(item["score"], int(config.IMAGE_TRIAGE_MIN_SCORE))
                     item["reasons"].append("document_object_ocr_required")
-                if config.IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT:
-                    is_reference, ref_hits = _has_reference_context(page, image, municipality)
-                    if is_reference:
-                        item["passed"] = False
-                        item["score"] -= 20
-                        item["reasons"].append("reference_context:" + ",".join(ref_hits[:4]))
-                        reference_filtered += 1
+                is_reference, was_filtered = _apply_reference_context_policy(
+                    page, image, item, municipality
+                )
+                reference_flagged += int(is_reference)
+                reference_filtered += int(was_filtered)
                 triaged.append(item)
             passed = [item for item in triaged if item["passed"]]
             passed.sort(key=lambda item: item["score"], reverse=True)
@@ -1844,6 +2301,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 "passed": len(passed),
                 "filtered": len(raw_images) - len(passed),
                 "min_score": config.IMAGE_TRIAGE_MIN_SCORE,
+                "reference_flagged": reference_flagged,
                 "reference_filtered": reference_filtered,
             }
 
@@ -1852,7 +2310,8 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 "[에이전트2b 이미지분석] ChartQA-style triage: "
                 f"후보 {len(raw_images)}개 → 통과 {len(pages_with_images)}개 "
                 f"(필터 {len(raw_images) - len(pages_with_images)}개, "
-                f"참고자료 {reference_filtered}개, 기준 {config.IMAGE_TRIAGE_MIN_SCORE})"
+                f"참고자료 표시 {reference_flagged}개/사전 제외 {reference_filtered}개, "
+                f"기준 {config.IMAGE_TRIAGE_MIN_SCORE})"
             )
             for item in passed[:5]:
                 print(
@@ -1860,13 +2319,29 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     f"score={item['score']}, {', '.join(item['reasons'][:4])}"
                 )
         else:
+            reference_flagged = 0
+            for page, image in raw_images:
+                item = {"passed": True, "score": 0, "reasons": []}
+                is_reference, _ = _apply_reference_context_policy(
+                    page,
+                    image,
+                    item,
+                    municipality,
+                    allow_legacy_prefilter=False,
+                )
+                reference_flagged += int(is_reference)
             pages_with_images = raw_images
             self._triage_stats = {
                 "raw": len(raw_images),
                 "passed": len(raw_images),
                 "filtered": 0,
                 "min_score": None,
+                "reference_flagged": reference_flagged,
+                "reference_filtered": 0,
             }
+
+        if render_stats:
+            self._triage_stats.update(render_stats)
 
         # 상한 적용은 명시적으로 설정한 경우에만 수행한다. 기본값은 전수 분석이다.
         max_images = getattr(config, "MAX_IMAGES", None)
@@ -1893,10 +2368,12 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     unresolved_reason="렌더 가능한 OCR/VLM 후보 없음",
                 )
                 self._update_final_status_stats(triage_decisions)
-                apply_triage_metadata(native_objects, triage_decisions)
+                merged_objects = merge_document_objects(native_objects, [])
+                reconcile_triage_decisions(merged_objects, triage_decisions)
+                apply_triage_metadata(merged_objects, triage_decisions)
                 text_results["object_triage"] = [row.to_dict() for row in triage_decisions]
                 text_results["ocr_document_objects"] = []
-                text_results["document_objects"] = [obj.to_dict() for obj in native_objects]
+                text_results["document_objects"] = [obj.to_dict() for obj in merged_objects]
             return text_results
 
         analyses = []
@@ -1928,6 +2405,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             lambda task: self._run_vision_task(task, municipality),
             vision_tasks,
             workers=getattr(config, "VISION_WORKERS", 2),
+            stats_label="vision_analysis",
         )
         outer_failed_batches = 0
         for task, result in zip(vision_tasks, batch_results_list):
@@ -1963,6 +2441,14 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
 
         self._image_results = analyses
         print(f"[에이전트2b 이미지분석] 유효 분석 {len(analyses)}개 완료")
+        if self._triage_stats.get("negative_revalidation_attempted"):
+            print(
+                "[에이전트2b 이미지분석] 음성 판정 재검증: "
+                f"시도 {self._triage_stats.get('negative_revalidation_attempted', 0)}개, "
+                f"복구 {self._triage_stats.get('negative_revalidation_recovered', 0)}개, "
+                f"음성확정 {self._triage_stats.get('negative_revalidation_confirmed_negative', 0)}개, "
+                f"실패 {self._triage_stats.get('negative_revalidation_failed', 0)}개"
+            )
 
         ocr_objects = []
         merged_objects = []
@@ -2000,6 +2486,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             self._update_final_status_stats(triage_decisions)
             ocr_objects = vision_analyses_to_objects(analyses)
             merged_objects = merge_document_objects(native_objects, ocr_objects)
+            reconcile_triage_decisions(merged_objects, triage_decisions)
             apply_triage_metadata(merged_objects, triage_decisions)
             evidence_catalog = build_evidence_catalog(
                 [obj.to_dict() for obj in merged_objects],
@@ -2048,6 +2535,10 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
 
         return merged_results
 
+    def metrics(self) -> dict:
+        """매니페스트에 기록할 이미지 triage·렌더 계측 스냅샷."""
+        return dict(self._triage_stats)
+
     def report(self) -> str:
         types: dict[str, int] = {}
         for a in self._image_results:
@@ -2065,15 +2556,28 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     f"(백엔드 {triage.get('backend', 'vlm')})"
                     f"\n  - 이미지 triage: 원본 {triage.get('raw', 0)}개 → "
                     f"통과 {triage.get('passed', 0)}개 / 필터 {triage.get('filtered', 0)}개"
-                    f" / 참고자료 제외 {triage.get('reference_filtered', 0)}개"
+                    f" / 참고자료 표시 {triage.get('reference_flagged', 0)}개"
+                    f" / 사전 제외 {triage.get('reference_filtered', 0)}개"
                     f"\n  - 객체 최종상태: "
                     f"{json.dumps(triage.get('final_statuses', {}), ensure_ascii=False, sort_keys=True)}"
+                    f"\n  - 음성 재검증: 시도 {triage.get('negative_revalidation_attempted', 0)}개 / "
+                    f"복구 {triage.get('negative_revalidation_recovered', 0)}개 / "
+                    f"음성확정 {triage.get('negative_revalidation_confirmed_negative', 0)}개 / "
+                    f"실패 {triage.get('negative_revalidation_failed', 0)}개"
                 )
+                if triage.get("render_requests") is not None:
+                    triage_line += (
+                        f"\n  - 객체 렌더: 요청 {triage.get('render_requests', 0)}개 / "
+                        f"실제 {triage.get('render_unique', 0)}개 / "
+                        f"재사용 {triage.get('render_reused', 0)}개 / "
+                        f"누적 {float(triage.get('render_seconds', 0.0)):.1f}초"
+                    )
             else:
                 triage_line = (
                     f"\n  - triage: 원본 {triage.get('raw', 0)}개 → "
                     f"통과 {triage.get('passed', 0)}개 / 필터 {triage.get('filtered', 0)}개"
-                    f" / 참고자료 제외 {triage.get('reference_filtered', 0)}개"
+                    f" / 참고자료 표시 {triage.get('reference_flagged', 0)}개"
+                    f" / 사전 제외 {triage.get('reference_filtered', 0)}개"
                 )
         checkpoint_line = ""
         if self.run_state is not None:

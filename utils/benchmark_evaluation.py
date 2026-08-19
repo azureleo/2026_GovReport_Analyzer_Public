@@ -258,10 +258,30 @@ def _visual_metrics(
     payload = json.loads(reports.json_path.read_text(encoding="utf-8"))
     expected = int(payload.get("expected_rows", 0) or 0)
     recorded = int(payload.get("recorded_rows", 0) or 0)
+    audit_metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
     return {
         "object_recall": round(recorded / expected, 4) if expected else None,
         "object_expected": expected,
         "object_recorded": recorded,
+        "visual_fixed_denominator": bool(audit_metrics.get("fixed_denominator")),
+        "visual_triage_evaluable_objects": int(
+            audit_metrics.get("triage_evaluable_objects", 0) or 0
+        ),
+        "visual_triage_missed_objects": int(
+            audit_metrics.get("triage_missed_objects", 0) or 0
+        ),
+        "visual_triage_miss_rate": round(
+            float(audit_metrics.get("triage_miss_rate", 0.0) or 0.0), 4
+        ),
+        "visual_vision_recall": round(
+            float(audit_metrics.get("vision_recall", 0.0) or 0.0), 4
+        ),
+        "visual_evidence_unresolved_rate": round(
+            float(audit_metrics.get("evidence_unresolved_rate", 0.0) or 0.0), 4
+        ),
+        "visual_negative_specificity": round(
+            float(audit_metrics.get("negative_specificity", 0.0) or 0.0), 4
+        ),
     }, {
         "visual_audit_json": str(reports.json_path),
         "visual_audit_markdown": str(reports.markdown),
@@ -340,6 +360,11 @@ def _markdown(payload: dict[str, Any]) -> str:
         "|---|---:|---:|",
         f"| 셀 정확도 | {ratio('cell_accuracy')} | {metrics.get('cell_expected', 0)}셀 |",
         f"| 객체 재현율 | {ratio('object_recall')} | {metrics.get('object_expected', 0)}개 |",
+        f"| 시각 Triage 누락률 | {ratio('visual_triage_miss_rate')} | "
+        f"{metrics.get('visual_triage_evaluable_objects', 0)}개 |",
+        f"| 시각 판독 재현율 | {ratio('visual_vision_recall')} | 고정 시각 분모 |",
+        f"| 시각 근거 미결정률 | {ratio('visual_evidence_unresolved_rate')} | 고정 시각 분모 |",
+        f"| 시각 음성 특이도 | {ratio('visual_negative_specificity')} | 고정 음성 분모 |",
         f"| 라우팅 오류율 | {ratio('routing_error_rate')} | {metrics.get('routing_evaluable_objects', 0)}개 |",
         f"| 행 리콜 | {ratio('row_recall')} | {metrics.get('golden_rows', 0)}행 |",
         f"| 행 정밀도 | {ratio('row_precision')} | {metrics.get('output_rows', 0)}행 |",

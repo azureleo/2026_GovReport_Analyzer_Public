@@ -34,7 +34,7 @@ def split_in_half(values: Sequence[T]) -> list[list[T]]:
 
 
 def has_usable_table_value(rows: Any) -> bool:
-    """Return whether a visual table contains explicit numeric or project content."""
+    """Return whether a visual result contains explicit numeric, project, or structural content."""
     if not isinstance(rows, list):
         return False
     for row in rows:
@@ -54,6 +54,14 @@ def has_usable_table_value(rows: Any) -> bool:
         if isinstance(fields, dict) and any(
             str(fields.get(key) or "").strip()
             for key in ("사업명", "감축사업명", "관리번호")
+        ):
+            return True
+        if isinstance(fields, dict) and any(
+            str(fields.get(key) or "").strip()
+            for key in (
+                "구조역할", "상위항목", "관계", "순서", "단계", "담당주체",
+                "노드ID", "연결노드ID", "비전", "목표", "전략", "과제명", "설명",
+            )
         ):
             return True
     return False

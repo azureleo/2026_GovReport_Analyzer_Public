@@ -111,6 +111,26 @@ def test_exact_evidence_match_is_merged_and_propagated_to_output(monkeypatch) ->
     assert cleaned["visual_inventory"][0]["근거매칭상태"] == "exact"
 
 
+def test_explicit_reference_flag_blocks_auto_merge_but_keeps_inventory(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_EVIDENCE_MERGE_ENABLED", True, raising=False)
+    observation = _observation(evidence_ids=["ev-1"])
+    observation.update({
+        "참고자료여부": True,
+        "참고자료근거": "OECD",
+        "자동병합정책": "block_auto_merge",
+    })
+
+    cleaned = _organize(observation, [_object("obj-1", "ev-1")])
+
+    assert cleaned["emissions_management"] == []
+    assert cleaned["chart_observations"][0]["병합상태"] == "reject"
+    assert "G4 참고자료/사례 판정" in cleaned["chart_observations"][0]["병합차단사유"]
+    inventory = cleaned["visual_inventory"][0]
+    assert inventory["참고자료여부"] is True
+    assert inventory["참고자료근거"] == "OECD"
+    assert inventory["자동병합정책"] == "block_auto_merge"
+
+
 def test_missing_multiple_and_ambiguous_evidence_are_isolated(monkeypatch) -> None:
     monkeypatch.setattr(config, "VISUAL_EVIDENCE_MERGE_ENABLED", True, raising=False)
     cases = [

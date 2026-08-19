@@ -77,3 +77,81 @@ def test_caption_proxy_and_image_with_same_evidence_are_one_physical_object() ->
 
     assert result.status == "exact"
     assert set(result.object_ids) == {"p10_chart_1", "p10_image_1"}
+
+
+def test_transport_proxy_in_legacy_triage_is_merged_without_downgrading_status() -> None:
+    chart = _object("p140_chart_1", "ev-p140-visual")
+    chart.update({
+        "page_number": 140,
+        "object_type": "chart",
+        "caption": "그림 4-2 온실가스 감축 경로",
+    })
+    triage_proxy = {
+        "object_id": "p140_image_1",
+        "evidence_id": "ev-p140-visual",
+        "object_type": "image",
+        "page_number": 140,
+        "action": "transport_only",
+        "reasons": ["page_render_transport"],
+        "final_status": "not_relevant",
+    }
+
+    result = match_evidence(
+        "ev-p140-visual",
+        build_evidence_catalog([chart], [triage_proxy]),
+    )
+
+    assert result.status == "exact"
+    assert result.final_statuses == ("extracted",)
+    assert set(result.object_ids) == {"p140_chart_1", "p140_image_1"}
+
+
+def test_missing_native_table_triage_row_is_an_alias_of_the_canonical_table() -> None:
+    table = {
+        "object_id": "p108_table_2",
+        "object_type": "table",
+        "page_number": 108,
+        "number": "표 3-8",
+        "caption": "표 3-8 부문별 배출량",
+        "metadata": {
+            "evidence_id": "ev-p108-table",
+            "final_status": "extracted",
+        },
+    }
+    stale_triage = {
+        "object_id": "p108_table_3",
+        "evidence_id": "ev-p108-table",
+        "object_type": "table",
+        "page_number": 108,
+        "number": "표 3-8",
+        "caption": "표 3-8 부문별 배출량",
+        "reasons": ["native_table_missing"],
+        "final_status": "extracted",
+    }
+
+    result = match_evidence(
+        "ev-p108-table",
+        build_evidence_catalog([table], [stale_triage]),
+    )
+
+    assert result.status == "exact"
+    assert set(result.object_ids) == {"p108_table_2", "p108_table_3"}
+
+
+def test_same_evidence_id_does_not_merge_independent_objects_without_physical_support() -> None:
+    left = _object("p20_chart_1", "ev-collision")
+    left.update({
+        "page_number": 20,
+        "caption": "전력 소비 추이",
+        "bbox": [20, 100, 250, 300],
+    })
+    right = _object("p20_chart_2", "ev-collision")
+    right.update({
+        "page_number": 20,
+        "caption": "자동차 등록 추이",
+        "bbox": [300, 100, 550, 300],
+    })
+
+    result = match_evidence("ev-collision", build_evidence_catalog([left, right]))
+
+    assert result.status == "multiple_objects"

@@ -16,7 +16,8 @@ from pathlib import Path
 import config
 from utils.pdf_reader import extract_pdf, PDFContent, PageContent
 from utils.hwp_reader import extract_hwp, is_hwp_file
-from utils import llm_cache, llm_client
+from utils import llm_cache, llm_client, parallel
+from utils.pipeline_artifacts import PipelineArtifacts
 from utils.run_state import RunState, sha256_json
 from utils.visual_merge_ab import write_visual_merge_snapshot
 from utils.semantic_routing import SemanticRoutingReport, validate_and_reclassify
@@ -46,6 +47,7 @@ QUALITY_SYSTEM = """당신은 지자체 탄소중립 기본계획 데이터 품�
 _TIMING_ORDER = [
     "문서 파싱",
     "가이드라인 로드",
+    "실행 산출물 구성",
     "텍스트 추출",
     "이미지 분석",
     "정리·정제",
@@ -186,6 +188,8 @@ class Supervisor:
         self._timings: dict[str, float] = {}
         self._quality_assessment_for_review: QualityAssessment | None = None
         self._active_run_state: RunState | None = None
+        self._artifact_stats: dict = {}
+        self._vision_render_stats: dict = {}
 
     def mark_interrupted(self, reason: str = "") -> None:
         if self._active_run_state is not None:
@@ -197,6 +201,18 @@ class Supervisor:
 
     def _add_timing(self, label: str, elapsed: float):
         self._timings[label] = self._timings.get(label, 0.0) + elapsed
+
+    def _add_vision_render_stats(self, metrics: dict) -> None:
+        for key in (
+            "render_requests",
+            "render_unique",
+            "render_reused",
+            "render_seconds",
+            "render_png_bytes",
+        ):
+            value = metrics.get(key)
+            if isinstance(value, (int, float)):
+                self._vision_render_stats[key] = self._vision_render_stats.get(key, 0) + value
 
     def _append_text_layer_warning(self, final_data: dict) -> None:
         report = final_data.setdefault("validation_report", [])
@@ -227,6 +243,30 @@ class Supervisor:
             self._log(f"  - 기타: {_fmt_seconds(other_elapsed)}")
         self._log(f"  - 전체: {_fmt_seconds(total_elapsed)}")
 
+        if self._artifact_stats:
+            self._log(
+                "  - 실행 산출물: "
+                f"DocumentObject {self._artifact_stats.get('document_object_count', 0):,}개, "
+                f"가이드라인 프롬프트 {self._artifact_stats.get('guideline_prompt_count', 0):,}개/"
+                f"{self._artifact_stats.get('guideline_prompt_chars', 0):,}자"
+            )
+        if self._vision_render_stats:
+            self._log(
+                "  - Vision 객체 렌더: "
+                f"요청 {int(self._vision_render_stats.get('render_requests', 0)):,}, "
+                f"실제 {int(self._vision_render_stats.get('render_unique', 0)):,}, "
+                f"재사용 {int(self._vision_render_stats.get('render_reused', 0)):,}, "
+                f"누적 {_fmt_seconds(float(self._vision_render_stats.get('render_seconds', 0.0)))}"
+            )
+        queue_stats = parallel.get_parallel_stats()
+        for label, values in queue_stats.items():
+            self._log(
+                f"  - 작업 큐[{label}]: 제출 {values.get('submitted', 0)}, "
+                f"시작 {values.get('started', 0)}, 완료 {values.get('completed', 0)}, "
+                f"대기 누적 {_fmt_seconds(float(values.get('queue_wait_seconds', 0.0)))}, "
+                f"최대 {_fmt_seconds(float(values.get('max_queue_wait_seconds', 0.0)))}"
+            )
+
         stats = llm_cache.get_cache_stats()
         if stats:
             self._log(
@@ -235,7 +275,9 @@ class Supervisor:
                 f"miss {stats.get('miss', 0)}, "
                 f"write {stats.get('write', 0)}, "
                 f"reject {stats.get('rejected', 0)}, "
-                f"disabled {stats.get('disabled', 0)}"
+                f"disabled {stats.get('disabled', 0)}, "
+                f"동시중복 합침 {stats.get('coalesced', 0)} "
+                f"(대기 누적 {_fmt_seconds(float(stats.get('singleflight_wait_seconds', 0.0)))})"
             )
         llm_stats = llm_client.get_llm_stats()
         if llm_stats:
@@ -247,6 +289,19 @@ class Supervisor:
                 f"재시도 {llm_stats.get('retries', 0)}, "
                 f"타임아웃 {llm_stats.get('timeouts', 0)}), "
                 f"quota 대기 누적 {_fmt_seconds(float(wait_seconds))}"
+            )
+            call_seconds = sum(
+                float(value) for value in llm_stats.get("call_seconds", {}).values()
+            )
+            input_chars = sum(
+                int(value) for value in llm_stats.get("input_chars", {}).values()
+            )
+            image_count = sum(
+                int(value) for value in llm_stats.get("image_count", {}).values()
+            )
+            self._log(
+                "  - LLM 실호출 누적: "
+                f"{_fmt_seconds(call_seconds)}, 입력 {input_chars:,}자, 이미지 {image_count:,}개"
             )
 
     def _llm_quality_review(self, final_data: dict) -> dict:
@@ -295,6 +350,7 @@ class Supervisor:
         full_text: str,
         extraction_prompts: dict[str, str],
         run_state: RunState | None = None,
+        document_objects: tuple | None = None,
     ) -> tuple[dict, ExtractorAgent, list[dict], list[dict]]:
         """
         시트별 추출·정제·검수 폐루프.
@@ -304,7 +360,11 @@ class Supervisor:
         """
         # 기존 테스트·확장 코드가 무인자 팩토리를 주입할 수 있으므로 새 상태가
         # 실제로 있을 때만 생성자 인자를 전달한다.
-        extractor = ExtractorAgent(run_state=run_state) if run_state is not None else ExtractorAgent()
+        extractor = (
+            ExtractorAgent(run_state=run_state, document_objects=document_objects)
+            if run_state is not None or document_objects is not None
+            else ExtractorAgent()
+        )
         organizer = OrganizerAgent()
         hybrid_agent = HybridReviewAgent() if getattr(config, "HYBRID_REVIEW_ENABLED", False) else None
         municipality = extractor._extract_municipality_name(full_text)
@@ -412,8 +472,11 @@ class Supervisor:
         run_started_at = datetime.now(timezone.utc).astimezone()
         execution_info = _execution_info(input_path, run_started_at)
         self._timings = {}
+        self._artifact_stats = {}
+        self._vision_render_stats = {}
         llm_cache.reset_cache_stats()
         llm_client.reset_llm_stats()
+        parallel.reset_parallel_stats()
 
         self._log("=" * 60)
         self._log("[감독관] 파이프라인 시작 (가이드라인 기반 16개 시트)")
@@ -446,10 +509,28 @@ class Supervisor:
         t0 = time.time()
         guideline_agent = GuidelineAgent(hwp_path=hwp_path)
         extraction_prompts = guideline_agent.get_all_prompts()
+        guideline_report = guideline_agent.report()
         elapsed = time.time() - t0
         self._add_timing("가이드라인 로드", elapsed)
-        self._log(guideline_agent.report())
+        self._log(guideline_report)
         self._log(f"[감독관] STEP 1 완료: {elapsed:.1f}초")
+
+        t0 = time.time()
+        artifacts = PipelineArtifacts.create(
+            pdf_content,
+            extraction_prompts,
+            guideline_report=guideline_report,
+        )
+        pdf_content = artifacts.document
+        extraction_prompts = artifacts.extraction_prompts
+        elapsed = time.time() - t0
+        self._artifact_stats = dict(artifacts.stats)
+        self._add_timing("실행 산출물 구성", elapsed)
+        self._log(
+            "[감독관] 실행 산출물 구성 완료: "
+            f"DocumentObject {len(artifacts.document_objects):,}개, "
+            f"프롬프트 {len(extraction_prompts)}개 ({elapsed:.1f}초)"
+        )
 
         run_state: RunState | None = None
         if getattr(config, "RUN_STATE_ENABLED", True):
@@ -493,13 +574,20 @@ class Supervisor:
                         full_text=pdf_content.full_text,
                         extraction_prompts=extraction_prompts,
                         run_state=run_state,
+                        document_objects=artifacts.document_objects,
                     )
                 except llm_client.LLMQuotaExceededError as exc:
-                    extractor = ExtractorAgent(run_state=run_state)
+                    extractor = ExtractorAgent(
+                        run_state=run_state,
+                        document_objects=artifacts.document_objects,
+                    )
                     raw_data = extractor.partial_results()
                     logger.warning("시트별 폐루프 추출 quota/한도 문제로 부분 결과로 계속 진행: %s", exc)
             else:
-                extractor = ExtractorAgent(run_state=run_state)
+                extractor = ExtractorAgent(
+                    run_state=run_state,
+                    document_objects=artifacts.document_objects,
+                )
                 try:
                     raw_data = extractor.extract(
                         pages=pdf_content.pages,
@@ -536,9 +624,11 @@ class Supervisor:
                         text_results=raw_data,
                         municipality=municipality,
                         document=pdf_content,
+                        document_objects=artifacts.clone_document_objects(),
                     )
                 except llm_client.LLMQuotaExceededError as exc:
                     logger.warning("이미지 분석 quota/한도 문제로 기존 텍스트 결과로 계속 진행: %s", exc)
+                self._add_vision_render_stats(image_agent.metrics())
                 elapsed = time.time() - t0
                 self._add_timing("이미지 분석", elapsed)
                 self._log(image_agent.report())
@@ -712,6 +802,7 @@ class Supervisor:
                     auto_reclassify=bool(
                         getattr(config, "SEMANTIC_ROUTING_AUTO_RECLASSIFY", True)
                     ),
+                    document_objects=artifacts.document_objects,
                 )
                 municipality = final_data.get("municipality_name", "알 수 없음")
                 validation_report = final_data.setdefault("validation_report", [])
@@ -759,7 +850,11 @@ class Supervisor:
             if getattr(config, "SOURCE_OBJECT_INVENTORY_ENABLED", True):
                 self._log("\n[감독관] STEP 3f: 원문 표·그래프 객체 인벤토리 연결...")
                 t0 = time.time()
-                source_object_inventory = build_source_object_inventory(final_data, pdf_content)
+                source_object_inventory = build_source_object_inventory(
+                    final_data,
+                    pdf_content,
+                    document_objects=artifacts.document_objects,
+                )
                 municipality = final_data.get("municipality_name", "알 수 없음")
                 final_data["source_object_inventory"] = source_object_inventory.excel_rows(municipality)
                 validation_report = final_data.setdefault("validation_report", [])
@@ -781,6 +876,10 @@ class Supervisor:
                 final_data["validation_report"] = _deduplicate_validation_rows(validation_rows)
 
             pipeline_metrics = _ledger_quality_metrics(ledger_records, run_state)
+            pipeline_metrics.update({
+                "text_tasks_enqueued": int(getattr(extractor, "enqueued_tasks", 0)),
+                "text_tasks_deduplicated": int(getattr(extractor, "deduplicated_tasks", 0)),
+            })
             if semantic_routing is not None:
                 pipeline_metrics.update(semantic_routing.metrics())
             if source_object_inventory is not None:
@@ -920,6 +1019,12 @@ class Supervisor:
                     "timings_seconds": {key: round(value, 3) for key, value in self._timings.items()},
                     "llm_cache_stats": llm_cache.get_cache_stats(),
                     "llm_call_stats": llm_client.get_llm_stats(),
+                    "parallel_queue_stats": parallel.get_parallel_stats(),
+                    "pipeline_artifact_stats": dict(self._artifact_stats),
+                    "vision_render_stats": {
+                        key: round(float(value), 3) if key.endswith("_seconds") else int(value)
+                        for key, value in self._vision_render_stats.items()
+                    },
                 },
             )
             state_summary = run_state.summary()

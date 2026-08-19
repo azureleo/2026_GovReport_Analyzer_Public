@@ -192,6 +192,12 @@ def main():
         help="시트별 키워드 라우팅/상한에 의존하지 않고 전체 페이지를 추출 후보로 사용",
     )
     parser.add_argument(
+        "--target-context-mode",
+        choices=["context", "legacy", "off"],
+        default=None,
+        help="06_감축목표 재태깅 방식: context(권장), legacy(v7-1), off",
+    )
+    parser.add_argument(
         "--hybrid-review",
         action="store_true",
         help="기본 추출 후 보조 모델(Gemini 기본값)로 고위험 시트 누락 후보를 별도 검수",
@@ -317,6 +323,8 @@ def main():
     if args.full_scan:
         os.environ["FULL_DOCUMENT_SCAN"] = "1"
         os.environ.setdefault("MAX_IMAGES", "0")
+    if args.target_context_mode:
+        os.environ["REDUCTION_TARGET_CONTEXT_MODE"] = args.target_context_mode
     if args.hybrid_review:
         os.environ["HYBRID_REVIEW_ENABLED"] = "1"
     if args.sheet_closed_loop:
@@ -388,6 +396,8 @@ def main():
         config.OCR_RESULTS_DIR = args.ocr_results_dir
     if args.no_selective_ocr:
         config.SELECTIVE_OCR_ENABLED = False
+    if args.target_context_mode:
+        config.REDUCTION_TARGET_CONTEXT_MODE = args.target_context_mode
 
     if (
         config.SELECTIVE_OCR_ENABLED
@@ -558,6 +568,7 @@ def main():
             else ""
         )
     )
+    print(f"  감축목표 문맥 분류: {config.REDUCTION_TARGET_CONTEXT_MODE}")
     if config.SOURCE_VERIFICATION_ENABLED:
         print(f"  원문 마킹 PDF: {'생성' if config.SOURCE_VERIFICATION_MARK_PDF else '생략'}")
         print(f"  품질 통과 기준: {config.QUALITY_THRESHOLD:g}/100")

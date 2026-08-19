@@ -84,8 +84,8 @@ def test_appendix4_matching_fills_blank_sector_and_reports_mismatch() -> None:
     assert any("부문 불일치" in issue["항목"] for issue in cleaned["validation_report"])
 
 
-def test_appendix3_unit_id_fill_and_value_difference_report() -> None:
-    # Given: 사업명으로 원단위 ID를 채울 행과, 기존 ID 값이 부록3보다 크게 다른 행
+def test_appendix3_unit_is_reference_only_and_value_difference_is_reported() -> None:
+    # Given: 원단위가 없는 행과, 원문에 원단위가 명시된 행
     raw = {
         "municipality_name": "서울특별시",
         "quantitative_reductions": [
@@ -97,11 +97,11 @@ def test_appendix3_unit_id_fill_and_value_difference_report() -> None:
     # When: organizer가 부록3 매칭을 수행하면
     cleaned = OrganizerAgent().organize(raw)
 
-    # Then: 발전량 모니터링인자에 맞는 원단위가 채워지고 차이가 큰 값은 리포트된다.
+    # Then: 부록3 값은 자동 채우지 않고, 명시된 값의 차이만 검증한다.
     first = cleaned["quantitative_reductions"][0]
-    assert first["감축원단위ID"] == "1-1"
-    assert first["감축원단위값"] == 0.0004781
-    assert first["감축원단위매칭신뢰도"] == "high"
+    assert not first.get("감축원단위ID")
+    assert first.get("감축원단위값") is None
+    assert any("감축원단위 외부 참조 후보" in issue["항목"] for issue in cleaned["validation_report"])
     assert any("감축원단위값 차이" in issue["항목"] for issue in cleaned["validation_report"])
 
 

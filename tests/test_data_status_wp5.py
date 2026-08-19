@@ -36,7 +36,9 @@ def test_data_status_marks_visual_gapfill_calculated_and_conflicting_rows() -> N
     # Then: 상태 우선순위에 맞는 데이터상태가 남는다.
     assert cleaned["regional_conditions"][0]["데이터상태"] == "visual_only"
     assert cleaned["plan_overview"][0]["데이터상태"] == "gap_fill"
-    assert cleaned["reduction_targets"][0]["데이터상태"] == "calculated"
+    assert cleaned["reduction_targets"][0]["데이터상태"] == "reported"
+    assert cleaned["reduction_targets"][0]["감축률계산값"] == 40.0
+    assert cleaned["reduction_targets"][0]["derivation_type"] == "inferred"
     assert cleaned["emissions_management"][0]["데이터상태"] == "conflicting"
 
 
@@ -53,7 +55,7 @@ def test_data_status_correction_keeps_conflicting_priority() -> None:
     # When: dedup 충돌 후 감축률 재계산을 수행하면
     cleaned = OrganizerAgent().organize(raw)
 
-    # Then: calculated보다 높은 conflicting 상태가 유지된다.
+    # Then: 원문 충돌 상태가 유지된다.
     assert cleaned["reduction_targets"][0]["데이터상태"] == "conflicting"
 
 

@@ -475,7 +475,7 @@ def 값비교(
 
 def 셀정확도집계(sheet_name: str, golden_rows: list, matches: list[매칭]) -> tuple[int, int]:
     """모든 의미 셀을 분모로 삼고 매칭 행의 정확한 셀을 센다."""
-    excluded = {"지자체명", "출처페이지", "데이터상태"}
+    excluded = {"지자체명", "출처페이지", "데이터상태", "derivation_type", "근거ID"}
     fields = [
         field_name
         for field_name in 계약헤더(sheet_name)

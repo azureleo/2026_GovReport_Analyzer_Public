@@ -25,11 +25,13 @@ def test_전망과_감축목표_legacy_target_sheet를_신규_시트로_매핑�
 
 def test_차트표_프롬프트에_전망과_감축목표_분류_규칙을_명시한다() -> None:
     assert (
-        "vehicle, energy, ghg, forecast, target, strategy, summary 중 하나"
+        "regional_conditions, emissions_regional, emissions_management, emissions_forecast, "
+        "reduction_targets, vision_strategy, mitigation_projects, financial_plan, "
+        "foundation_measures, other 중 하나"
         in CHART_TABLE_SYSTEM
     )
     assert "배출·흡수 전망" in CHART_TABLE_SYSTEM
-    assert "기후 시나리오(SSP·RCP 등의 기온·강수 전망)는 forecast가 아니라 summary" in CHART_TABLE_SYSTEM
+    assert "기후 시나리오(SSP·RCP 등의 기온·강수 전망), 영향·취약성·리스크 자료는 foundation" in CHART_TABLE_SYSTEM
     assert "감축목표 차트" in CHART_TABLE_SYSTEM
     assert "배출전망(forecast)" in CHART_TABLE_SYSTEM
     assert "차트·캡션의 시나리오 표기 그대로(BAU|목표|전망 등), 없으면 생략" in CHART_TABLE_SYSTEM

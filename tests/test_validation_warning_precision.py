@@ -1,7 +1,7 @@
 from agents.organizer_agent import OrganizerAgent
 
 
-def test_resolved_numeric_conflict_is_information_not_warning() -> None:
+def test_unresolved_numeric_conflict_is_warning() -> None:
     cleaned = OrganizerAgent().organize({
         "municipality_name": "서울특별시",
         "emissions_regional": [
@@ -15,8 +15,9 @@ def test_resolved_numeric_conflict_is_information_not_warning() -> None:
         if "중복 키 값 충돌" in issue.get("항목", "")
     ]
     assert len(conflicts) == 1
-    assert conflicts[0]["심각도"] == "정보"
-    assert "자동해결" in conflicts[0]["항목"]
+    assert conflicts[0]["심각도"] == "경고"
+    assert "자동해결" not in conflicts[0]["항목"]
+    assert "충돌값 자동선택 금지" in conflicts[0]["문제내용"]
 
 
 def test_financial_subtotals_are_not_compared_across_projects() -> None:

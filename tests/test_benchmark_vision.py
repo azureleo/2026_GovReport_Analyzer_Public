@@ -41,8 +41,8 @@ def _inventory(path: Path, rows: list[list[str | int]] | None = None) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "시각요소"
-    ws.append(["요소ID", "페이지", "요소유형", "제목", "데이터포함", "기대추출", "관련시트", "비고"])
-    for row in rows or [["E001", 1, "그래프", "[그림 1-1]", "Y", "Y", "03_배출현황_지역", ""]]:
+    ws.append(["요소ID", "페이지", "요소유형", "제목", "데이터포함", "기대추출", "관련시트", "비고", "근거ID"])
+    for row in rows or [["E001", 1, "그래프", "[그림 1-1]", "Y", "Y", "03_배출현황_지역", "", "ev-e001"]]:
         ws.append(row)
     wb.save(path)
 
@@ -99,8 +99,8 @@ def _dummy_extractor(path: Path) -> None:
         ws.append(["지자체명", "인벤토리출처", "배출범위", "배출유형", "부문", "세부부문", "연도", "배출량", "단위", "흡수원여부", "출처페이지", "데이터상태"])
         ws.append(["서울특별시", "", "", "직접배출", "건물", "전기", 2020, 10, "톤", "N", "1", "visual_only"])
         visual = wb.create_sheet("16_시각자료목록")
-        visual.append(["지자체명", "시각자료ID", "캡션", "유형", "데이터포함여부", "추출값요약", "디지타이징필요", "관련시트"])
-        visual.append(["서울특별시", "V1-001", "[그림 1-1]", "그래프", "Y", "10톤", "N", "03_배출현황_지역"])
+        visual.append(["지자체명", "시각자료ID", "캡션", "유형", "데이터포함여부", "추출값요약", "디지타이징필요", "관련시트", "근거ID"])
+        visual.append(["서울특별시", "V1-001", "[그림 1-1]", "그래프", "Y", "10톤", "N", "03_배출현황_지역", "ev-e001"])
         meta = wb.create_sheet("_env")
         meta.append(["key", "value"])
         for key in ["LLM_PROVIDER", "GEMINI_MODEL", "LLM_CACHE_DIR", "STAGE_PROVIDER_VISION", "STAGE_MODEL_VISION", "STAGE_PROVIDER_EXTRACTION"]:

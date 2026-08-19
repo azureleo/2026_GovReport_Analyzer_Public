@@ -95,6 +95,11 @@ _OPENAI_QUOTA_ERROR_MARKERS = (
 _LLM_STATS_LOCK = threading.Lock()
 _LLM_STATS = {
     "calls": {},
+    "call_seconds": {},
+    "max_call_seconds": {},
+    "input_chars": {},
+    "image_count": {},
+    "image_base64_chars": {},
     "failures": 0,
     "retries": 0,
     "quota_wait_seconds": 0.0,
@@ -106,6 +111,11 @@ def reset_llm_stats() -> None:
     """현재 실행의 LLM 호출/대기 통계를 초기화한다."""
     with _LLM_STATS_LOCK:
         _LLM_STATS["calls"] = {}
+        _LLM_STATS["call_seconds"] = {}
+        _LLM_STATS["max_call_seconds"] = {}
+        _LLM_STATS["input_chars"] = {}
+        _LLM_STATS["image_count"] = {}
+        _LLM_STATS["image_base64_chars"] = {}
         _LLM_STATS["failures"] = 0
         _LLM_STATS["retries"] = 0
         _LLM_STATS["quota_wait_seconds"] = 0.0
@@ -118,6 +128,17 @@ def get_llm_stats() -> dict[str, Any]:
         calls = dict(_LLM_STATS["calls"])
         return {
             "calls": calls,
+            "call_seconds": {
+                key: round(float(value), 3)
+                for key, value in _LLM_STATS["call_seconds"].items()
+            },
+            "max_call_seconds": {
+                key: round(float(value), 3)
+                for key, value in _LLM_STATS["max_call_seconds"].items()
+            },
+            "input_chars": dict(_LLM_STATS["input_chars"]),
+            "image_count": dict(_LLM_STATS["image_count"]),
+            "image_base64_chars": dict(_LLM_STATS["image_base64_chars"]),
             "total_calls": sum(calls.values()),
             "failures": int(_LLM_STATS["failures"]),
             "retries": int(_LLM_STATS["retries"]),
@@ -136,17 +157,55 @@ def _add_wait_seconds(seconds: float) -> None:
         _LLM_STATS["quota_wait_seconds"] = float(_LLM_STATS["quota_wait_seconds"]) + seconds
 
 
-def _record_call(kind: str, provider: str, producer) -> str:
+def _record_call(
+    kind: str,
+    provider: str,
+    producer,
+    *,
+    request: LLMCacheRequest | None = None,
+    stage: str | None = None,
+) -> str:
+    detail_key = ":".join((
+        kind,
+        provider,
+        str(stage or "default"),
+        str(request.model if request is not None else "default"),
+    ))
+    input_chars = 0
+    image_count = 0
+    image_chars = 0
+    if request is not None:
+        input_chars = len(request.system) + len(request.prompt)
+        image_count = len(request.images_b64)
+        image_chars = sum(len(image) for image in request.images_b64)
     with _LLM_STATS_LOCK:
         calls = dict(_LLM_STATS["calls"])
         key = f"{kind}:{provider}"
         calls[key] = calls.get(key, 0) + 1
         _LLM_STATS["calls"] = calls
+        for metric, amount in (
+            ("input_chars", input_chars),
+            ("image_count", image_count),
+            ("image_base64_chars", image_chars),
+        ):
+            values = dict(_LLM_STATS[metric])
+            values[detail_key] = int(values.get(detail_key, 0)) + int(amount)
+            _LLM_STATS[metric] = values
+    started = time.perf_counter()
     try:
         return producer()
     except (LLMCallError, OSError, RuntimeError, subprocess.SubprocessError):
         _inc_stat("failures")
         raise
+    finally:
+        elapsed = time.perf_counter() - started
+        with _LLM_STATS_LOCK:
+            seconds = dict(_LLM_STATS["call_seconds"])
+            maximum = dict(_LLM_STATS["max_call_seconds"])
+            seconds[detail_key] = float(seconds.get(detail_key, 0.0)) + elapsed
+            maximum[detail_key] = max(float(maximum.get(detail_key, 0.0)), elapsed)
+            _LLM_STATS["call_seconds"] = seconds
+            _LLM_STATS["max_call_seconds"] = maximum
 
 _JSON_ONLY_INSTRUCTION = """
 당신은 지자체 탄소중립 계획 문서에서 구조화 데이터를 추출하는 로컬 에이전트입니다.
@@ -631,7 +690,10 @@ def call_text(
 
         return cached_response(
             request,
-            lambda: _record_call("text", provider, produce_gemini_text),
+            lambda: _record_call(
+                "text", provider, produce_gemini_text,
+                request=request, stage=stage,
+            ),
         )
 
     if provider == "openai":
@@ -646,6 +708,8 @@ def call_text(
                     max_retries=max_retries,
                     model=stage_model or None,
                 ),
+                request=request,
+                stage=stage,
             ),
         )
 
@@ -668,6 +732,8 @@ def call_text(
                 max_retries=max_retries,
                 label=provider,
             ),
+            request=request,
+            stage=stage,
         ),
     )
 
@@ -698,7 +764,10 @@ def call_vision(
 
         return cached_response(
             request,
-            lambda: _record_call("vision", provider, produce_gemini_vision),
+            lambda: _record_call(
+                "vision", provider, produce_gemini_vision,
+                request=request, stage=stage,
+            ),
         )
 
     if provider == "openai":
@@ -714,6 +783,8 @@ def call_vision(
                     max_retries=max_retries,
                     model=stage_model or None,
                 ),
+                request=request,
+                stage=stage,
             ),
         )
 
@@ -733,6 +804,8 @@ def call_vision(
                 max_retries=max_retries,
                 label=f"{provider} vision",
             ),
+            request=request,
+            stage=stage,
         ),
     )
 
@@ -768,7 +841,10 @@ def call_vision_batch(
 
         return cached_response(
             request,
-            lambda: _record_call("vision_batch", provider, produce_gemini_vision_batch),
+            lambda: _record_call(
+                "vision_batch", provider, produce_gemini_vision_batch,
+                request=request, stage=stage,
+            ),
         )
 
     if provider == "openai":
@@ -784,6 +860,8 @@ def call_vision_batch(
                     max_retries=max_retries,
                     model=stage_model or None,
                 ),
+                request=request,
+                stage=stage,
             ),
         )
 
@@ -803,6 +881,8 @@ def call_vision_batch(
                 max_retries=max_retries,
                 label=f"{provider} vision batch",
             ),
+            request=request,
+            stage=stage,
         ),
     )
 

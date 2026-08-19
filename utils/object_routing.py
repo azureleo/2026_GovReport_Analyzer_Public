@@ -8,9 +8,15 @@ from difflib import SequenceMatcher
 from typing import Iterable
 
 from utils.document_objects import DocumentObject
+from utils.physical_objects import (
+    aggregate_identity_metadata,
+    identity_from_document_object,
+    normalize_object_label as _normalize_physical_label,
+    normalize_object_number as _normalize_physical_number,
+    same_physical_object,
+)
 
 
-_VISUAL_TYPES = {"chart", "figure", "image"}
 _INDEX_HEADING_RE = re.compile(
     r"^(?:(?:표|그림|도|사진)\s*)?(?:목\s*차|차\s*례)$"
     r"|^(?:contents?|tables?|figures?|pictures?)$",
@@ -41,7 +47,6 @@ _ROMAN_FOLIO_RE = re.compile(r"^[ivxlcdm]+$")
 _CONTENTS_ENTRY_RE = re.compile(
     r"^(?:제\s*\d+\s*[장절]|\d+(?:\.\d+)*\s*[.)]|참고문헌|부록)"
 )
-_NON_WORD_RE = re.compile(r"[^0-9a-z가-힣]+", re.IGNORECASE)
 _NUMBER_RE = re.compile(
     r"\b(표|그림|figure|fig\.?)\s*"
     r"([0-9ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+(?:\s*[-–—.]\s*\d+)?)",
@@ -64,20 +69,12 @@ def _lines(text: str) -> list[str]:
 
 def normalize_object_label(value: object) -> str:
     """캡션 비교용으로 괄호·공백·구두점을 제거한다."""
-    return _NON_WORD_RE.sub("", str(value or "").casefold())
+    return _normalize_physical_label(value)
 
 
 def normalize_object_number(value: object) -> str:
     """`표 2-3`, `[표 2–3]` 같은 번호 표기를 같은 키로 만든다."""
-    text = str(value or "").strip()
-    match = _NUMBER_RE.search(text)
-    if not match:
-        return ""
-    kind = match.group(1).casefold()
-    kind = "figure" if kind.startswith(("그림", "fig")) else "table"
-    number = re.sub(r"\s+", "", match.group(2))
-    number = re.sub(r"[–—.]", "-", number)
-    return f"{kind}:{number.casefold()}"
+    return _normalize_physical_number(value)
 
 
 def index_page_kind(page_text: str) -> str:
@@ -167,12 +164,6 @@ def _caption_similarity(left: DocumentObject, right: DocumentObject) -> float:
     return SequenceMatcher(None, a[:500], b[:500]).ratio()
 
 
-def _compatible_types(left: DocumentObject, right: DocumentObject) -> bool:
-    return left.object_type == right.object_type or {
-        left.object_type, right.object_type
-    } <= _VISUAL_TYPES
-
-
 def _nonempty_cells(obj: DocumentObject) -> int:
     return sum(1 for row in obj.rows for cell in row if str(cell or "").strip())
 
@@ -236,6 +227,33 @@ def _merge_duplicate_group(group: list[DocumentObject]) -> DocumentObject:
     merged.metadata["duplicate_object_ids"] = aliases
     merged.metadata["source_object_ids"] = sorted(source_ids)
     merged.metadata["deduplicated_count"] = len(group) - 1
+    existing_physical_id = next(
+        (
+            str(obj.metadata.get("physical_object_id") or "").strip()
+            for obj in group
+            if obj.metadata.get("physical_object_id")
+        ),
+        "",
+    )
+    merged.metadata.update(aggregate_identity_metadata(
+        merged.object_id,
+        [identity_from_document_object(obj) for obj in group],
+        existing_physical_id=existing_physical_id,
+    ))
+    evidence = next(
+        (
+            str(
+                obj.metadata.get("evidence_id")
+                or obj.metadata.get("source_evidence_id")
+                or ""
+            ).strip()
+            for obj in group
+            if obj.metadata.get("evidence_id") or obj.metadata.get("source_evidence_id")
+        ),
+        "",
+    )
+    if evidence:
+        merged.metadata["evidence_id"] = evidence
     if reference_ids:
         merged.metadata["index_reference_ids"] = sorted(reference_ids)
     if reference_pages:
@@ -244,25 +262,10 @@ def _merge_duplicate_group(group: list[DocumentObject]) -> DocumentObject:
 
 
 def _same_evidence(left: DocumentObject, right: DocumentObject) -> bool:
-    if left.page_number != right.page_number or not _compatible_types(left, right):
-        return False
-    left_evidence = str(left.metadata.get("evidence_id") or "").strip()
-    right_evidence = str(right.metadata.get("evidence_id") or "").strip()
-    if left_evidence and left_evidence == right_evidence:
-        return True
-
-    left_number = normalize_object_number(left.number or left.caption)
-    right_number = normalize_object_number(right.number or right.caption)
-    similarity = _caption_similarity(left, right)
-    different_engine = str(left.metadata.get("engine") or "") != str(
-        right.metadata.get("engine") or ""
+    return same_physical_object(
+        identity_from_document_object(left),
+        identity_from_document_object(right),
     )
-    caption_proxy = bool(left.metadata.get("caption_only") or right.metadata.get("caption_only"))
-    if left_number and left_number == right_number and similarity >= 0.72:
-        return different_engine or caption_proxy
-    if similarity >= 0.94 and (different_engine or caption_proxy):
-        return True
-    return False
 
 
 def deduplicate_evidence_objects(objects: Iterable[DocumentObject]) -> tuple[list[DocumentObject], int]:

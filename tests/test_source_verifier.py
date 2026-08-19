@@ -14,6 +14,8 @@ from utils.source_verifier import (
     create_marked_pdf,
     verify_final_data,
 )
+from utils.document_objects import build_document_objects
+from utils.selective_ocr import evidence_id
 
 
 def test_numeric_variants_keep_deterministic_order():
@@ -129,12 +131,16 @@ def test_source_object_inventory_connects_table_and_unlocks_full_score():
         )],
         full_text="표 5-1 태양광 보급 재정계획",
     )
+    table_object = next(
+        obj for obj in build_document_objects(document.pages) if obj.object_type == "table"
+    )
+    table_evidence_id = evidence_id(table_object)
     final_data = {
         "document_meta": [{"지자체명": "서울", "계획명": "기본계획", "계획시작연도": 2024, "계획종료연도": 2033}],
         "emissions_regional": [{"배출유형": "직접배출", "부문": "합계", "연도": 2021, "배출량": 10, "단위": "천톤CO2eq"}],
         "reduction_targets": [{"목표수준": "총괄", "기준연도": 2018, "목표연도": 2030, "목표배출량": 80}],
-        "mitigation_projects": [{"사업명": "태양광 보급", "부문": "전환", "출처페이지": 1}],
-        "financial_plan": [{"사업명": "태양광 보급", "연도": 2030, "예산액": 100, "예산단위": "백만원", "출처페이지": 1}],
+        "mitigation_projects": [{"사업명": "태양광 보급", "부문": "전환", "출처페이지": 1, "근거ID": table_evidence_id}],
+        "financial_plan": [{"사업명": "태양광 보급", "연도": 2030, "예산액": 100, "예산단위": "백만원", "출처페이지": 1, "근거ID": table_evidence_id}],
         "validation_report": [],
     }
     verification = SourceVerificationReport(
@@ -148,6 +154,7 @@ def test_source_object_inventory_connects_table_and_unlocks_full_score():
 
     assert inventory.total_objects == 1
     assert inventory.confirmed_objects == 1
+    assert inventory.exact_match_objects == 1
     assert inventory.coverage_ratio == 1.0
     assert assessment.score == 100.0
     assert assessment.metrics["source_inventory_connected"] is True

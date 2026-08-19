@@ -12,6 +12,50 @@ from utils.run_state import RunState
 
 
 class ExtractionLedgerTests(unittest.TestCase):
+    def test_failed_retry_returns_preserved_partial_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "source.pdf"
+            source.write_bytes(b"input")
+            with patch.object(config, "RUN_STATE_DIR", str(tmp_path / "runs")):
+                state = RunState.create(
+                    input_path=source,
+                    guideline_path=None,
+                    extraction_prompts={"emissions_regional": "prompt"},
+                    execution_info={"text_backend": "test", "text_model": "model"},
+                    output_path=tmp_path / "result.xlsx",
+                )
+                agent = ExtractorAgent(run_state=state)
+                task = {
+                    "sheet_key": "emissions_regional",
+                    "pages": [PageContent(page_number=1, text="배출량", tables=[], images=[])],
+                    "batch_text": "=== 페이지 1 ===\n배출량",
+                    "page_nums": [1],
+                    "page_range": "p1",
+                    "batch_num": 1,
+                    "batch_total": 1,
+                }
+                batch_id = agent._ensure_batch_id(task, "sheet")
+                preserved = [{"지자체명": "서울", "부문": "합계", "출처페이지": 1}]
+                state.record_batch(
+                    batch_id=batch_id,
+                    kind="sheet",
+                    sheet_keys=["emissions_regional"],
+                    page_nums=[1],
+                    status="partial",
+                    result=preserved,
+                    recovered=True,
+                )
+
+                actual = agent._record_call_failure(
+                    task,
+                    llm_client.LLMTimeoutError("retry timeout"),
+                )
+
+        self.assertEqual(actual, preserved)
+        self.assertEqual(agent.ledger[-1].status, "partial")
+        self.assertEqual(agent.ledger[-1].rows, 1)
+
     def test_extracted_page_nums_excludes_failed_batches(self):
         # Given: 성공/실패가 섞인 추출 원장
         agent = ExtractorAgent()

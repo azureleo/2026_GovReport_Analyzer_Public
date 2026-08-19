@@ -7,6 +7,12 @@ import json
 import re
 from typing import Any, Iterable
 
+from utils.physical_objects import (
+    PhysicalObjectIdentity,
+    normalize_object_ids,
+    same_physical_object as identities_match,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class EvidenceReference:
@@ -20,6 +26,9 @@ class EvidenceReference:
     number: str = ""
     caption_only: bool = False
     render_proxy: bool = False
+    missing_native: bool = False
+    engine: str = ""
+    canonical_object_id: str = ""
     alias_object_ids: tuple[str, ...] = ()
 
 
@@ -90,7 +99,17 @@ def _reference_from_document_object(row: dict[str, Any]) -> EvidenceReference | 
     )
     if not evidence_id:
         return None
-    object_id = str(row.get("object_id") or metadata.get("source_object_id") or "").strip()
+    raw_object_id = str(row.get("object_id") or metadata.get("source_object_id") or "").strip()
+    canonical_object_id = str(metadata.get("canonical_object_id") or raw_object_id).strip()
+    aliases = tuple(
+        value
+        for value in normalize_object_ids(
+            raw_object_id if raw_object_id != canonical_object_id else "",
+            metadata.get("alias_object_ids"),
+            metadata.get("duplicate_object_ids"),
+        )
+        if value != canonical_object_id
+    )
     final_status = str(
         metadata.get("final_status") or row.get("final_status") or "needs_review"
     ).strip()
@@ -98,7 +117,7 @@ def _reference_from_document_object(row: dict[str, Any]) -> EvidenceReference | 
     page_number = _normalize_page(row.get("page_number"))
     return EvidenceReference(
         evidence_id,
-        object_id or f"unknown:{evidence_id}",
+        canonical_object_id or f"unknown:{evidence_id}",
         final_status,
         page_number=page_number,
         object_type=str(row.get("object_type") or "").strip(),
@@ -107,6 +126,10 @@ def _reference_from_document_object(row: dict[str, Any]) -> EvidenceReference | 
         number=str(row.get("number") or "").strip(),
         caption_only=bool(metadata.get("caption_only")),
         render_proxy=bool(metadata.get("render_proxy")),
+        missing_native=bool(metadata.get("missing_native")),
+        engine=str(metadata.get("engine") or metadata.get("ocr_backend") or "").strip(),
+        canonical_object_id=canonical_object_id,
+        alias_object_ids=aliases,
     )
 
 
@@ -115,14 +138,40 @@ def _reference_from_triage(row: dict[str, Any]) -> EvidenceReference | None:
     if not evidence_id:
         return None
     object_id = str(row.get("object_id") or "").strip() or f"unknown:{evidence_id}"
+    canonical_object_id = str(row.get("canonical_object_id") or object_id).strip()
     final_status = str(row.get("final_status") or "needs_review").strip()
+    reasons = row.get("reasons") if isinstance(row.get("reasons"), list) else []
+    render_proxy = bool(
+        row.get("render_proxy")
+        or row.get("action") == "transport_only"
+        or "page_render_transport" in reasons
+    )
+    missing_native = bool(
+        row.get("missing_native") or "native_table_missing" in reasons
+    )
+    aliases = tuple(
+        value
+        for value in normalize_object_ids(
+            row.get("alias_object_ids"),
+            row.get("duplicate_object_ids"),
+        )
+        if value != canonical_object_id
+    )
     return EvidenceReference(
         evidence_id,
-        object_id,
+        canonical_object_id,
         final_status,
         page_number=_normalize_page(row.get("page_number")),
         object_type=str(row.get("object_type") or "").strip(),
         bbox=_normalize_bbox(row.get("bbox")),
+        caption=str(row.get("caption") or "").strip(),
+        number=str(row.get("number") or "").strip(),
+        caption_only=bool(row.get("caption_only")),
+        render_proxy=render_proxy,
+        missing_native=missing_native,
+        engine=str(row.get("engine") or row.get("backend") or "").strip(),
+        canonical_object_id=canonical_object_id,
+        alias_object_ids=aliases,
     )
 
 
@@ -146,46 +195,25 @@ def _normalize_bbox(value: Any) -> tuple[float, float, float, float] | None:
     return bbox  # type: ignore[return-value]
 
 
-def _type_family(value: str) -> str:
-    normalized = str(value or "").strip().casefold()
-    return "visual" if normalized in {"chart", "figure", "image"} else normalized
-
-
-def _normalized_label(value: Any) -> str:
-    return re.sub(r"[^0-9a-z가-힣]+", "", str(value or "").casefold())
-
-
-def _bbox_iou(
-    left: tuple[float, float, float, float] | None,
-    right: tuple[float, float, float, float] | None,
-) -> float:
-    if left is None or right is None:
-        return 0.0
-    x0, y0 = max(left[0], right[0]), max(left[1], right[1])
-    x1, y1 = min(left[2], right[2]), min(left[3], right[3])
-    intersection = max(0.0, x1 - x0) * max(0.0, y1 - y0)
-    if intersection <= 0:
-        return 0.0
-    left_area = max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
-    right_area = max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1])
-    union = left_area + right_area - intersection
-    return intersection / union if union > 0 else 0.0
-
-
 def _same_physical_object(left: EvidenceReference, right: EvidenceReference) -> bool:
-    if left.object_id == right.object_id:
-        return True
-    if left.page_number is None or right.page_number is None or left.page_number != right.page_number:
-        return False
-    if _type_family(left.object_type) != _type_family(right.object_type):
-        return False
-    if left.caption_only or right.caption_only or left.render_proxy or right.render_proxy:
-        return True
-    left_label = _normalized_label(left.number or left.caption)
-    right_label = _normalized_label(right.number or right.caption)
-    if left_label and left_label == right_label:
-        return True
-    return _bbox_iou(left.bbox, right.bbox) >= 0.80
+    def identity(reference: EvidenceReference) -> PhysicalObjectIdentity:
+        return PhysicalObjectIdentity(
+            object_id=reference.object_id,
+            page_number=reference.page_number,
+            object_type=reference.object_type,
+            evidence_id=reference.evidence_id,
+            bbox=reference.bbox,
+            caption=reference.caption,
+            number=reference.number,
+            engine=reference.engine,
+            caption_only=reference.caption_only,
+            render_proxy=reference.render_proxy,
+            missing_native=reference.missing_native,
+            canonical_object_id=reference.canonical_object_id,
+            alias_object_ids=reference.alias_object_ids,
+        )
+
+    return identities_match(identity(left), identity(right))
 
 
 def _merge_reference(left: EvidenceReference, right: EvidenceReference) -> EvidenceReference:
@@ -218,6 +246,9 @@ def _merge_reference(left: EvidenceReference, right: EvidenceReference) -> Evide
         number=preferred.number or left.number or right.number,
         caption_only=preferred.caption_only,
         render_proxy=preferred.render_proxy,
+        missing_native=preferred.missing_native,
+        engine=preferred.engine,
+        canonical_object_id=preferred.canonical_object_id or preferred.object_id,
         alias_object_ids=aliases,
     )
 

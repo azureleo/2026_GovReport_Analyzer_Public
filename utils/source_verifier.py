@@ -7,12 +7,14 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import fitz
 
 import config
 from utils.document_objects import DocumentObject, build_document_objects
+from utils.evidence_merge import normalize_evidence_ids
+from utils.object_evidence_match import descriptor, match_object_evidence
 from utils.object_routing import is_index_page, prepare_object_inventory
 from utils.pdf_reader import PDFContent
 from utils.selective_ocr import apply_triage_metadata, evidence_id, merge_document_objects
@@ -239,6 +241,10 @@ class SourceObjectVerification:
     attempt_count: int = 0
     terminal_reason: str = ""
     evidence_id: str = ""
+    match_stage: str = ""
+    matched_evidence_ids: list[str] = field(default_factory=list)
+    evaluation_target: str = "extraction"
+    triage_evaluation_status: str = ""
     index_reference_pages: list[int] = field(default_factory=list)
     duplicate_object_ids: list[str] = field(default_factory=list)
 
@@ -280,6 +286,10 @@ class SourceObjectVerification:
             "시도횟수": self.attempt_count,
             "종결사유": self.terminal_reason,
             "근거ID": self.evidence_id,
+            "근거매칭단계": self.match_stage,
+            "일치근거ID": ", ".join(self.matched_evidence_ids),
+            "평가분모상태": self.evaluation_target,
+            "Triage평가상태": self.triage_evaluation_status,
             "허용시트": ", ".join(self.allowed_sheets),
             "보조연결시트": ", ".join(self.auxiliary_linked_sheets),
             "목차참조페이지": ",".join(str(page) for page in self.index_reference_pages),
@@ -298,6 +308,16 @@ class SourceObjectInventoryReport:
     routing_evaluable_objects: int = 0
     routing_mismatch_objects: int = 0
     routing_error_rate: float = 0.0
+    extraction_denominator_objects: int = 0
+    excluded_candidate_objects: int = 0
+    review_candidate_objects: int = 0
+    exact_match_objects: int = 0
+    composite_match_objects: int = 0
+    ambiguous_match_objects: int = 0
+    triage_evaluable_objects: int = 0
+    triage_missed_objects: int = 0
+    triage_miss_rate: float = 0.0
+    triage_unresolved_objects: int = 0
 
     def excel_rows(self, municipality: str) -> list[dict[str, Any]]:
         return [row.as_excel_row(municipality) for row in self.rows]
@@ -307,6 +327,10 @@ class SourceObjectInventoryReport:
             f"원문 객체 {self.total_objects}개, 확인 {self.confirmed_objects}개, "
             f"부분 {self.partial_objects}개, 미확인 {self.unconfirmed_objects}개, "
             f"완전성 {self.coverage_ratio:.1%}, "
+            f"추출분모 {self.extraction_denominator_objects}개, "
+            f"제외후보 {self.excluded_candidate_objects}개, "
+            f"Triage 누락의심 {self.triage_missed_objects}개 "
+            f"({self.triage_miss_rate:.1%}), "
             f"시트의미 판정 {self.routing_evaluable_objects}개, "
             f"오배치 의심 {self.routing_mismatch_objects}개 "
             f"({self.routing_error_rate:.1%})"
@@ -323,7 +347,10 @@ class SourceObjectInventoryReport:
             "권장조치": "21_원문객체인벤토리의 부분·미확인 객체를 우선 재추출",
         }]
         if self.unconfirmed_objects:
-            pages = sorted({row.page_number for row in self.rows if row.status == "미확인"})
+            pages = sorted({
+                row.page_number for row in self.rows
+                if row.status in {"미확인", "검토필요"}
+            })
             page_text = ",".join(f"p{page}" for page in pages[:20])
             if len(pages) > 20:
                 page_text += ",…"
@@ -860,10 +887,16 @@ def _is_data_object(obj: DocumentObject, page_text: str) -> bool:
         return False
     if obj.metadata.get("render_proxy") or obj.metadata.get("triage_action") == "transport_only":
         return False
-    if obj.metadata.get("triage_action") == "skip_non_data":
-        return False
     if obj.metadata.get("is_index_reference") or is_index_page(page_text):
         return False
+    strong_signals = [
+        str(value)
+        for value in [
+            *(obj.metadata.get("triage_reasons") or []),
+            *(obj.metadata.get("negative_revalidation_signals") or []),
+        ]
+        if str(value).startswith("strong:")
+    ]
     if obj.object_type == "table":
         if not obj.rows or len(obj.rows) < 2:
             return bool(
@@ -881,6 +914,7 @@ def _is_data_object(obj: DocumentObject, page_text: str) -> bool:
     if obj.object_type in {"figure", "image"}:
         return bool(
             obj.rows
+            or strong_signals
             or obj.metadata.get("triage_action") == "ocr_required"
             or obj.metadata.get("ocr_status") in {
                 "parsed", "loaded", "added_missing_object", "enriched_native",
@@ -890,9 +924,45 @@ def _is_data_object(obj: DocumentObject, page_text: str) -> bool:
     return bool(obj.number or obj.caption)
 
 
+def _object_evaluation_target(obj: DocumentObject, page_text: str) -> str:
+    """객체를 삭제하지 않고 추출·음성·검토 분모 중 하나로 배치한다."""
+    if obj.object_type not in {"table", "chart", "figure", "image"}:
+        return ""
+    if obj.metadata.get("render_proxy") or obj.metadata.get("triage_action") == "transport_only":
+        return ""
+    if obj.metadata.get("is_index_reference") or is_index_page(page_text):
+        return ""
+    if _is_data_object(obj, page_text):
+        return "extraction"
+    if obj.metadata.get("triage_action") == "skip_non_data":
+        return "triage_negative"
+    if (
+        obj.metadata.get("final_status") == "needs_review"
+        or obj.number
+        or obj.caption
+    ):
+        return "review"
+    return ""
+
+
+def _triage_evaluation_status(obj: DocumentObject, evaluation_target: str) -> str:
+    action = str(obj.metadata.get("triage_action") or "")
+    final_status = str(obj.metadata.get("final_status") or "needs_review")
+    if evaluation_target == "extraction":
+        if action == "skip_non_data":
+            return "false_negative_candidate"
+        if final_status == "needs_review":
+            return "unresolved"
+        return "selected"
+    if evaluation_target == "triage_negative":
+        return "negative_selected" if action == "skip_non_data" else "over_selected_candidate"
+    return "unresolved"
+
+
 def _inventory_document_objects(
     final_data: dict[str, Any],
     document: PDFContent,
+    native_objects: Sequence[DocumentObject] | None = None,
 ) -> list[DocumentObject]:
     """파이프라인 객체 원장을 우선 사용하고 구버전 결과는 재구성한다."""
     serialized = final_data.get("document_objects")
@@ -908,7 +978,7 @@ def _inventory_document_objects(
         if objects:
             # 초기 A/B 스냅샷은 용량 절감을 위해 rows/text를 생략했다. 같은 PDF에서
             # 재구성한 native 객체로 누락 payload만 복원해 평가 분모를 보존한다.
-            native = build_document_objects(document.pages)
+            native = list(native_objects) if native_objects is not None else build_document_objects(document.pages)
             native_by_id = {obj.object_id: obj for obj in native}
             for obj in objects:
                 base = native_by_id.pop(obj.object_id, None)
@@ -940,7 +1010,7 @@ def _inventory_document_objects(
             )
             return objects
 
-    native = build_document_objects(document.pages)
+    native = list(native_objects) if native_objects is not None else build_document_objects(document.pages)
     triage = final_data.get("object_triage")
     if isinstance(triage, list):
         apply_triage_metadata(native, triage)
@@ -960,25 +1030,31 @@ def _inventory_document_objects(
 def build_source_object_inventory(
     final_data: dict[str, Any],
     document: PDFContent,
+    *,
+    document_objects: Sequence[DocumentObject] | None = None,
 ) -> SourceObjectInventoryReport:
     """원문의 데이터 표·그래프를 결과 행에 역방향으로 연결한다. LLM은 사용하지 않는다."""
     page_count = document.total_pages
     page_text = {page.page_number: page.text or "" for page in document.pages}
     prepared = prepare_object_inventory(
-        _inventory_document_objects(final_data, document),
+        _inventory_document_objects(final_data, document, document_objects),
         page_text,
     )
-    objects = [
-        obj for obj in prepared.objects
-        if _is_data_object(obj, page_text.get(obj.page_number, ""))
-    ]
+    object_targets = {
+        obj.object_id: _object_evaluation_target(
+            obj, page_text.get(obj.page_number, "")
+        )
+        for obj in prepared.objects
+    }
+    objects = [obj for obj in prepared.objects if object_targets.get(obj.object_id)]
 
-    indexed_rows: list[tuple[str, str, set[int]]] = []
+    indexed_rows: dict[str, tuple[str, str, set[int], dict[str, Any]]] = {}
+    result_descriptors = []
     for sheet_key in [*getattr(config, "EXTRACTION_SHEETS", []), "visual_inventory"]:
         rows = final_data.get(sheet_key, [])
         if not isinstance(rows, list):
             continue
-        for row in rows:
+        for row_index, row in enumerate(rows):
             if not isinstance(row, dict):
                 continue
             normalized = _normalize(json.dumps(
@@ -987,7 +1063,37 @@ def build_source_object_inventory(
                 sort_keys=True,
                 default=str,
             ))
-            indexed_rows.append((sheet_key, normalized, set(_source_pages(row, page_count))))
+            pages = set(_source_pages(row, page_count))
+            row_evidence_ids = normalize_evidence_ids(
+                row.get("근거ID"), row.get("근거ID목록")
+            )
+            row_object_ids = [
+                value for value in (
+                    row.get("객체ID"), row.get("근거객체ID"),
+                ) if value
+            ]
+            descriptor_pages = sorted(pages) or [None]
+            for descriptor_page in descriptor_pages:
+                key = f"{sheet_key}:{row_index}:p{descriptor_page or 0}"
+                indexed_rows[key] = (sheet_key, normalized, pages, row)
+                result_descriptors.append(descriptor(
+                    key=key,
+                    page=descriptor_page,
+                    evidence_ids=row_evidence_ids,
+                    object_ids=row_object_ids,
+                    number=row.get("번호"),
+                    caption=row.get("캡션") or row.get("제목"),
+                    content=json.dumps(row, ensure_ascii=False, sort_keys=True, default=str),
+                ))
+
+    evidence_object_ids: dict[str, set[str]] = {}
+    for obj in objects:
+        obj_evidence_id = str(obj.metadata.get("evidence_id") or evidence_id(obj))
+        for value in normalize_evidence_ids(obj_evidence_id):
+            evidence_object_ids.setdefault(value, set()).add(obj.object_id)
+    ambiguous_evidence_ids = {
+        value for value, object_ids in evidence_object_ids.items() if len(object_ids) > 1
+    }
 
     partial_weight = max(
         0.0,
@@ -995,32 +1101,39 @@ def build_source_object_inventory(
     )
     results: list[SourceObjectVerification] = []
     for obj in objects:
-        identity_terms, cell_terms = _object_inventory_terms(obj)
+        evaluation_target = object_targets[obj.object_id]
         semantic_targets = infer_object_semantic_targets(obj)
-        same_page = [entry for entry in indexed_rows if obj.page_number in entry[2]]
-        identity_matches = [
-            entry for entry in indexed_rows
-            if any(term and term in entry[1] for term in identity_terms)
+        obj_evidence_id = str(obj.metadata.get("evidence_id") or evidence_id(obj))
+        match = match_object_evidence(
+            descriptor(
+                key=obj.object_id,
+                page=obj.page_number,
+                evidence_ids=[obj_evidence_id],
+                object_ids=[
+                    obj.object_id,
+                    *(obj.metadata.get("duplicate_object_ids") or []),
+                ],
+                number=obj.number,
+                caption=obj.caption,
+                content=" ".join(
+                    str(cell or "") for row in obj.rows[:20] for cell in row[:20]
+                ),
+            ),
+            result_descriptors,
+            ambiguous_evidence_ids=ambiguous_evidence_ids,
+        )
+        matched_entries = [
+            indexed_rows[key] for key in match.matched_keys if key in indexed_rows
         ]
-
-        confirmed: list[tuple[str, str, set[int]]] = []
-        for entry in same_page:
-            row_text = entry[1]
-            identity_hit = any(term and term in row_text for term in identity_terms)
-            cell_hits = {term for term in cell_terms if term and term in row_text}
-            if identity_hit or len(cell_hits) >= 2:
-                confirmed.append(entry)
-        if not confirmed and identity_matches:
-            confirmed = identity_matches
-
-        linked = confirmed or same_page
+        linked = matched_entries
         linked_sheets = sorted({
             config.SHEET_KEY_TO_NAME.get(sheet_key, sheet_key)
-            for sheet_key, _row_text, _pages in linked
+            for sheet_key, _row_text, _pages, _row in linked
         })
-        confirmed_sheet_keys = {
-            sheet_key for sheet_key, _row_text, _pages in confirmed
-        }
+        confirmed_sheet_keys = (
+            {sheet_key for sheet_key, _row_text, _pages, _row in matched_entries}
+            if match.confirmed else set()
+        )
         body_confirmed_keys = confirmed_sheet_keys.intersection(
             set(getattr(config, "EXTRACTION_SHEETS", []))
         )
@@ -1043,7 +1156,7 @@ def build_source_object_inventory(
             if allowed_sheets
             else ""
         )
-        if not semantic_targets or not confirmed:
+        if not semantic_targets or not match.confirmed:
             routing_status = "판정불가"
         elif any(sheet_key in body_confirmed_keys for sheet_key in allowed_sheet_keys):
             routing_status = "일치"
@@ -1053,18 +1166,26 @@ def build_source_object_inventory(
             routing_status = "본문미연결"
         else:
             routing_status = "판정불가"
-        if confirmed:
+        if evaluation_target == "triage_negative":
+            status = "제외후보"
+            score = 0.0
+            message = "비데이터로 분류된 객체를 Triage 평가 분모에 보존했습니다."
+        elif match.confirmed:
             status = "확인"
             score = 1.0
-            message = "객체 번호·캡션 또는 표 셀 값이 추출 행과 연결되었습니다."
-        elif same_page:
+            message = match.reason
+        elif match.status == "partial":
             status = "부분"
             score = partial_weight
-            message = "같은 페이지의 결과 행은 있으나 객체 식별값까지 확인되지 않았습니다."
+            message = match.reason
+        elif match.status == "ambiguous":
+            status = "검토필요"
+            score = 0.0
+            message = match.reason
         else:
             status = "미확인"
             score = 0.0
-            message = "이 원문 객체에 연결되는 결과 행을 찾지 못했습니다."
+            message = match.reason
         results.append(SourceObjectVerification(
             object_id=obj.object_id,
             object_type=obj.object_type,
@@ -1095,7 +1216,11 @@ def build_source_object_inventory(
             final_status=str(obj.metadata.get("final_status") or "needs_review"),
             attempt_count=int(obj.metadata.get("attempt_count") or 0),
             terminal_reason=str(obj.metadata.get("terminal_reason") or ""),
-            evidence_id=str(obj.metadata.get("evidence_id") or evidence_id(obj)),
+            evidence_id=obj_evidence_id,
+            match_stage=match.status,
+            matched_evidence_ids=list(match.matched_evidence_ids),
+            evaluation_target=evaluation_target,
+            triage_evaluation_status=_triage_evaluation_status(obj, evaluation_target),
             index_reference_pages=sorted({
                 int(page)
                 for page in (obj.metadata.get("index_reference_pages") or [])
@@ -1109,7 +1234,14 @@ def build_source_object_inventory(
         ))
 
     total = len(results)
-    coverage = sum(row.completeness_score for row in results) / total if total else 1.0
+    extraction_rows = [
+        row for row in results if row.evaluation_target in {"extraction", "review"}
+    ]
+    coverage_denominator = len(extraction_rows)
+    coverage = (
+        sum(row.completeness_score for row in extraction_rows) / coverage_denominator
+        if coverage_denominator else 1.0
+    )
     routing_statuses = {"일치", "오배치의심", "본문미연결"}
     routing_evaluable = sum(row.routing_status in routing_statuses for row in results)
     routing_mismatches = sum(
@@ -1118,14 +1250,42 @@ def build_source_object_inventory(
     return SourceObjectInventoryReport(
         rows=results,
         total_objects=total,
-        confirmed_objects=sum(row.status == "확인" for row in results),
-        partial_objects=sum(row.status == "부분" for row in results),
-        unconfirmed_objects=sum(row.status == "미확인" for row in results),
+        confirmed_objects=sum(row.status == "확인" for row in extraction_rows),
+        partial_objects=sum(row.status == "부분" for row in extraction_rows),
+        unconfirmed_objects=sum(
+            row.status in {"미확인", "검토필요"} for row in extraction_rows
+        ),
         coverage_ratio=coverage,
         routing_evaluable_objects=routing_evaluable,
         routing_mismatch_objects=routing_mismatches,
         routing_error_rate=(
             routing_mismatches / routing_evaluable if routing_evaluable else 0.0
+        ),
+        extraction_denominator_objects=coverage_denominator,
+        excluded_candidate_objects=sum(
+            row.evaluation_target == "triage_negative" for row in results
+        ),
+        review_candidate_objects=sum(
+            row.evaluation_target == "review" for row in results
+        ),
+        exact_match_objects=sum(
+            row.match_stage in {"exact_id", "exact_object_id"} for row in extraction_rows
+        ),
+        composite_match_objects=sum(row.match_stage == "composite" for row in extraction_rows),
+        ambiguous_match_objects=sum(row.match_stage == "ambiguous" for row in extraction_rows),
+        triage_evaluable_objects=len(results),
+        triage_missed_objects=sum(
+            row.triage_evaluation_status == "false_negative_candidate" for row in results
+        ),
+        triage_miss_rate=(
+            sum(
+                row.triage_evaluation_status == "false_negative_candidate"
+                for row in results
+            ) / coverage_denominator
+            if coverage_denominator else 0.0
+        ),
+        triage_unresolved_objects=sum(
+            row.triage_evaluation_status == "unresolved" for row in results
         ),
     )
 
@@ -1297,6 +1457,37 @@ def assess_quality(
         "source_objects_confirmed": source_inventory.confirmed_objects if source_inventory is not None else 0,
         "source_objects_partial": source_inventory.partial_objects if source_inventory is not None else 0,
         "source_objects_unconfirmed": source_inventory.unconfirmed_objects if source_inventory is not None else 0,
+        "source_object_extraction_denominator": (
+            source_inventory.extraction_denominator_objects if source_inventory is not None else 0
+        ),
+        "source_object_excluded_candidates": (
+            source_inventory.excluded_candidate_objects if source_inventory is not None else 0
+        ),
+        "source_object_review_candidates": (
+            source_inventory.review_candidate_objects if source_inventory is not None else 0
+        ),
+        "source_object_exact_matches": (
+            source_inventory.exact_match_objects if source_inventory is not None else 0
+        ),
+        "source_object_composite_matches": (
+            source_inventory.composite_match_objects if source_inventory is not None else 0
+        ),
+        "source_object_ambiguous_matches": (
+            source_inventory.ambiguous_match_objects if source_inventory is not None else 0
+        ),
+        "triage_evaluable_objects": (
+            source_inventory.triage_evaluable_objects if source_inventory is not None else 0
+        ),
+        "triage_missed_objects": (
+            source_inventory.triage_missed_objects if source_inventory is not None else 0
+        ),
+        "triage_miss_rate": round(
+            source_inventory.triage_miss_rate if source_inventory is not None else 0.0,
+            4,
+        ),
+        "triage_unresolved_objects": (
+            source_inventory.triage_unresolved_objects if source_inventory is not None else 0
+        ),
         # 아래 세 지표는 총점과 분리해 보고한다. 셀 정확도는 고정 골든셋
         # 평가를 명시적으로 실행한 경우에만 외부 평가 리포트에서 채워진다.
         "cell_accuracy": None,

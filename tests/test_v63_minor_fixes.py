@@ -87,8 +87,9 @@ def test_S1_감축목표의_일반_수치충돌은_기존_충돌경로를_유지
         _감축목표행(기준배출량=120),
     ])
 
-    assert len(cleaned["reduction_targets"]) == 1
-    assert cleaned["reduction_targets"][0]["데이터상태"] == "conflicting"
+    assert len(cleaned["reduction_targets"]) == 2
+    assert {row["기준배출량"] for row in cleaned["reduction_targets"]} == {100.0, 120.0}
+    assert all(row["데이터상태"] == "conflicting" for row in cleaned["reduction_targets"])
     assert any("중복 키 값 충돌" in issue["항목"] for issue in cleaned["validation_report"])
 
 

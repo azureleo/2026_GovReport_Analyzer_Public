@@ -6,7 +6,7 @@ import json
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 import config
 from utils.document_objects import DocumentObject, build_document_objects
@@ -56,6 +56,8 @@ _SEMANTIC_TERMS: dict[str, tuple[str, ...]] = {
     ),
     "foundation_measures": (
         "대응기반 강화", "대응 기반 강화", "기후위기 적응", "녹색성장", "교육 및 홍보",
+        "기후변화 감시", "기후 전망", "기후변화 영향", "취약성 평가", "기후 리스크",
+        "위험도", "ssp 시나리오", "rcp 시나리오", "재난방지",
     ),
     "governance_feedback": (
         "이행관리 및 환류", "이행관리 환류", "거버넌스", "추진체계", "환류 체계",
@@ -356,9 +358,13 @@ def infer_object_semantic_targets(obj: DocumentObject) -> list[SemanticTarget]:
     )
 
 
-def _page_targets(document: PDFContent) -> dict[int, SemanticTarget | None]:
+def _page_targets(
+    document: PDFContent,
+    document_objects: Sequence[DocumentObject] | None = None,
+) -> dict[int, SemanticTarget | None]:
     by_page: dict[int, list[DocumentObject]] = defaultdict(list)
-    for obj in build_document_objects(document.pages):
+    source_objects = document_objects if document_objects is not None else build_document_objects(document.pages)
+    for obj in source_objects:
         if obj.object_type in {"table", "chart", "figure"}:
             by_page[obj.page_number].append(obj)
 
@@ -456,6 +462,7 @@ def validate_and_reclassify(
     document: PDFContent,
     *,
     auto_reclassify: bool | None = None,
+    document_objects: Sequence[DocumentObject] | None = None,
 ) -> SemanticRoutingReport:
     """
     시트 의미를 검증하고 안전한 미래연도 배출전망 오배치만 자동 이동한다.
@@ -464,7 +471,7 @@ def validate_and_reclassify(
     계획시작연도보다 이른 행은 오배치 분모와 자동 이동에서 제외한다.
     """
     report = SemanticRoutingReport()
-    page_targets = _page_targets(document)
+    page_targets = _page_targets(document, document_objects)
     plan_start = _plan_start_year(final_data)
     if auto_reclassify is None:
         auto_reclassify = bool(getattr(config, "SEMANTIC_ROUTING_AUTO_RECLASSIFY", True))

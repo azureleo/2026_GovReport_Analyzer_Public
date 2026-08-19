@@ -83,11 +83,11 @@ def test_S1_재태깅으로_세부사업이_된_힌트없는_행은_현행키와
     cleaned = OrganizerAgent().organize({
         "municipality_name": "테스트시",
         "reduction_targets": [
-            _target_row(목표수준="부문"),
-            _target_row(목표수준="부문", 출처페이지=11),
+            _target_row(목표수준="부문", 근거ID="ev-card"),
+            _target_row(목표수준="부문", 출처페이지=11, 근거ID="ev-card"),
         ],
         "mitigation_projects": [
-            {"사업명": "공공건물 개선", "출처페이지": "10,11"},
+            {"사업명": "공공건물 개선", "출처페이지": "10,11", "근거ID": "ev-card"},
         ],
     })["reduction_targets"]
 

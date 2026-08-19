@@ -21,7 +21,11 @@ GUIDELINE_CONTEXT_RULES_V2: dict[str, list[str]] = {
     "annual_implementation": ["연차별", "이행계획", "단계별", "목표물량"],
     "quantitative_reductions": ["감축량", "감축원단위", "모니터링", "활동량", "배출계수", "정량사업"],
     "financial_plan": ["재정", "투자", "예산", "국비", "시비", "도비"],
-    "foundation_measures": ["적응", "공유재산", "국제협력", "교육", "녹색성장", "정의로운 전환"],
+    "foundation_measures": [
+        "적응", "공유재산", "국제협력", "교육", "녹색성장", "정의로운 전환",
+        "기후감시", "기후 전망", "기후영향", "취약성", "리스크", "위험도",
+        "SSP", "RCP", "재난방지",
+    ],
     "governance_feedback": ["이행관리", "환류", "점검체계", "탄소중립이행책임관"],
     "monitoring_performance": ["추진상황", "점검", "달성여부", "이행실적"],
     "changes_actions": ["변경과제", "미달성", "조치계획", "변경사유"],

@@ -106,7 +106,8 @@ class GapFillAgent:
 
         if sheet_key == "reduction_targets":
             years = {r.get("목표연도") for r in rows if isinstance(r, dict) and r.get("목표연도")}
-            missing = [year for year in (2030, 2050) if year not in years]
+            # 2050은 장기 비전 탐색 대상이며 정량 목표 행을 강제하지 않는다.
+            missing = [year for year in (2030,) if year not in years]
             if missing:
                 return True, "목표연도 누락: " + ", ".join(str(year) for year in missing)
             return False, ""
@@ -270,6 +271,7 @@ class GapFillAgent:
             lambda sb: self._reextract(sb["sheet_key"], _build_page_text(sb["batch"]), municipality),
             sheet_batches,
             workers=getattr(config, "TEXT_WORKERS", 4),
+            stats_label="gap_fill",
         )
 
         added_by_sheet: dict[str, list[dict]] = {}

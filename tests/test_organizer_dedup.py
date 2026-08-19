@@ -69,7 +69,7 @@ class OrganizerDedupTests(unittest.TestCase):
 
         # Then: 직간접구분 정규화 후 같은 dedup 키로 병합된다.
         self.assertEqual(cleaned["emissions_management"], [
-            {"지자체명": "서울특별시", "관리부문": "건물", "세부부문": "가정", "직간접구분": "직접", "연도": 2020, "배출량": 10.0, "단위": "천톤", "데이터상태": "reported"}
+            {"지자체명": "서울특별시", "관리부문": "건물", "세부부문": "가정", "직간접구분": "직접", "연도": 2020, "배출량": 10.0, "단위": "천톤", "데이터상태": "reported", "derivation_type": "explicit"}
         ])
 
 

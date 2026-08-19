@@ -15,6 +15,7 @@ class ProvenanceTests(unittest.TestCase):
         # Given / When / Then: 숫자·배열·문자열 출처가 같은 문자열 규칙으로 정규화된다.
         self.assertEqual(_normalize_provenance_pages(12), "12")
         self.assertEqual(_normalize_provenance_pages([13, "12", "p12~14"]), "12,13,14")
+        self.assertEqual(_normalize_provenance_pages("[표 1-1] p2"), "2")
         self.assertEqual(_normalize_provenance_pages(None), "")
 
     def test_merges_provenance_page_sets(self):

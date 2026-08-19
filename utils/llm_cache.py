@@ -4,6 +4,7 @@ import hashlib
 import json
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TypedDict
@@ -33,9 +34,24 @@ _CACHE_STATS: dict[str, int] = {
     "write": 0,
     "rejected": 0,
     "disabled": 0,
+    "coalesced": 0,
+    "singleflight_bypass": 0,
 }
+_CACHE_WAIT_SECONDS = 0.0
 # 병렬 호출 시 여러 스레드가 통계를 증가시키므로 보호한다.
 _CACHE_STATS_LOCK = threading.Lock()
+
+
+@dataclass(slots=True)
+class _InflightRequest:
+    event: threading.Event
+    owner_thread_id: int
+    response: str | None = None
+    error: BaseException | None = None
+
+
+_INFLIGHT: dict[str, _InflightRequest] = {}
+_INFLIGHT_LOCK = threading.Lock()
 
 
 def _bump_stat(key: str) -> None:
@@ -44,14 +60,25 @@ def _bump_stat(key: str) -> None:
 
 
 def reset_cache_stats() -> None:
+    global _CACHE_WAIT_SECONDS
     with _CACHE_STATS_LOCK:
         for key in _CACHE_STATS:
             _CACHE_STATS[key] = 0
+        _CACHE_WAIT_SECONDS = 0.0
 
 
-def get_cache_stats() -> dict[str, int]:
+def get_cache_stats() -> dict[str, int | float]:
     with _CACHE_STATS_LOCK:
-        return dict(_CACHE_STATS)
+        return {
+            **_CACHE_STATS,
+            "singleflight_wait_seconds": round(_CACHE_WAIT_SECONDS, 3),
+        }
+
+
+def _add_wait_seconds(seconds: float) -> None:
+    global _CACHE_WAIT_SECONDS
+    with _CACHE_STATS_LOCK:
+        _CACHE_WAIT_SECONDS += max(0.0, float(seconds))
 
 
 def _sha256_text(text: str) -> str:
@@ -65,6 +92,10 @@ def _cache_root() -> Path:
 
 def _is_enabled() -> bool:
     return bool(getattr(config, "LLM_CACHE_ENABLED", True))
+
+
+def _singleflight_enabled() -> bool:
+    return bool(getattr(config, "LLM_SINGLEFLIGHT_ENABLED", True))
 
 
 def _request_key(request: LLMCacheRequest) -> str:
@@ -84,6 +115,53 @@ def _request_key(request: LLMCacheRequest) -> str:
 def _cache_path(request: LLMCacheRequest) -> Path:
     key = _request_key(request)
     return _cache_root() / key[:2] / f"{key}.json"
+
+
+def _singleflight(
+    request: LLMCacheRequest,
+    producer: Callable[[], str],
+) -> str:
+    """동시에 들어온 동일 요청은 한 호출만 실행하고 나머지는 결과를 공유한다."""
+    if not _singleflight_enabled():
+        return producer()
+
+    key = _request_key(request)
+    thread_id = threading.get_ident()
+    with _INFLIGHT_LOCK:
+        state = _INFLIGHT.get(key)
+        if state is None:
+            state = _InflightRequest(threading.Event(), thread_id)
+            _INFLIGHT[key] = state
+            leader = True
+        elif state.owner_thread_id == thread_id:
+            # 같은 producer 안에서 같은 요청을 재귀 호출하면 대기 교착이 생기므로 우회한다.
+            _bump_stat("singleflight_bypass")
+            return producer()
+        else:
+            leader = False
+
+    if not leader:
+        started = time.perf_counter()
+        state.event.wait()
+        _add_wait_seconds(time.perf_counter() - started)
+        _bump_stat("coalesced")
+        if state.error is not None:
+            raise state.error
+        if state.response is None:
+            raise RuntimeError("동일 LLM 요청 단일화 결과가 비어 있습니다")
+        return state.response
+
+    try:
+        state.response = producer()
+        return state.response
+    except BaseException as exc:
+        state.error = exc
+        raise
+    finally:
+        state.event.set()
+        with _INFLIGHT_LOCK:
+            if _INFLIGHT.get(key) is state:
+                _INFLIGHT.pop(key, None)
 
 
 def _read_response(request: LLMCacheRequest) -> str | None:
@@ -155,18 +233,22 @@ def _is_valid_json_response(response: str) -> bool:
 def cached_response(request: LLMCacheRequest, producer: Callable[[], str]) -> str:
     if not _is_enabled():
         _bump_stat("disabled")
-        return producer()
+        return _singleflight(request, producer)
 
-    cached = _read_response(request)
-    if cached is not None:
-        _bump_stat("hit")
-        return cached
+    def load_or_produce() -> str:
+        # 단일 실행 잠금을 얻은 뒤 다시 읽어 직전 완료 요청과의 cache stampede도 막는다.
+        cached = _read_response(request)
+        if cached is not None:
+            _bump_stat("hit")
+            return cached
 
-    _bump_stat("miss")
-    response = producer()
-    try:
-        if _write_response(request, response):
-            _bump_stat("write")
-    except OSError:
+        _bump_stat("miss")
+        response = producer()
+        try:
+            if _write_response(request, response):
+                _bump_stat("write")
+        except OSError:
+            return response
         return response
-    return response
+
+    return _singleflight(request, load_or_produce)

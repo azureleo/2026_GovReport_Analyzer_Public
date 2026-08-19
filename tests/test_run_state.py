@@ -83,6 +83,83 @@ def test_retry_failed_only_executes_failed_but_not_missing(tmp_path: Path, monke
     assert resumed.should_execute(missing_id) is False
 
 
+def test_failed_retry_preserves_previous_partial_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    state = _state(tmp_path, monkeypatch)
+    batch_id = state.batch_id(
+        kind="sheet",
+        sheet_keys=["document_meta"],
+        page_nums=[1],
+        batch_text="partial",
+    )
+    partial_rows = [{"지자체명": "서울", "계획명": "기본계획", "출처페이지": 1}]
+    state.record_batch(
+        batch_id=batch_id,
+        kind="sheet",
+        sheet_keys=["document_meta"],
+        page_nums=[1],
+        status="partial",
+        result=partial_rows,
+        error="child timeout",
+        recovered=True,
+    )
+    state.record_batch(
+        batch_id=batch_id,
+        kind="sheet",
+        sheet_keys=["document_meta"],
+        page_nums=[1],
+        status="call_fail",
+        error="retry timeout",
+    )
+
+    record = state.record_for(batch_id)
+    assert record is not None
+    assert record["status"] == "partial"
+    assert record["result"] == partial_rows
+    assert "이전 부분 결과 보존" in record["error"]
+    assert state.should_execute(batch_id) is True
+
+    resumed = _state(tmp_path, monkeypatch, retry_failed_only=True)
+    resumed_record = resumed.record_for(batch_id)
+    assert resumed_record is not None
+    assert resumed_record["status"] == "partial"
+    assert resumed_record["result"] == partial_rows
+    assert resumed.should_execute(batch_id) is True
+
+
+def test_new_partial_retry_rows_are_merged_with_previous_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    state = _state(tmp_path, monkeypatch)
+    batch_id = state.batch_id(
+        kind="sheet",
+        sheet_keys=["document_meta"],
+        page_nums=[1, 2],
+        batch_text="partial merge",
+    )
+    first = {"지자체명": "서울", "계획명": "기본계획", "출처페이지": 1}
+    second = {"지자체명": "서울", "계획명": "시행계획", "출처페이지": 2}
+    state.record_batch(
+        batch_id=batch_id,
+        kind="sheet",
+        sheet_keys=["document_meta"],
+        page_nums=[1, 2],
+        status="partial",
+        result=[first],
+    )
+    state.record_batch(
+        batch_id=batch_id,
+        kind="sheet",
+        sheet_keys=["document_meta"],
+        page_nums=[1, 2],
+        status="partial",
+        result=[second],
+        error="second child timeout",
+    )
+
+    record = state.record_for(batch_id)
+    assert record is not None
+    assert record["status"] == "partial"
+    assert record["result"] == [first, second]
+
+
 def test_stable_merge_is_idempotent_and_preserves_entity_conflict() -> None:
     first = {"지자체명": "서울", "계획명": "기본계획", "발간기관": "서울시", "출처페이지": 2}
     conflict = {"지자체명": "서울", "계획명": "기본계획", "발간기관": "환경부", "출처페이지": 3}
