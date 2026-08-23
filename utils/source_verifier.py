@@ -247,6 +247,13 @@ class SourceObjectVerification:
     triage_evaluation_status: str = ""
     index_reference_pages: list[int] = field(default_factory=list)
     duplicate_object_ids: list[str] = field(default_factory=list)
+    physical_object_id: str = ""
+    canonical_object_id: str = ""
+    alias_object_ids: list[str] = field(default_factory=list)
+    physical_merge_status: str = "canonical"
+    physical_merge_methods: list[str] = field(default_factory=list)
+    physical_merge_confidence: float = 1.0
+    physical_bbox_union: tuple[float, float, float, float] | None = None
 
     def as_excel_row(self, municipality: str) -> dict[str, Any]:
         type_labels = {
@@ -294,6 +301,16 @@ class SourceObjectVerification:
             "보조연결시트": ", ".join(self.auxiliary_linked_sheets),
             "목차참조페이지": ",".join(str(page) for page in self.index_reference_pages),
             "중복객체ID": ", ".join(self.duplicate_object_ids),
+            "물리객체ID": self.physical_object_id,
+            "대표객체ID": self.canonical_object_id or self.object_id,
+            "별칭객체ID": ", ".join(self.alias_object_ids),
+            "물리통합상태": self.physical_merge_status,
+            "물리통합방식": ", ".join(self.physical_merge_methods),
+            "물리통합신뢰도": round(float(self.physical_merge_confidence), 3),
+            "물리통합좌표": (
+                json.dumps(list(self.physical_bbox_union), ensure_ascii=False)
+                if self.physical_bbox_union else ""
+            ),
         }
 
 
@@ -928,7 +945,11 @@ def _object_evaluation_target(obj: DocumentObject, page_text: str) -> str:
     """객체를 삭제하지 않고 추출·음성·검토 분모 중 하나로 배치한다."""
     if obj.object_type not in {"table", "chart", "figure", "image"}:
         return ""
-    if obj.metadata.get("render_proxy") or obj.metadata.get("triage_action") == "transport_only":
+    if (
+        obj.metadata.get("render_proxy")
+        or obj.metadata.get("context_only")
+        or obj.metadata.get("triage_action") == "transport_only"
+    ):
         return ""
     if obj.metadata.get("is_index_reference") or is_index_page(page_text):
         return ""
@@ -1069,7 +1090,7 @@ def build_source_object_inventory(
             )
             row_object_ids = [
                 value for value in (
-                    row.get("객체ID"), row.get("근거객체ID"),
+                    row.get("객체ID"), row.get("근거객체ID"), row.get("물리객체ID"),
                 ) if value
             ]
             descriptor_pages = sorted(pages) or [None]
@@ -1111,6 +1132,9 @@ def build_source_object_inventory(
                 evidence_ids=[obj_evidence_id],
                 object_ids=[
                     obj.object_id,
+                    obj.metadata.get("physical_object_id"),
+                    obj.metadata.get("canonical_object_id"),
+                    *(obj.metadata.get("alias_object_ids") or []),
                     *(obj.metadata.get("duplicate_object_ids") or []),
                 ],
                 number=obj.number,
@@ -1231,6 +1255,32 @@ def build_source_object_inventory(
                 for value in (obj.metadata.get("duplicate_object_ids") or [])
                 if value
             ],
+            physical_object_id=str(obj.metadata.get("physical_object_id") or ""),
+            canonical_object_id=str(
+                obj.metadata.get("canonical_object_id") or obj.object_id
+            ),
+            alias_object_ids=[
+                str(value)
+                for value in (obj.metadata.get("alias_object_ids") or [])
+                if value
+            ],
+            physical_merge_status=str(
+                obj.metadata.get("physical_merge_status") or "canonical"
+            ),
+            physical_merge_methods=[
+                str(value)
+                for value in (obj.metadata.get("physical_merge_methods") or [])
+                if value
+            ],
+            physical_merge_confidence=float(
+                obj.metadata.get("physical_merge_confidence") or 1.0
+            ),
+            physical_bbox_union=(
+                tuple(float(value) for value in obj.metadata.get("physical_bbox_union"))
+                if isinstance(obj.metadata.get("physical_bbox_union"), (list, tuple))
+                and len(obj.metadata.get("physical_bbox_union")) == 4
+                else None
+            ),
         ))
 
     total = len(results)

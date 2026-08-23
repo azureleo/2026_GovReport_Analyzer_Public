@@ -11,8 +11,11 @@ from utils.document_objects import DocumentObject
 from utils.physical_objects import (
     aggregate_identity_metadata,
     identity_from_document_object,
+    match_physical_objects,
     normalize_object_label as _normalize_physical_label,
     normalize_object_number as _normalize_physical_number,
+    normalize_object_ids,
+    object_type_family,
     same_physical_object,
 )
 
@@ -204,7 +207,17 @@ def _merge_duplicate_group(group: list[DocumentObject]) -> DocumentObject:
             merged.nearby_text = candidate.nearby_text
         if merged.bbox is None and candidate.bbox is not None:
             merged.bbox = candidate.bbox
-    aliases = sorted({obj.object_id for obj in group if obj.object_id != merged.object_id})
+    aliases = sorted({
+        value
+        for obj in group
+        for value in normalize_object_ids(
+            obj.object_id,
+            obj.metadata.get("canonical_object_id"),
+            obj.metadata.get("alias_object_ids"),
+            obj.metadata.get("duplicate_object_ids"),
+        )
+        if value != merged.object_id
+    })
     source_ids = {
         str(value)
         for obj in group
@@ -230,7 +243,7 @@ def _merge_duplicate_group(group: list[DocumentObject]) -> DocumentObject:
     existing_physical_id = next(
         (
             str(obj.metadata.get("physical_object_id") or "").strip()
-            for obj in group
+            for obj in [preferred, *group]
             if obj.metadata.get("physical_object_id")
         ),
         "",
@@ -240,6 +253,25 @@ def _merge_duplicate_group(group: list[DocumentObject]) -> DocumentObject:
         [identity_from_document_object(obj) for obj in group],
         existing_physical_id=existing_physical_id,
     ))
+    match_results = [
+        match_physical_objects(
+            identity_from_document_object(left),
+            identity_from_document_object(right),
+        )
+        for index, left in enumerate(group)
+        for right in group[index + 1:]
+    ]
+    merge_methods = sorted({result.method for result in match_results if result.same and result.method})
+    confidences = [result.confidence for result in match_results if result.same]
+    bboxes = [obj.bbox for obj in group if obj.bbox is not None]
+    merged.metadata.update({
+        "physical_merge_status": "alias_merged" if len(group) > 1 else "canonical",
+        "physical_merge_methods": merge_methods,
+        "physical_merge_confidence": min(confidences) if confidences else 1.0,
+        "physical_alias_count": len(aliases),
+        "physical_object_roles": sorted({_physical_object_role(obj) for obj in group}),
+        "physical_bbox_union": list(_bbox_union(bboxes)) if bboxes else None,
+    })
     evidence = next(
         (
             str(
@@ -268,25 +300,68 @@ def _same_evidence(left: DocumentObject, right: DocumentObject) -> bool:
     )
 
 
+def _physical_object_role(obj: DocumentObject) -> str:
+    metadata = obj.metadata
+    if metadata.get("context_only") or str(metadata.get("render_variant") or "") in {
+        "full_page_context", "fallback_full_page",
+    }:
+        return "context"
+    if metadata.get("panel_index"):
+        return "panel"
+    if metadata.get("render_proxy"):
+        return "render_proxy"
+    if metadata.get("caption_only"):
+        return "caption_proxy"
+    if metadata.get("missing_native"):
+        return "missing_native_proxy"
+    return "structured" if obj.rows else "native"
+
+
+def _bbox_union(
+    values: list[tuple[float, float, float, float]],
+) -> tuple[float, float, float, float]:
+    return (
+        min(value[0] for value in values),
+        min(value[1] for value in values),
+        max(value[2] for value in values),
+        max(value[3] for value in values),
+    )
+
+
 def deduplicate_evidence_objects(objects: Iterable[DocumentObject]) -> tuple[list[DocumentObject], int]:
     """동일 페이지의 native/OCR/VLM 표현을 한 근거 객체로 합친다."""
-    pending = [_copy_object(obj) for obj in objects]
+    buckets: dict[tuple[int, str], list[DocumentObject]] = {}
+    for obj in objects:
+        copied = _copy_object(obj)
+        buckets.setdefault(
+            (copied.page_number, object_type_family(copied.object_type)), []
+        ).append(copied)
+
     groups: list[list[DocumentObject]] = []
-    while pending:
-        seed = pending.pop(0)
-        group = [seed]
-        changed = True
-        while changed:
-            changed = False
-            remaining: list[DocumentObject] = []
-            for candidate in pending:
-                if any(_same_evidence(member, candidate) for member in group):
-                    group.append(candidate)
-                    changed = True
-                else:
-                    remaining.append(candidate)
-            pending = remaining
-        groups.append(group)
+    for pending in buckets.values():
+        bucket_groups: list[list[DocumentObject]] = []
+        for candidate in pending:
+            selected: list[DocumentObject] | None = None
+            for group in bucket_groups:
+                matches = [
+                    match_physical_objects(
+                        identity_from_document_object(member),
+                        identity_from_document_object(candidate),
+                    )
+                    for member in group
+                ]
+                # 한 구성원과 일치하더라도 다른 구성원이 명시적 패널 충돌이면
+                # 전이적 군집화로 합치지 않는다.
+                if any(result.blocked for result in matches):
+                    continue
+                if any(result.same for result in matches):
+                    selected = group
+                    break
+            if selected is None:
+                bucket_groups.append([candidate])
+            else:
+                selected.append(candidate)
+        groups.extend(bucket_groups)
     merged = [_merge_duplicate_group(group) for group in groups]
     merged.sort(key=lambda obj: (obj.page_number, obj.sequence, obj.object_type, obj.object_id))
     return merged, sum(len(group) - 1 for group in groups)

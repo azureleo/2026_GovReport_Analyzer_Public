@@ -168,6 +168,12 @@ REDUCTION_TARGET_CONTEXT_REVIEW_SCORE = _env_float(
 REDUCTION_TARGET_CONTEXT_MIN_ANNUAL_RUN = _env_int(
     "REDUCTION_TARGET_CONTEXT_MIN_ANNUAL_RUN", 4
 )
+# 06·12 시트의 행 증식을 보수적으로 억제한다. 고정 페이지나 지자체명 대신
+# 시트 의미 계약과 08·10 시트의 동일 근거를 사용하며, 제외 행은 내부 원장에 남긴다.
+# 12a 독립 시트 승격은 여러 지자체 문서에서 필드 밀도를 검증한 뒤 별도로 진행한다.
+SEMANTIC_OVEREXTRACTION_GUARD_ENABLED = _env_bool(
+    "SEMANTIC_OVEREXTRACTION_GUARD_ENABLED", True
+)
 QUALITY_THRESHOLD = _env_float("QUALITY_THRESHOLD", 70.0)
 QUALITY_MAX_WITHOUT_SOURCE_INVENTORY = _env_float("QUALITY_MAX_WITHOUT_SOURCE_INVENTORY", 95.0)
 
@@ -414,7 +420,8 @@ EXCEL_HEADERS = {
         "디지타이징필요", "관련시트",
         "참고자료여부", "참고자료근거", "시각구조유형",
         "음성재검증상태", "음성재검증근거", "자동병합정책",
-        "근거ID", "근거매칭상태", "병합상태", "병합차단사유",
+        "근거ID", "근거매칭상태", "물리객체ID", "렌더변형",
+        "렌더변형목록", "물리중복통합수", "병합상태", "병합차단사유",
     ],
     "17_보조검수후보": [
         "지자체명", "대상시트", "후보유형", "신뢰도", "근거페이지",
@@ -441,6 +448,8 @@ EXCEL_HEADERS = {
         "최종상태", "시도횟수", "종결사유", "근거ID",
         "근거매칭단계", "일치근거ID", "평가분모상태", "Triage평가상태",
         "허용시트", "보조연결시트", "목차참조페이지", "중복객체ID",
+        "물리객체ID", "대표객체ID", "별칭객체ID", "물리통합상태",
+        "물리통합방식", "물리통합신뢰도", "물리통합좌표",
     ],
     "90_코드북": [
         "코드유형", "코드", "라벨", "정의", "비고",
@@ -462,22 +471,28 @@ EXTRACTION_SHEETS = [
 # ──────────────────────────────────────────────────────────────────────
 # 시트 클러스터링 추출 (agent 모드 핵심 최적화)
 # ──────────────────────────────────────────────────────────────────────
-# 같은 페이지가 시트마다 따로 호출되는 중복(서울 기준 8.8×)을, 관련 시트를 묶어
-# "페이지 묶음당 1회 호출로 여러 시트 동시 추출"해 줄인다. 측정상 텍스트 호출 383→173회
-# (−55%), 입력 page-send 4514→2119(−53%). codex/claude처럼 호출당 오버헤드가 큰
-# agent 모드에서 시간·토큰 절감이 특히 크다.
+# 같은 페이지가 시트마다 따로 호출되는 중복을 관련 시트끼리만 묶어 줄인다.
+# 단독 그룹은 기존 per-sheet 경로를 그대로 사용하고, 결합 그룹만 한 번의 호출에서
+# 여러 시트를 추출한다. codex/claude처럼 호출당 오버헤드가 큰 agent 모드에서
+# 시간·토큰 절감 효과를 기대할 수 있다.
 #
-# 품질 주의(기본 비활성): 한 번에 2~4개 시트 스키마를 추출하면 출력 JSON이 길어져
+# 품질 주의(기본 비활성): 한 번에 여러 시트 스키마를 추출하면 출력 JSON이 길어져
 # 파싱 실패·시트별 정확도 저하 위험이 있다. 그래서 기본은 안전한 per-sheet(False)이며,
 # 실제 추출 A/B로 시트별 행 수·정확도 무회귀를 증명한 뒤 1로 켠다.
 EXTRACTION_SHEET_CLUSTERING = _env_bool("EXTRACTION_SHEET_CLUSTERING", False)
-# 클러스터는 (a) 원문에서 같은 구간을 공유하고 (b) 개념적으로 함께 읽히는 시트끼리 묶는다.
+# 클러스터는 원문 구간과 스키마 의미가 가까운 시트만 보수적으로 묶는다.
+# 행 수가 많거나 의미 경계가 중요한 시트는 단독으로 유지하고 그룹 크기는 최대 3개다.
 EXTRACTION_SHEET_CLUSTERS = [
-    ["document_meta", "plan_overview", "regional_conditions"],
-    ["emissions_regional", "emissions_management", "emissions_forecast"],
-    ["reduction_targets", "vision_strategy"],
-    ["mitigation_projects", "annual_implementation", "quantitative_reductions", "financial_plan"],
-    ["foundation_measures", "governance_feedback", "monitoring_performance", "changes_actions"],
+    ["document_meta", "plan_overview"],
+    ["regional_conditions"],
+    ["emissions_regional", "emissions_management"],
+    ["emissions_forecast"],
+    ["reduction_targets"],
+    ["vision_strategy"],
+    ["mitigation_projects", "annual_implementation"],
+    ["quantitative_reductions", "financial_plan"],
+    ["foundation_measures"],
+    ["governance_feedback", "monitoring_performance", "changes_actions"],
 ]
 
 # 시트 내부 키 → 엑셀 시트명 매핑
@@ -517,7 +532,7 @@ OPTIONAL_EXCEL_SHEETS = {
 # 사용자용 작성 데이터 집계에는 포함하지 않는다.
 INTERNAL_OBJECT_KEYS = {
     "object_triage", "ocr_document_objects", "document_objects",
-    "reduction_target_context",
+    "reduction_target_context", "semantic_contract_review",
 }
 
 # 행 단위 원문 대조를 위한 페이지 근거. 헤더에는 항상 맨 뒤에 추가하되,
@@ -720,6 +735,9 @@ IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT = _env_bool(
 # 데이터 차트만 보완한다. 백엔드는 vlm(기존 이미지 에이전트),
 # unlimited_ocr(사전 생성 Markdown/JSONL 디렉터리), none 중 하나다.
 SELECTIVE_OCR_ENABLED = _env_bool("SELECTIVE_OCR_ENABLED", True)
+# 동일 표·차트의 native/캡션/OCR/VLM 표현을 Triage 전에 하나의 물리 객체로
+# 통합한다. 원래 객체 ID는 alias로 보존하고 서로 다른 패널은 합치지 않는다.
+PHYSICAL_OBJECT_MERGE_ENABLED = _env_bool("PHYSICAL_OBJECT_MERGE_ENABLED", True)
 OCR_BACKEND = os.environ.get("OCR_BACKEND", "vlm").strip().lower() or "vlm"
 OCR_RESULTS_DIR = os.environ.get("OCR_RESULTS_DIR", "").strip()
 OCR_NATIVE_CONFIDENCE_THRESHOLD = _env_float("OCR_NATIVE_CONFIDENCE_THRESHOLD", 0.78)

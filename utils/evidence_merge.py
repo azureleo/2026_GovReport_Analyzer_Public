@@ -30,6 +30,12 @@ class EvidenceReference:
     engine: str = ""
     canonical_object_id: str = ""
     alias_object_ids: tuple[str, ...] = ()
+    physical_object_id: str = ""
+    render_group_id: str = ""
+    render_variant: str = ""
+    panel_index: int | None = None
+    panel_count: int = 0
+    context_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +136,12 @@ def _reference_from_document_object(row: dict[str, Any]) -> EvidenceReference | 
         engine=str(metadata.get("engine") or metadata.get("ocr_backend") or "").strip(),
         canonical_object_id=canonical_object_id,
         alias_object_ids=aliases,
+        physical_object_id=str(metadata.get("physical_object_id") or "").strip(),
+        render_group_id=str(metadata.get("render_group_id") or "").strip(),
+        render_variant=str(metadata.get("render_variant") or "").strip(),
+        panel_index=_normalize_positive_int(metadata.get("panel_index")),
+        panel_count=_normalize_positive_int(metadata.get("panel_count")) or 0,
+        context_only=bool(metadata.get("context_only")),
     )
 
 
@@ -172,6 +184,12 @@ def _reference_from_triage(row: dict[str, Any]) -> EvidenceReference | None:
         engine=str(row.get("engine") or row.get("backend") or "").strip(),
         canonical_object_id=canonical_object_id,
         alias_object_ids=aliases,
+        physical_object_id=str(row.get("physical_object_id") or "").strip(),
+        render_group_id=str(row.get("render_group_id") or "").strip(),
+        render_variant=str(row.get("render_variant") or "").strip(),
+        panel_index=_normalize_positive_int(row.get("panel_index")),
+        panel_count=_normalize_positive_int(row.get("panel_count")) or 0,
+        context_only=bool(row.get("context_only")),
     )
 
 
@@ -183,6 +201,16 @@ def _normalize_page(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return page if page > 0 else None
+
+
+def _normalize_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _normalize_bbox(value: Any) -> tuple[float, float, float, float] | None:
@@ -210,7 +238,13 @@ def _same_physical_object(left: EvidenceReference, right: EvidenceReference) -> 
             render_proxy=reference.render_proxy,
             missing_native=reference.missing_native,
             canonical_object_id=reference.canonical_object_id,
+            physical_object_id=reference.physical_object_id,
             alias_object_ids=reference.alias_object_ids,
+            render_group_id=reference.render_group_id,
+            render_variant=reference.render_variant,
+            panel_index=reference.panel_index,
+            panel_count=reference.panel_count,
+            context_only=reference.context_only,
         )
 
     return identities_match(identity(left), identity(right))
@@ -250,6 +284,20 @@ def _merge_reference(left: EvidenceReference, right: EvidenceReference) -> Evide
         engine=preferred.engine,
         canonical_object_id=preferred.canonical_object_id or preferred.object_id,
         alias_object_ids=aliases,
+        physical_object_id=(
+            preferred.physical_object_id
+            or left.physical_object_id
+            or right.physical_object_id
+        ),
+        render_group_id=preferred.render_group_id or left.render_group_id or right.render_group_id,
+        render_variant=preferred.render_variant or left.render_variant or right.render_variant,
+        panel_index=(
+            preferred.panel_index
+            if preferred.panel_index is not None
+            else left.panel_index if left.panel_index is not None else right.panel_index
+        ),
+        panel_count=max(preferred.panel_count, left.panel_count, right.panel_count),
+        context_only=preferred.context_only and left.context_only and right.context_only,
     )
 
 

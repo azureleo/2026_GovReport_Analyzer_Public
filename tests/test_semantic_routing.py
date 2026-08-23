@@ -56,6 +56,8 @@ def test_future_current_emission_on_forecast_table_is_reclassified() -> None:
                 "배출량": 100,
                 "단위": "천톤CO2eq",
                 "출처페이지": 10,
+                "근거ID": "ev-forecast-source",
+                "derivation_type": "normalized",
             },
         ],
         "emissions_forecast": [],
@@ -66,11 +68,85 @@ def test_future_current_emission_on_forecast_table_is_reclassified() -> None:
     assert [row["연도"] for row in final_data["emissions_regional"]] == [2021]
     assert final_data["emissions_forecast"][0]["연도"] == 2030
     assert final_data["emissions_forecast"][0]["전망값"] == 100
+    assert final_data["emissions_forecast"][0]["출처페이지"] == 10
+    assert final_data["emissions_forecast"][0]["근거ID"] == "ev-forecast-source"
+    assert final_data["emissions_forecast"][0]["derivation_type"] == "normalized"
     assert report.mismatches_before == 1
     assert report.mismatches_after == 0
     assert report.reclassified_rows == 1
     assert report.evaluable_rows == 1
     assert report.error_rate == 0.0
+
+
+def test_duplicate_forecast_merges_provenance_before_source_removal() -> None:
+    final_data = {
+        "document_meta": [{"계획시작연도": 2024}],
+        "emissions_regional": [{
+            "지자체명": "강원특별자치도",
+            "배출유형": "직접배출",
+            "부문": "건물",
+            "연도": 2030,
+            "배출량": 100,
+            "단위": "천톤CO2eq",
+            "출처페이지": 10,
+            "근거ID": "ev-current-sheet",
+            "derivation_type": "normalized",
+            "데이터상태": "visual_only",
+        }],
+        "emissions_forecast": [{
+            "지자체명": "강원특별자치도",
+            "시나리오": "BAU",
+            "부문": "건물",
+            "연도": 2030,
+            "전망값": 100,
+            "단위": "천톤CO2eq",
+            "출처페이지": 9,
+            "근거ID": "ev-forecast-sheet",
+            "derivation_type": "explicit",
+            "데이터상태": "reported",
+        }],
+    }
+
+    report = validate_and_reclassify(final_data, _forecast_document())
+
+    assert final_data["emissions_regional"] == []
+    assert len(final_data["emissions_forecast"]) == 1
+    forecast = final_data["emissions_forecast"][0]
+    assert forecast["출처페이지"] == "9,10"
+    assert forecast["근거ID"] == "ev-forecast-sheet"
+    assert forecast["근거ID목록"] == ["ev-forecast-sheet", "ev-current-sheet"]
+    assert forecast["derivation_type"] == "normalized"
+    assert forecast["데이터상태"] == "visual_only"
+    assert report.removed_duplicates == 1
+    assert report.reclassified_rows == 0
+    assert report.actions[0].action == "근거 병합 후 원본시트에서 제거"
+
+
+def test_reclassified_forecast_keeps_source_object_link() -> None:
+    document = _forecast_document()
+    evidence = _forecast_evidence_id()
+    final_data = {
+        "document_meta": [{"계획시작연도": 2024}],
+        "emissions_management": [{
+            "지자체명": "경기도",
+            "관리부문": "건물",
+            "연도": 2030,
+            "배출량": 100,
+            "단위": "천톤CO2eq",
+            "출처페이지": 10,
+            "근거ID": evidence,
+            "derivation_type": "explicit",
+        }],
+        "emissions_forecast": [],
+    }
+
+    validate_and_reclassify(final_data, document)
+    inventory = build_source_object_inventory(final_data, document)
+
+    assert final_data["emissions_management"] == []
+    assert final_data["emissions_forecast"][0]["근거ID"] == evidence
+    assert inventory.rows[0].linked_sheets == ["05_배출전망"]
+    assert inventory.rows[0].routing_status == "일치"
 
 
 def test_source_object_inventory_reports_wrong_sheet_semantics() -> None:

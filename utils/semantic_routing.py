@@ -10,6 +10,7 @@ from typing import Any, Sequence
 
 import config
 from utils.document_objects import DocumentObject, build_document_objects
+from utils.evidence_merge import normalize_evidence_ids
 from utils.pdf_reader import PDFContent
 
 
@@ -73,6 +74,33 @@ _SEMANTIC_TERMS: dict[str, tuple[str, ...]] = {
 _CURRENT_EMISSION_SHEETS = {"emissions_regional", "emissions_management"}
 _NON_SEMANTIC_KEYS = {
     "_row_id", "_entity_id", "출처페이지", "출처페이지추정", "데이터상태",
+}
+_PROVENANCE_COPY_FIELDS = (
+    "출처페이지",
+    "출처페이지추정",
+    "근거ID",
+    "근거ID목록",
+    "source_evidence_id",
+    "source_evidence_ids",
+    "객체ID",
+    "근거객체ID",
+    "물리객체ID",
+    "derivation_type",
+    "데이터상태",
+)
+_DERIVATION_PRIORITY = {
+    "explicit": 0,
+    "normalized": 1,
+    "calculated": 2,
+    "inferred": 3,
+    "external_lookup": 4,
+}
+_DATA_STATUS_PRIORITY = {
+    "reported": 0,
+    "gap_fill": 1,
+    "visual_only": 2,
+    "calculated": 3,
+    "conflicting": 4,
 }
 
 
@@ -430,6 +458,112 @@ def _row_summary(row: dict[str, Any]) -> str:
     return text if len(text) <= 300 else text[:299] + "…"
 
 
+def _copy_provenance(source: dict[str, Any], target: dict[str, Any]) -> None:
+    for field in _PROVENANCE_COPY_FIELDS:
+        value = source.get(field)
+        if value not in (None, "", [], ()):
+            target[field] = value
+
+    evidence_ids = normalize_evidence_ids(
+        source.get("근거ID"),
+        source.get("근거ID목록"),
+        source.get("source_evidence_id"),
+        source.get("source_evidence_ids"),
+    )
+    if evidence_ids:
+        target["근거ID"] = str(source.get("근거ID") or evidence_ids[0])
+        if len(evidence_ids) > 1:
+            target["근거ID목록"] = evidence_ids
+
+
+def _page_numbers(value: Any) -> list[int]:
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    pages: list[int] = []
+    for item in values:
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, (int, float)) and int(item) > 0:
+            page = int(item)
+            if page not in pages:
+                pages.append(page)
+            continue
+        for token in re.findall(r"(?:p|P)?\s*(\d{1,4})", str(item or "")):
+            page = int(token)
+            if page > 0 and page not in pages:
+                pages.append(page)
+    return pages
+
+
+def _merge_page_provenance(current: Any, incoming: Any) -> Any:
+    if current in (None, "", [], ()):
+        return incoming
+    if incoming in (None, "", [], ()):
+        return current
+    pages = sorted(set(_page_numbers(current)) | set(_page_numbers(incoming)))
+    if not pages:
+        return current
+    current_pages = _page_numbers(current)
+    if len(pages) == 1 and current_pages == pages:
+        return current
+    return ",".join(str(page) for page in pages)
+
+
+def _more_conservative_value(
+    current: Any,
+    incoming: Any,
+    priorities: dict[str, int],
+) -> Any:
+    current_text = str(current or "").strip()
+    incoming_text = str(incoming or "").strip()
+    if not current_text:
+        return incoming
+    if not incoming_text:
+        return current
+    if priorities.get(incoming_text, -1) > priorities.get(current_text, -1):
+        return incoming
+    return current
+
+
+def _merge_forecast_provenance(target: dict[str, Any], source: dict[str, Any]) -> None:
+    target["출처페이지"] = _merge_page_provenance(
+        target.get("출처페이지"), source.get("출처페이지")
+    )
+    if source.get("출처페이지추정") not in (None, "", [], ()):
+        target["출처페이지추정"] = _merge_page_provenance(
+            target.get("출처페이지추정"), source.get("출처페이지추정")
+        )
+
+    evidence_ids = normalize_evidence_ids(
+        target.get("근거ID"),
+        target.get("근거ID목록"),
+        target.get("source_evidence_id"),
+        target.get("source_evidence_ids"),
+        source.get("근거ID"),
+        source.get("근거ID목록"),
+        source.get("source_evidence_id"),
+        source.get("source_evidence_ids"),
+    )
+    if evidence_ids:
+        if not target.get("근거ID"):
+            target["근거ID"] = evidence_ids[0]
+        if len(evidence_ids) > 1:
+            target["근거ID목록"] = evidence_ids
+
+    target["derivation_type"] = _more_conservative_value(
+        target.get("derivation_type"),
+        source.get("derivation_type"),
+        _DERIVATION_PRIORITY,
+    )
+    target["데이터상태"] = _more_conservative_value(
+        target.get("데이터상태"),
+        source.get("데이터상태"),
+        _DATA_STATUS_PRIORITY,
+    )
+    for field in ("객체ID", "근거객체ID", "물리객체ID"):
+        if not target.get(field) and source.get(field):
+            target[field] = source[field]
+
+
 def _forecast_row(source_sheet: str, row: dict[str, Any], target: SemanticTarget) -> dict[str, Any]:
     sector = row.get("부문") if source_sheet == "emissions_regional" else row.get("관리부문")
     scenario = "BAU" if any("bau" in keyword.casefold() for keyword in target.keywords) else "기준전망"
@@ -447,7 +581,9 @@ def _forecast_row(source_sheet: str, row: dict[str, Any], target: SemanticTarget
         "출처페이지": row.get("출처페이지"),
         "데이터상태": row.get("데이터상태") or "reported",
     }
-    return {key: value for key, value in mapped.items() if value is not None}
+    mapped = {key: value for key, value in mapped.items() if value is not None}
+    _copy_provenance(row, mapped)
+    return mapped
 
 
 def _forecast_signature(row: dict[str, Any]) -> tuple[str, ...]:
@@ -481,11 +617,10 @@ def validate_and_reclassify(
     if not isinstance(forecast_rows, list):
         forecast_rows = []
         final_data["emissions_forecast"] = forecast_rows
-    forecast_signatures = {
-        _forecast_signature(row)
-        for row in forecast_rows
-        if isinstance(row, dict)
-    }
+    forecast_by_signature: dict[tuple[str, ...], dict[str, Any]] = {}
+    for row in forecast_rows:
+        if isinstance(row, dict):
+            forecast_by_signature.setdefault(_forecast_signature(row), row)
     source_snapshots = {
         sheet_key: list(rows)
         for sheet_key in getattr(config, "EXTRACTION_SHEETS", [])
@@ -542,13 +677,14 @@ def validate_and_reclassify(
                 mapped = _forecast_row(source_sheet, row, target)
                 signature = _forecast_signature(mapped)
                 removals[source_sheet].add(index)
-                if signature in forecast_signatures:
+                if signature in forecast_by_signature:
+                    _merge_forecast_provenance(forecast_by_signature[signature], mapped)
                     report.removed_duplicates += 1
                     status = "중복제거"
-                    action = "원본시트에서 제거"
+                    action = "근거 병합 후 원본시트에서 제거"
                 else:
                     forecast_rows.append(mapped)
-                    forecast_signatures.add(signature)
+                    forecast_by_signature[signature] = mapped
                     report.reclassified_rows += 1
                     status = "재분류"
                     action = "05_배출전망으로 이동"

@@ -173,6 +173,9 @@ JSON 형식:
 - 목표수준: 총괄/부문/세부부문/세부사업/연차경로
 - 개별 사업·과제 카드(관리번호·성과지표·추진계획 문맥)의 감축 목표는 세부사업. 부문 전체 목표 표(기준배출량·전망·목표배출량 구조)만 부문
 - 연도가 연속 나열된 연차별 감축량·감축률 경로표의 각 연도 행은 연차경로(그 연도 시점의 목표가 아님). 5년 단위 이정표 목표 표는 해당 없음
+- 사업의 활동량·목표물량·추진일정·예산·일반 이행실적은 감축목표가 아니다. 해당 값은 09_연차별이행계획·10_정량감축량에만 기록하고 06에 중복 생성하지 않는다
+- 세부사업·연차경로는 원문이 온실가스 감축량·목표배출량·감축률을 명시할 때만 생성한다
+- 표의 행 라벨인 'BAU', '기준배출량', '목표감축량', '목표배출량'을 부문명으로 기록하지 않는다
 - 목표수준은 항상 기입
 - 목표범위: 관리권한/관리권한+추가감축/지역전체
 - 목표범위는 원문 근거가 불확실하면 생략(추측 금지)
@@ -265,6 +268,9 @@ JSON 형식:
 - 감시·예측·영향·취약성·리스크·재난 평가 표와 지도를 별도 행으로 구조화한다
 - 평가유형: monitoring/projection/impact/vulnerability/risk/disaster
 - 값·등급·시나리오·기간은 원문에 보이는 경우에만 기록하고 추정하지 않는다
+- 장·절 제목이나 목차 문구만 반복한 행은 만들지 않는다. 정책 과제는 과제명과 정책방향·주요내용·부서·기간 중 실제 내용이 있어야 한다
+- 기후위험 행은 평가유형·기후변수·시나리오·리스크항목·취약성지표·값·등급 중 서로 연결되는 근거를 구조화한다. 일반 기후 서술 한 문장만으로 행을 만들지 않는다
+- 감축사업 목록과 같은 사업명이 보이더라도 대응기반 영역 또는 기후위험 문맥이 없으면 12에 중복 기록하지 않는다
 
 JSON 형식:
 {"foundation_measures": [{"지자체명": "...", "대응기반영역": "적응대책|공유재산|국제협력|교육소통|녹색성장|청정에너지|정의로운전환|인력양성", "과제ID": "...", "과제명": "...", "정책방향": "...", "주요내용": "...", "대상": "...", "주관부서": "...", "기간": "...", "평가유형": "monitoring|projection|impact|vulnerability|risk|disaster|null", "기후변수": "...", "시나리오": "...", "기준기간": "...", "미래기간": "...", "공간단위": "...", "부문": "...", "리스크항목": "...", "취약성지표": "...", "값": 숫자or null, "단위": "...", "리스크등급": "...", "방법론": "...", "자료출처": "...", "연계적응과제": "..."}]}
@@ -1663,16 +1669,47 @@ class ExtractorAgent:
         extraction_prompts: dict[str, str],
         batch_size: int,
     ) -> None:
-        clusters = getattr(config, "EXTRACTION_SHEET_CLUSTERS", [])
+        configured_clusters = getattr(config, "EXTRACTION_SHEET_CLUSTERS", [])
+        clusters: list[list[str]] = []
+        assigned: set[str] = set()
+        duplicate_members: list[str] = []
+        for configured in configured_clusters:
+            members: list[str] = []
+            for sheet_key in configured:
+                if sheet_key not in _SHEET_CONFIGS:
+                    continue
+                if sheet_key in assigned:
+                    duplicate_members.append(sheet_key)
+                    continue
+                members.append(sheet_key)
+                assigned.add(sheet_key)
+            if members:
+                clusters.append(members)
+
+        # 사용자 정의 클러스터가 불완전해도 추출 시트를 조용히 누락하지 않는다.
+        missing_members = [sheet_key for sheet_key in _SHEET_CONFIGS if sheet_key not in assigned]
+        clusters.extend([[sheet_key] for sheet_key in missing_members])
+
         by_num: dict[int, PageContent] = {}
         for v in routed_pages.values():
             for p in v:
                 by_num[p.page_number] = p
 
-        print(f"[에이전트2 텍스트추출] 시트 클러스터링 모드: {len(clusters)}개 그룹")
+        combined_count = sum(len(cluster) > 1 for cluster in clusters)
+        singleton_count = sum(len(cluster) == 1 for cluster in clusters)
+        print(
+            "[에이전트2 텍스트추출] 시트 클러스터링 모드: "
+            f"{len(clusters)}개 그룹(결합 {combined_count}, 단독 {singleton_count})"
+        )
+        if duplicate_members:
+            duplicate_label = ", ".join(dict.fromkeys(duplicate_members))
+            print(f"  - 중복 시트 정의 제외: {duplicate_label}")
+        if missing_members:
+            print(f"  - 미정의 시트 단독 보충: {', '.join(missing_members)}")
+
         tasks: list[dict] = []
-        for cluster in clusters:
-            members = [sk for sk in cluster if sk in _SHEET_CONFIGS]
+        schedule_order = 0
+        for members in clusters:
             nums: set[int] = set()
             for sk in members:
                 nums |= {p.page_number for p in routed_pages.get(sk, [])}
@@ -1685,19 +1722,48 @@ class ExtractorAgent:
                 page_range = (
                     f"p{page_nums[0]}~{page_nums[-1]}" if len(page_nums) > 1 else f"p{page_nums[0]}"
                 )
-                tasks.append({
-                    "members": members,
+                task = {
                     "pages": batch,
                     "batch_text": _build_page_text(batch),
                     "batch_num": batch_num,
                     "batch_total": len(batches),
                     "page_range": page_range,
                     "page_nums": page_nums,
-                })
+                    "schedule_order": schedule_order,
+                }
+                schedule_order += 1
+                if len(members) == 1:
+                    sheet_key = members[0]
+                    task.update({
+                        "sheet_key": sheet_key,
+                        "guideline_prompt": extraction_prompts.get(sheet_key, ""),
+                    })
+                else:
+                    task["members"] = members
+                tasks.append(task)
 
-        tasks = self._prepare_tasks(tasks, "cluster", extraction_prompts)
+        cluster_tasks = self._prepare_tasks(
+            [task for task in tasks if "members" in task],
+            "cluster",
+            extraction_prompts,
+        )
+        sheet_tasks = self._prepare_tasks(
+            [task for task in tasks if "members" not in task],
+            "sheet",
+            extraction_prompts,
+        )
+        tasks = sorted(
+            [*cluster_tasks, *sheet_tasks],
+            key=lambda task: int(task.get("schedule_order", 0)),
+        )
+
+        def run_task(task: dict) -> Any:
+            if "members" in task:
+                return self._run_cluster_task(task, municipality, extraction_prompts)
+            return self._run_sheet_task(task, municipality)
+
         results = parallel_map_collect(
-            lambda task: self._run_cluster_task(task, municipality, extraction_prompts),
+            run_task,
             tasks,
             workers=getattr(config, "TEXT_WORKERS", 4),
             stats_label="text_extraction",
@@ -1711,11 +1777,24 @@ class ExtractorAgent:
                             self._raw_results[sk] = self._merge_rows(
                                 sk, self._raw_results[sk], items,
                             )
+                elif isinstance(preserved, list):
+                    sheet_key = task["sheet_key"]
+                    rows = [row for row in preserved if isinstance(row, dict)]
+                    self._raw_results[sheet_key] = self._merge_rows(
+                        sheet_key, self._raw_results[sheet_key], rows,
+                    )
                 continue
             if res is None:
                 continue
-            for sk, items in res.items():
-                self._raw_results[sk] = self._merge_rows(sk, self._raw_results[sk], items)
+            if "members" in task:
+                for sk, items in res.items():
+                    self._raw_results[sk] = self._merge_rows(sk, self._raw_results[sk], items)
+            else:
+                sheet_key = task["sheet_key"]
+                rows = [row for row in res if isinstance(row, dict)]
+                self._raw_results[sheet_key] = self._merge_rows(
+                    sheet_key, self._raw_results[sheet_key], rows,
+                )
 
     def route_pages(self, pages: list[PageContent]) -> dict[str, list[PageContent]]:
         if getattr(config, "FULL_DOCUMENT_SCAN", False):

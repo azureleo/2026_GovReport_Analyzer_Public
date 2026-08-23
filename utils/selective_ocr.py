@@ -27,6 +27,7 @@ from utils.physical_objects import (
     aggregate_identity_metadata,
     aliases_from_metadata,
     identity_from_document_object,
+    match_physical_objects,
     normalize_object_ids,
     physical_object_id,
     same_physical_object,
@@ -87,6 +88,16 @@ def _bbox(value: Any) -> tuple[float, float, float, float] | None:
         except (TypeError, ValueError):
             return None
     return None
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _bbox_key(value: tuple[float, float, float, float] | None) -> str:
@@ -298,6 +309,11 @@ class TriageDecision:
     physical_object_id: str = ""
     alias_object_ids: list[str] = field(default_factory=list)
     source_object_ids: list[str] = field(default_factory=list)
+    render_group_id: str = ""
+    render_variant: str = ""
+    panel_index: int | None = None
+    panel_count: int = 0
+    context_only: bool = False
     reasons: list[str] = field(default_factory=list)
     backend: str = ""
     status: str = "planned"
@@ -324,6 +340,11 @@ class TriageDecision:
             "physical_object_id": self.physical_object_id,
             "alias_object_ids": list(self.alias_object_ids),
             "source_object_ids": list(self.source_object_ids),
+            "render_group_id": self.render_group_id,
+            "render_variant": self.render_variant,
+            "panel_index": self.panel_index,
+            "panel_count": self.panel_count,
+            "context_only": self.context_only,
             "reasons": list(self.reasons),
             "backend": self.backend,
             "status": self.status,
@@ -415,6 +436,11 @@ def build_triage_plan(
             or physical_object_id(identity),
             alias_object_ids=aliases,
             source_object_ids=source_object_ids,
+            render_group_id=str(obj.metadata.get("render_group_id") or "").strip(),
+            render_variant=str(obj.metadata.get("render_variant") or "").strip(),
+            panel_index=_positive_int(obj.metadata.get("panel_index")),
+            panel_count=_positive_int(obj.metadata.get("panel_count")) or 0,
+            context_only=bool(obj.metadata.get("context_only")),
             reasons=reasons,
             backend=backend if action == "ocr_required" else "",
             final_status=final_status,
@@ -475,6 +501,18 @@ def apply_triage_metadata(
                 row.get("source_object_ids"),
                 obj.object_id,
             ))
+            obj.metadata["render_group_id"] = str(
+                row.get("render_group_id") or obj.metadata.get("render_group_id") or ""
+            )
+            obj.metadata["render_variant"] = str(
+                row.get("render_variant") or obj.metadata.get("render_variant") or ""
+            )
+            if row.get("panel_index") is not None:
+                obj.metadata["panel_index"] = row.get("panel_index")
+            if row.get("panel_count"):
+                obj.metadata["panel_count"] = row.get("panel_count")
+            if row.get("context_only"):
+                obj.metadata["context_only"] = True
             if row.get("caption_only"):
                 obj.metadata["had_caption_proxy"] = True
             if row.get("render_proxy"):
@@ -498,7 +536,13 @@ def _triage_identity(decision: TriageDecision) -> PhysicalObjectIdentity:
         render_proxy=decision.render_proxy,
         missing_native=decision.missing_native,
         canonical_object_id=decision.canonical_object_id,
+        physical_object_id=decision.physical_object_id,
         alias_object_ids=tuple(decision.alias_object_ids),
+        render_group_id=decision.render_group_id,
+        render_variant=decision.render_variant,
+        panel_index=decision.panel_index,
+        panel_count=decision.panel_count,
+        context_only=decision.context_only,
     )
 
 
@@ -898,6 +942,7 @@ def vision_analyses_to_objects(analyses: list[dict[str, Any]]) -> list[DocumentO
         physical_id = (
             source_physical_values[0] if len(source_physical_values) == 1 else ""
         )
+        render_variant = str(analysis.get("render_variant") or "")
         objects.append(DocumentObject(
             object_id=f"vlm-p{page_number}-chart-{sequence}",
             object_type="table" if str(analysis.get("chart_type")) == "표" else "chart",
@@ -926,11 +971,12 @@ def vision_analyses_to_objects(analyses: list[dict[str, Any]]) -> list[DocumentO
                     else ""
                 ),
                 "negative_revalidation": dict(analysis.get("negative_revalidation") or {}),
-                "render_variant": analysis.get("render_variant", ""),
+                "render_variant": render_variant,
                 "reconstruction_method": analysis.get("reconstruction_method", ""),
                 "render_group_id": analysis.get("render_group_id", ""),
                 "panel_index": analysis.get("panel_index", 0),
                 "panel_count": analysis.get("panel_count", 0),
+                "context_only": render_variant in {"full_page_context", "fallback_full_page"},
                 "reference_context": (
                     analysis.get("reference_context") is True
                     or str(analysis.get("reference_context") or "").strip().casefold()
@@ -1439,11 +1485,28 @@ def render_ocr_candidate_images(
     except Exception:
         return []
     try:
-        grouped: dict[str, list[TriageDecision]] = {}
+        grouped: list[list[TriageDecision]] = []
         for row in required:
-            grouped.setdefault(row.evidence_id or row.object_id, []).append(row)
-        for evidence_key, rows in grouped.items():
+            selected: list[TriageDecision] | None = None
+            for group in grouped:
+                matches = [
+                    match_physical_objects(
+                        _triage_identity(member), _triage_identity(row)
+                    )
+                    for member in group
+                ]
+                if any(result.blocked for result in matches):
+                    continue
+                if any(result.same for result in matches):
+                    selected = group
+                    break
+            if selected is None:
+                grouped.append([row])
+            else:
+                selected.append(row)
+        for rows in grouped:
             row = rows[0]
+            physical_key = row.physical_object_id or row.evidence_id or row.object_id
             page = page_map.get(row.page_number)
             candidates = [object_map.get(item.object_id) for item in rows]
             candidates = [obj for obj in candidates if obj is not None]
@@ -1519,7 +1582,7 @@ def render_ocr_candidate_images(
                     "physical_reconstruction": region.variant != "fallback_full_page",
                     "panel_index": region.panel_index,
                     "panel_count": region.panel_count,
-                    "render_group_id": source_physical_ids[0] if source_physical_ids else evidence_key,
+                    "render_group_id": source_physical_ids[0] if source_physical_ids else physical_key,
                     "source_object_ids": source_object_ids,
                     "source_evidence_ids": source_evidence_ids,
                     "source_physical_object_ids": source_physical_ids,

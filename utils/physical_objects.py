@@ -33,7 +33,24 @@ class PhysicalObjectIdentity:
     render_proxy: bool = False
     missing_native: bool = False
     canonical_object_id: str = ""
+    physical_object_id: str = ""
     alias_object_ids: tuple[str, ...] = ()
+    render_group_id: str = ""
+    render_variant: str = ""
+    panel_index: int | None = None
+    panel_count: int = 0
+    context_only: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalObjectMatch:
+    """두 객체 표현의 통합 가능 여부와 판정 근거."""
+
+    same: bool
+    method: str = ""
+    confidence: float = 0.0
+    blocked: bool = False
+    reason: str = ""
 
 
 def normalize_object_label(value: object) -> str:
@@ -131,64 +148,107 @@ def identity_object_ids(identity: PhysicalObjectIdentity) -> set[str]:
     }
 
 
+def _panel_conflict(
+    left: PhysicalObjectIdentity,
+    right: PhysicalObjectIdentity,
+) -> bool:
+    """같은 렌더 그룹의 서로 다른 패널은 동일 객체로 합치지 않는다."""
+    if not left.render_group_id or left.render_group_id != right.render_group_id:
+        return False
+    if left.panel_index is None or right.panel_index is None:
+        return False
+    return left.panel_index != right.panel_index
+
+
+def match_physical_objects(
+    left: PhysicalObjectIdentity,
+    right: PhysicalObjectIdentity,
+) -> PhysicalObjectMatch:
+    """강한 구조적 근거만 사용해 물리 객체 통합 여부를 판정한다."""
+    if (
+        left.page_number is not None
+        and right.page_number is not None
+        and left.page_number != right.page_number
+    ):
+        return PhysicalObjectMatch(False, reason="페이지 불일치")
+
+    if _panel_conflict(left, right):
+        return PhysicalObjectMatch(
+            False,
+            "panel_conflict",
+            1.0,
+            blocked=True,
+            reason="같은 렌더 그룹의 서로 다른 패널",
+        )
+
+    left_ids = identity_object_ids(left)
+    right_ids = identity_object_ids(right)
+    if left_ids & right_ids:
+        return PhysicalObjectMatch(True, "shared_object_id", 1.0)
+
+    if (
+        left.physical_object_id
+        and left.physical_object_id == right.physical_object_id
+    ):
+        return PhysicalObjectMatch(True, "physical_object_id", 1.0)
+
+    if (
+        left.page_number is None
+        or right.page_number is None
+    ):
+        return PhysicalObjectMatch(False, reason="페이지 정보 부족")
+    if object_type_family(left.object_type) != object_type_family(right.object_type):
+        return PhysicalObjectMatch(False, reason="객체 유형 불일치")
+
+    both_have_evidence = bool(left.evidence_id and right.evidence_id)
+    same_evidence = both_have_evidence and left.evidence_id == right.evidence_id
+    if both_have_evidence and not same_evidence:
+        return PhysicalObjectMatch(False, reason="근거 ID 불일치")
+
+    left_number = normalize_object_number(left.number or left.caption)
+    right_number = normalize_object_number(right.number or right.caption)
+    same_number = bool(left_number and left_number == right_number)
+    similarity = caption_similarity(left, right)
+    overlap = bbox_iou(left.bbox, right.bbox)
+
+    # 페이지 렌더는 전송 변형이다. 빈 프록시는 같은 근거 ID에만 연결하고,
+    # 데이터가 있는 렌더 결과는 번호·캡션·좌표 중 추가 근거를 요구한다.
+    if left.render_proxy or right.render_proxy:
+        proxy = left if left.render_proxy else right
+        if same_evidence and not (proxy.caption or proxy.number or proxy.bbox):
+            return PhysicalObjectMatch(True, "transport_proxy", 0.98)
+        if same_evidence and (same_number or similarity >= 0.72 or overlap >= 0.50):
+            return PhysicalObjectMatch(True, "render_proxy_support", 0.94)
+        return PhysicalObjectMatch(False, reason="렌더 프록시의 물리 근거 부족")
+
+    left_placeholder = left.caption_only or left.missing_native
+    right_placeholder = right.caption_only or right.missing_native
+    if left_placeholder or right_placeholder:
+        if same_number and similarity >= 0.45:
+            return PhysicalObjectMatch(True, "caption_number", 0.96)
+        if same_evidence and (similarity >= 0.72 or overlap >= 0.35):
+            return PhysicalObjectMatch(True, "placeholder_support", 0.90)
+        if similarity >= 0.94:
+            return PhysicalObjectMatch(True, "caption_exact", 0.92)
+        return PhysicalObjectMatch(False, reason="캡션 프록시의 물리 근거 부족")
+
+    if same_number and (same_evidence or similarity >= 0.72):
+        return PhysicalObjectMatch(True, "number_caption", 0.96)
+
+    different_engine = bool(left.engine and right.engine and left.engine != right.engine)
+    if similarity >= 0.94 and (same_evidence or different_engine):
+        return PhysicalObjectMatch(True, "caption_engine", 0.92)
+    if overlap >= 0.80 and (same_evidence or different_engine):
+        return PhysicalObjectMatch(True, "bbox_overlap", 0.90)
+    return PhysicalObjectMatch(False, reason="통합 근거 부족")
+
+
 def same_physical_object(
     left: PhysicalObjectIdentity,
     right: PhysicalObjectIdentity,
 ) -> bool:
     """강한 구조적 근거가 있을 때만 두 표현을 동일 객체로 간주한다."""
-    left_ids = identity_object_ids(left)
-    right_ids = identity_object_ids(right)
-    if left_ids & right_ids:
-        return True
-
-    if (
-        left.page_number is None
-        or right.page_number is None
-        or left.page_number != right.page_number
-    ):
-        return False
-    if object_type_family(left.object_type) != object_type_family(right.object_type):
-        return False
-
-    both_have_evidence = bool(left.evidence_id and right.evidence_id)
-    same_evidence = both_have_evidence and left.evidence_id == right.evidence_id
-    if both_have_evidence and not same_evidence:
-        return False
-
-    # 페이지 렌더 이미지는 분석 전송 수단일 뿐이다. 같은 근거 ID에 연결된
-    # 실제 표·차트와는 합치되, 페이지의 다른 객체까지 흡수하지 않는다.
-    if left.render_proxy or right.render_proxy:
-        if same_evidence:
-            return True
-        left_number = normalize_object_number(left.number or left.caption)
-        right_number = normalize_object_number(right.number or right.caption)
-        return bool(
-            left_number
-            and left_number == right_number
-            and caption_similarity(left, right) >= 0.72
-        )
-
-    left_placeholder = left.caption_only or left.missing_native
-    right_placeholder = right.caption_only or right.missing_native
-    if left_placeholder or right_placeholder:
-        if same_evidence:
-            return True
-        left_number = normalize_object_number(left.number or left.caption)
-        right_number = normalize_object_number(right.number or right.caption)
-        if left_number and left_number == right_number:
-            return caption_similarity(left, right) >= 0.45
-        return caption_similarity(left, right) >= 0.94
-
-    left_number = normalize_object_number(left.number or left.caption)
-    right_number = normalize_object_number(right.number or right.caption)
-    similarity = caption_similarity(left, right)
-    if left_number and left_number == right_number and (same_evidence or similarity >= 0.72):
-        return True
-
-    different_engine = bool(left.engine and right.engine and left.engine != right.engine)
-    if similarity >= 0.94 and (same_evidence or different_engine):
-        return True
-    return bbox_iou(left.bbox, right.bbox) >= 0.80 and (same_evidence or different_engine)
+    return match_physical_objects(left, right).same
 
 
 def physical_object_id(identity: PhysicalObjectIdentity) -> str:
@@ -234,7 +294,13 @@ def identity_from_document_object(obj: Any) -> PhysicalObjectIdentity:
         render_proxy=bool(metadata.get("render_proxy")),
         missing_native=bool(metadata.get("missing_native")),
         canonical_object_id=str(metadata.get("canonical_object_id") or "").strip(),
+        physical_object_id=str(metadata.get("physical_object_id") or "").strip(),
         alias_object_ids=aliases,
+        render_group_id=str(metadata.get("render_group_id") or "").strip(),
+        render_variant=str(metadata.get("render_variant") or "").strip(),
+        panel_index=_positive_int(metadata.get("panel_index")),
+        panel_count=_positive_int(metadata.get("panel_count")) or 0,
+        context_only=bool(metadata.get("context_only")),
     )
 
 
@@ -265,10 +331,23 @@ def aggregate_identity_metadata(
             )
         ),
         "alias_object_ids": list(aliases),
+        "source_physical_object_ids": list(normalize_object_ids(
+            *(identity.physical_object_id for identity in values)
+        )),
         "had_caption_proxy": any(identity.caption_only for identity in values),
         "had_render_proxy": any(identity.render_proxy for identity in values),
         "had_missing_native_proxy": any(identity.missing_native for identity in values),
     }
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _page_number(value: Any) -> int | None:

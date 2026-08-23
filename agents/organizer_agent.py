@@ -32,6 +32,11 @@ from utils.reference_data import (
     normalise_key_text,
 )
 from utils.reduction_target_context import classify_reduction_target_rows
+from utils.semantic_contract_guard import (
+    apply_semantic_contract_guards,
+    guard_foundation_measures,
+    guard_reduction_targets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1645,6 +1650,91 @@ def _clean_foundation_measures(rows: list[dict], municipality: str) -> list[dict
     )
 
 
+def _semantic_guard_summary(records: list[dict]) -> tuple[str, str]:
+    reason_counts: dict[str, int] = {}
+    pages: set[int] = set()
+    for record in records:
+        for reason in record.get("reason_codes", []):
+            reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + 1
+        pages.update(
+            int(page)
+            for page in record.get("source_pages", [])
+            if isinstance(page, int) and page > 0
+        )
+    reasons = ", ".join(
+        f"{reason} {count}건"
+        for reason, count in sorted(reason_counts.items())
+    ) or "사유 미상"
+    page_summary = ",".join(f"p{page}" for page in sorted(pages)[:15]) or "미상"
+    if len(pages) > 15:
+        page_summary += ",…"
+    return reasons, page_summary
+
+
+def _mark_semantic_guarded_observations(
+    observations: list[dict],
+    records: list[dict],
+) -> None:
+    quarantined_ids = {
+        evidence_id
+        for record in records
+        for evidence_id in record.get("evidence_ids", [])
+        if evidence_id
+    }
+    if not quarantined_ids:
+        return
+    for observation in observations:
+        if not isinstance(observation, dict):
+            continue
+        observation_ids = set(normalize_evidence_ids(
+            observation.get("근거ID"),
+            observation.get("근거ID목록"),
+            observation.get("source_evidence_id"),
+            observation.get("source_evidence_ids"),
+        ))
+        if observation_ids & quarantined_ids:
+            _set_visual_merge_state(
+                observation,
+                "needs_review",
+                "06·12 의미 계약 과잉 추출 격리",
+            )
+
+
+def _apply_semantic_overextraction_guards(
+    cleaned: dict,
+    municipality: str,
+    observations: list[dict] | None = None,
+) -> list[dict]:
+    if not getattr(config, "SEMANTIC_OVEREXTRACTION_GUARD_ENABLED", True):
+        return []
+    records = apply_semantic_contract_guards(cleaned)
+    if not records:
+        return []
+
+    observations = observations or []
+    _mark_semantic_guarded_observations(observations, records)
+    by_sheet: dict[str, list[dict]] = {}
+    for record in records:
+        by_sheet.setdefault(str(record.get("sheet_key") or ""), []).append(record)
+    for sheet_key, sheet_records in sorted(by_sheet.items()):
+        reasons, pages = _semantic_guard_summary(sheet_records)
+        _remember_validation_issue(
+            municipality,
+            "경고",
+            _sheet_area(sheet_key),
+            "의미 계약 과잉 추출 격리",
+            f"{len(sheet_records)}건 격리; {reasons}; 페이지 {pages}",
+            "내부 semantic_contract_review 원장의 원행과 정식 대상 시트를 대조",
+            target_sheet_key=sheet_key,
+        )
+    sheet_counts = {
+        sheet_key: len(sheet_records)
+        for sheet_key, sheet_records in by_sheet.items()
+    }
+    print(f"[에이전트3 정리] 06·12 의미 계약 격리: {sheet_counts}")
+    return records
+
+
 def _clean_governance_feedback(rows: list[dict], municipality: str) -> list[dict]:
     for row in rows:
         row["지자체명"] = row.get("지자체명") or municipality
@@ -1767,6 +1857,12 @@ def _build_visual_inventory(observations: list[dict], municipality: str) -> list
             "자동병합정책": obs.get("자동병합정책", "standard") or "standard",
             "근거ID": obs.get("근거ID", "") or "",
             "근거매칭상태": obs.get("근거매칭상태", "") or "",
+            "물리객체ID": obs.get("물리객체ID", "") or "",
+            "렌더변형": obs.get("렌더변형", "") or "",
+            "렌더변형목록": ", ".join(
+                str(value) for value in (obs.get("렌더변형목록") or []) if value
+            ),
+            "물리중복통합수": int(obs.get("물리중복통합수") or 0),
             "병합상태": obs.get("병합상태", "") or "",
             "병합차단사유": obs.get("병합차단사유", "") or "",
         })
@@ -3279,6 +3375,11 @@ class OrganizerAgent:
             return []
         source_rows = [dict(row) for row in rows if isinstance(row, dict)]
         cleaned_rows = cleaner(source_rows, municipality)
+        if getattr(config, "SEMANTIC_OVEREXTRACTION_GUARD_ENABLED", True):
+            if sheet_key == "reduction_targets":
+                cleaned_rows, _ = guard_reduction_targets(cleaned_rows)
+            elif sheet_key == "foundation_measures":
+                cleaned_rows, _ = guard_foundation_measures(cleaned_rows)
         cleaned = {
             "municipality_name": municipality,
             sheet_key: [_normalize_row_provenance(row) for row in cleaned_rows],
@@ -3358,6 +3459,13 @@ class OrganizerAgent:
             evidence_contract_active=evidence_contract_active,
         )
         _drop_unfilled_visual_placeholders(cleaned)
+        # 06의 09·10 중복 상세행과 12의 제목 반복·무식별 행은 본문 시트에서
+        # 격리하되, 원행과 사유를 내부 감사 원장에 남겨 재검토 가능하게 한다.
+        cleaned["semantic_contract_review"] = _apply_semantic_overextraction_guards(
+            cleaned,
+            municipality,
+            observations,
+        )
         # 병합 게이트가 관찰값에 기록한 최종 상태를 16번 감사 시트에 반영한다.
         cleaned["visual_inventory"] = _build_visual_inventory(observations, municipality)
         _tag_prior_plan_rows(cleaned, municipality, prior_plan_pages or set())

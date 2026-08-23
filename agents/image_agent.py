@@ -24,6 +24,7 @@ from utils.evidence_merge import (
     normalize_evidence_ids,
 )
 from utils.pdf_reader import PDFContent, PageContent
+from utils.object_routing import deduplicate_evidence_objects
 from utils.selective_ocr import (
     apply_triage_metadata,
     build_triage_plan,
@@ -617,6 +618,49 @@ def _has_chart_value(item: dict) -> bool:
             "석유_비에너지유", "가스", "전력", "열", "신재생",
         ]
     )
+
+
+def _physical_observation_key(observation: dict) -> str:
+    physical_id = str(observation.get("물리객체ID") or "").strip()
+    render_variant = str(observation.get("렌더변형") or "").strip()
+    if not physical_id or not render_variant:
+        return ""
+    payload = {
+        "physical_object_id": physical_id,
+        "target_sheet": observation.get("대상시트"),
+        "title": observation.get("제목"),
+        "item": observation.get("항목"),
+        "year": observation.get("연도"),
+        "value": observation.get("값"),
+        "unit": observation.get("단위"),
+        "fields": observation.get("판독필드") or {},
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _physical_observation_duplicate(
+    observations: list[dict],
+    candidate: dict,
+) -> dict | None:
+    """다른 렌더 변형이 만든 완전 동일 값만 한 관찰값으로 통합한다."""
+    key = _physical_observation_key(candidate)
+    current_variant = str(candidate.get("렌더변형") or "").strip()
+    if not key:
+        return None
+    for existing in observations:
+        if not isinstance(existing, dict) or _physical_observation_key(existing) != key:
+            continue
+        variants = {
+            str(value).strip()
+            for value in (
+                existing.get("렌더변형목록")
+                or [existing.get("렌더변형")]
+            )
+            if str(value or "").strip()
+        }
+        if current_variant not in variants:
+            return existing
+    return None
 
 
 def _infer_chart_kind(item: dict, analysis: dict) -> str:
@@ -1414,6 +1458,12 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         if value_source == "unknown" and _is_table_like_chart(analysis):
             value_source = "table_cell"
         evidence_ids = normalize_evidence_ids(analysis.get("source_evidence_ids"))
+        physical_object_ids = [
+            str(value)
+            for value in (analysis.get("source_physical_object_ids") or [])
+            if str(value or "").strip()
+        ]
+        physical_object_ids = list(dict.fromkeys(physical_object_ids))
         blockers = list(reasons or [])
         if evidence_match is not None and not evidence_match.exact:
             blockers.append(evidence_match.reason)
@@ -1483,6 +1533,11 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             ),
             "근거ID목록": evidence_ids,
             "근거객체ID": ",".join(evidence_match.object_ids) if evidence_match is not None else "",
+            "물리객체ID": physical_object_ids[0] if len(physical_object_ids) == 1 else "",
+            "물리객체ID목록": physical_object_ids,
+            "렌더변형": analysis.get("render_variant", "") or "",
+            "렌더변형목록": [analysis.get("render_variant")] if analysis.get("render_variant") else [],
+            "물리중복통합수": 0,
             "근거매칭상태": evidence_match.status if evidence_match is not None else "legacy",
             "병합상태": merge_status,
             "병합차단사유": "" if merge_status in {"candidate", "merged"} else reason_text,
@@ -1501,7 +1556,19 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             evidence["대상시트근거"] = "재추론(summary)"
         if inferred_kind in {"현황", "전망", "목표"}:
             evidence["종류추론"] = inferred_kind
-        text_results.setdefault("chart_observations", []).append(evidence)
+        observations = text_results.setdefault("chart_observations", [])
+        if getattr(config, "PHYSICAL_OBJECT_MERGE_ENABLED", True):
+            duplicate = _physical_observation_duplicate(observations, evidence)
+            if duplicate is not None:
+                duplicate["렌더변형목록"] = list(dict.fromkeys([
+                    *(duplicate.get("렌더변형목록") or []),
+                    *(evidence.get("렌더변형목록") or []),
+                ]))
+                duplicate["물리중복통합수"] = int(
+                    duplicate.get("물리중복통합수") or 0
+                ) + 1
+                return
+        observations.append(evidence)
 
     def _merge_image_results(
         self,
@@ -2102,13 +2169,26 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         triage_decisions = []
         backend = None
         render_stats = {}
+        physical_stats = {}
 
         if selective_enabled:
-            native_objects = (
+            raw_native_objects = (
                 list(document_objects)
                 if document_objects is not None
                 else build_document_objects(pages)
             )
+            if getattr(config, "PHYSICAL_OBJECT_MERGE_ENABLED", True):
+                native_objects, physical_duplicates = deduplicate_evidence_objects(
+                    raw_native_objects
+                )
+            else:
+                native_objects = raw_native_objects
+                physical_duplicates = 0
+            physical_stats = {
+                "raw_object_total": len(raw_native_objects),
+                "physical_object_total": len(native_objects),
+                "physical_duplicates_merged": physical_duplicates,
+            }
             backend = get_ocr_backend(
                 getattr(config, "OCR_BACKEND", "vlm"),
                 getattr(config, "OCR_RESULTS_DIR", "") or None,
@@ -2126,7 +2206,8 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             native_kept = sum(row.action == "native_keep" for row in triage_decisions)
             print(
                 "[에이전트2b 이미지분석] 객체 기반 선택적 OCR: "
-                f"전체 {len(native_objects)}개 → 보완 {len(required)}개 "
+                f"원시 {len(raw_native_objects)}개 → 물리객체 {len(native_objects)}개 "
+                f"(중복통합 {physical_duplicates}개) → 보완 {len(required)}개 "
                 f"(PyMuPDF 충분 {native_kept}개, 백엔드 {backend.name})"
             )
 
@@ -2178,6 +2259,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     "ocr_objects": len(precomputed),
                     "object_total": len(native_objects),
                     "object_candidates": len(required),
+                    **physical_stats,
                 }
                 self._update_final_status_stats(triage_decisions)
                 print(
@@ -2342,6 +2424,8 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
 
         if render_stats:
             self._triage_stats.update(render_stats)
+        if physical_stats:
+            self._triage_stats.update(physical_stats)
 
         # 상한 적용은 명시적으로 설정한 경우에만 수행한다. 기본값은 전수 분석이다.
         max_images = getattr(config, "MAX_IMAGES", None)
@@ -2531,6 +2615,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 "ocr_objects": len(ocr_objects),
                 "object_total": len(native_objects),
                 "object_candidates": sum(row.action == "ocr_required" for row in triage_decisions),
+                **physical_stats,
             })
 
         return merged_results
@@ -2554,6 +2639,9 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     f"OCR/VLM 후보 {triage.get('object_candidates', 0)}개, "
                     f"보완 객체 {triage.get('ocr_objects', 0)}개 "
                     f"(백엔드 {triage.get('backend', 'vlm')})"
+                    f"\n  - 물리 객체 통합: 원시 {triage.get('raw_object_total', triage.get('object_total', 0))}개 → "
+                    f"대표 {triage.get('physical_object_total', triage.get('object_total', 0))}개 / "
+                    f"별칭 통합 {triage.get('physical_duplicates_merged', 0)}개"
                     f"\n  - 이미지 triage: 원본 {triage.get('raw', 0)}개 → "
                     f"통과 {triage.get('passed', 0)}개 / 필터 {triage.get('filtered', 0)}개"
                     f" / 참고자료 표시 {triage.get('reference_flagged', 0)}개"
