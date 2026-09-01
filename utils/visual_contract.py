@@ -9,7 +9,7 @@ import unicodedata
 from typing import Any, Sequence
 
 
-VISUAL_CONTRACT_VERSION = 4
+VISUAL_CONTRACT_VERSION = 5
 
 VISUAL_CHART_TYPES = frozenset({
     "막대", "꺾은선", "영역", "원", "표", "복합", "기타",

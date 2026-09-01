@@ -120,6 +120,117 @@ def test_시각_라벨병합은_게이트_미충족_사유를_행단위로_기�
     assert all(row["항목"] == "차단" for row in visual_issues)
 
 
+def test_G4_비완화시트는_명시_false여도_기존_참고판정을_유지한다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        config, "VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED", True, raising=False
+    )
+    observation = _관리권한_관찰값()
+    observation["참고자료여부"] = False
+    observation["자동병합정책"] = "standard"
+    observation["근거"] = json.dumps({
+        "관리부문": "건물",
+        "세부부문": "공공",
+        "직간접구분": "직접",
+        "설명": "국내외 사례 동향과 비교한 서울시 직접값",
+    }, ensure_ascii=False)
+
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    assert cleaned["emissions_management"] == []
+    assert cleaned["chart_observations"][0]["병합상태"] == "reject"
+
+
+def test_G4_지역여건_직접행은_긴_근거의_약한_키워드로_재차단하지_않는다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        config, "VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED", True, raising=False
+    )
+    observation = _시각_관찰값(
+        "regional_conditions",
+        {
+            "지표범주": "인문사회",
+            "지표명": "가구 수",
+            "항목": "서울시",
+            "연도": 2021,
+        },
+        value=4047,
+    )
+    observation.update({
+        "제목": "서울시 가구 수 추이",
+        "항목": "서울시",
+        "단위": "천가구",
+        "참고자료여부": False,
+        "자동병합정책": "standard",
+        "근거": json.dumps({
+            "지표범주": "인문사회",
+            "지표명": "가구 수",
+            "항목": "서울시",
+            "연도": 2021,
+            "설명": "국내외 사례 동향과 비교한 서울시 직접값",
+        }, ensure_ascii=False),
+    })
+
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    assert len(cleaned["regional_conditions"]) == 1
+    assert cleaned["chart_observations"][0]["병합상태"] == "accept"
+
+
+def test_G4_지역여건_전국행은_명시_false여도_차단한다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        config, "VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED", True, raising=False
+    )
+    observation = _시각_관찰값(
+        "regional_conditions",
+        {
+            "지표범주": "인문사회",
+            "지표명": "가구 수",
+            "항목": "전국",
+            "연도": 2021,
+        },
+        value=20400,
+    )
+    observation.update({
+        "제목": "전국 및 서울 가구 수 추이",
+        "항목": "전국",
+        "단위": "천가구",
+        "참고자료여부": False,
+        "자동병합정책": "standard",
+    })
+
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    assert cleaned["regional_conditions"] == []
+    assert cleaned["chart_observations"][0]["병합상태"] == "reject"
+
+
+def test_G4_레거시_플래그_부재는_객체_제목의_해외사례를_계속_차단한다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        config, "VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED", True, raising=False
+    )
+    observation = _관리권한_관찰값(title="OECD 해외사례 관리권한 배출량")
+
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    assert cleaned["emissions_management"] == []
+    assert "G4 참고자료/사례 판정" in cleaned["chart_observations"][0]["병합차단사유"]
+
+
 def test_시각_라벨병합은_실스키마의_estimated_부재만으로_G1을_차단하지_않는다(monkeypatch) -> None:
     # Given: 실제 라벨 판독처럼 estimated가 없거나, 추정값이거나, 판독필드 자체가 없는 관찰값이면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)

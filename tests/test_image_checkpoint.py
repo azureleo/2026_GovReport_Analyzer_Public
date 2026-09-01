@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 import config
-from agents.image_agent import ImageAgent
+from agents.image_agent import ImageAgent, VisionBatchContractError
 from utils import llm_client
 from utils.pdf_reader import PageContent
 from utils.run_state import RunState
@@ -115,6 +115,85 @@ def test_vision_batch_rejects_duplicate_indexes_even_when_all_indexes_exist(monk
 
     with pytest.raises(llm_client.LLMCallError, match="객체 계약 위반"):
         agent._chart_to_table_batch(_batch(), "서울특별시", fail_fast=True)
+
+
+def test_vision_batch_contract_error_exposes_only_unambiguous_rows(monkeypatch) -> None:
+    agent = ImageAgent()
+    monkeypatch.setattr(config, "VISION_NEGATIVE_REVALIDATION_ENABLED", False)
+    monkeypatch.setattr(
+        llm_client,
+        "call_vision_batch_json",
+        lambda *args, **kwargs: ({
+            "analyses": [
+                {"image_index": 1, "type": "해당없음"},
+                {"image_index": 1, "type": "해당없음"},
+                {"image_index": 2, "type": "해당없음"},
+            ],
+        }, True),
+    )
+
+    with pytest.raises(VisionBatchContractError) as caught:
+        agent._chart_to_table_batch(_batch(), "서울특별시", fail_fast=True)
+
+    assert caught.value.unresolved_indexes == [1]
+    assert [row["page_number"] for row in caught.value.partial_rows] == [11]
+
+
+def test_partial_vision_success_retries_only_missing_objects(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISION_CHECKPOINT_ENABLED", True)
+    monkeypatch.setattr(config, "VISION_SPLIT_ON_FAILURE", True)
+    monkeypatch.setattr(config, "VISION_RECOVERY_MAX_SPLIT_DEPTH", 2)
+    monkeypatch.setattr(config, "VISION_NEGATIVE_REVALIDATION_ENABLED", False)
+    calls: list[int] = []
+
+    def partial_then_success(batch, municipality, fail_fast=False):
+        calls.append(len(batch))
+        if len(batch) == 2:
+            raise VisionBatchContractError(
+                "missing index 2",
+                partial_rows=[{"page_number": 10, "type": "해당없음"}],
+                unresolved_indexes=[2],
+            )
+        return [{"page_number": batch[0][0].page_number, "type": "해당없음"}]
+
+    agent = ImageAgent(run_state=_state(tmp_path, monkeypatch))
+    monkeypatch.setattr(agent, "_chart_to_table_batch", partial_then_success)
+    task = {"batch": _batch(), "batch_num": 1, "batch_total": 1, "split_depth": 0}
+
+    rows = agent._run_vision_task(task, "서울특별시")
+
+    assert calls == [2, 1]
+    assert [row["page_number"] for row in rows] == [10, 11]
+    assert agent.split_batches == 1
+    assert agent.run_state.record_for(task["batch_id"])["status"] == "ok"
+
+
+def test_partial_vision_success_survives_failed_missing_object_recovery(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(config, "VISION_CHECKPOINT_ENABLED", True)
+    monkeypatch.setattr(config, "VISION_SPLIT_ON_FAILURE", True)
+    monkeypatch.setattr(config, "VISION_RECOVERY_MAX_SPLIT_DEPTH", 1)
+    monkeypatch.setattr(config, "VISION_NEGATIVE_REVALIDATION_ENABLED", False)
+
+    def partial_then_timeout(batch, municipality, fail_fast=False):
+        if len(batch) == 2:
+            raise VisionBatchContractError(
+                "missing index 2",
+                partial_rows=[{"page_number": 10, "type": "해당없음"}],
+                unresolved_indexes=[2],
+            )
+        raise llm_client.LLMTimeoutError("singleton timeout")
+
+    agent = ImageAgent(run_state=_state(tmp_path, monkeypatch))
+    monkeypatch.setattr(agent, "_chart_to_table_batch", partial_then_timeout)
+    task = {"batch": _batch(), "batch_num": 1, "batch_total": 1, "split_depth": 0}
+
+    rows = agent._run_vision_task(task, "서울특별시")
+
+    assert [row["page_number"] for row in rows] == [10]
+    assert agent.run_state.record_for(task["batch_id"])["status"] == "partial"
 
 
 def test_object_attempt_limit_stops_before_unbounded_singleton_retries(monkeypatch) -> None:

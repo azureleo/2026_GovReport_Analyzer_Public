@@ -304,6 +304,28 @@ VISUAL_MERGE_LABELED_ENABLED = _env_bool("VISUAL_MERGE_LABELED_ENABLED", True)
 # 객체 인벤토리가 연결된 운영 경로에서는 단일 근거 ID가 단일 extracted 객체와
 # 정확히 일치한 시각 후보만 본문 시트에 병합한다. 나머지는 16번 시트에 격리한다.
 VISUAL_EVIDENCE_MERGE_ENABLED = _env_bool("VISUAL_EVIDENCE_MERGE_ENABLED", True)
+# 02_지역여건 시각 후보에 값·연도·정확 근거가 이미 있을 때만 캡션과 차트 문맥으로
+# 누락된 범주를 보완한다. 애매한 문맥은 기존처럼 needs_review에 남긴다.
+REGIONAL_VISUAL_ENRICHMENT_ENABLED = _env_bool(
+    "REGIONAL_VISUAL_ENRICHMENT_ENABLED", True
+)
+VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED = _env_bool(
+    "VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED", True
+)
+# 운반된 근거 ID만 신뢰하지 않고 표·그림 번호, 원본/물리 객체 ID, 패널,
+# 좌표, 캡션 순서로 하나의 원문 객체를 확정한다. 복수 객체는 자동 병합하지 않는다.
+VISUAL_EXACT_OBJECT_RESOLUTION_ENABLED = _env_bool(
+    "VISUAL_EXACT_OBJECT_RESOLUTION_ENABLED", True
+)
+VISUAL_FIELD_COMPOSITION_ENABLED = _env_bool(
+    "VISUAL_FIELD_COMPOSITION_ENABLED", True
+)
+# G4 완화는 시각값의 직접 통계 전환 효과가 확인된 시트에만 적용한다. 다른 시트는
+# 기존 참고 키워드 판정을 유지해 이행평가·설비현황 등이 사업 목록으로 유입되지 않게 한다.
+VISUAL_REFERENCE_GATE_RELAXED_SHEETS = set(_env_list(
+    "VISUAL_REFERENCE_GATE_RELAXED_SHEETS",
+    ["regional_conditions"],
+))
 # 운영 Vision 결과를 모델 호출 없이 병합 정책 A/B에 재사용할 수 있도록
 # 정제 직전의 최소 입력을 gzip JSON 스냅샷으로 보존한다.
 VISUAL_MERGE_SNAPSHOT_ENABLED = _env_bool("VISUAL_MERGE_SNAPSHOT_ENABLED", True)
@@ -420,8 +442,10 @@ EXCEL_HEADERS = {
         "디지타이징필요", "관련시트",
         "참고자료여부", "참고자료근거", "시각구조유형",
         "음성재검증상태", "음성재검증근거", "자동병합정책",
-        "근거ID", "근거매칭상태", "물리객체ID", "렌더변형",
+        "근거ID", "근거매칭상태", "근거분리방식", "원본객체ID",
+        "물리객체ID", "렌더그룹ID", "패널인덱스", "패널수", "근거좌표", "렌더변형",
         "렌더변형목록", "물리중복통합수", "병합상태", "병합차단사유",
+        "필드조합상태", "필드조합목록", "필드조합근거", "필드조합충돌",
     ],
     "17_보조검수후보": [
         "지자체명", "대상시트", "후보유형", "신뢰도", "근거페이지",

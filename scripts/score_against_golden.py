@@ -174,6 +174,10 @@ def score_workbooks(output_path: str | Path, golden_path: str | Path, *, report_
             문자유사관찰들,
             스케일동치쌍들,
         ) = 시트점수(sheet_name, golden_sheet, output_sheet)
+        if golden_sheet.상태 == "정상" and sheet_name != "00_문서메타":
+            sheet_source = 출처집계초기화()
+            출처집계반영(sheet_source, golden_sheet.행들, matches, row_values)
+            summary["출처유형별"] = 출처직렬화(sheet_source)
         sheet_results[sheet_name] = summary
         all_missing_golden.extend(missing_golden)
         all_missing_output.extend(missing_output)

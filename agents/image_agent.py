@@ -20,11 +20,12 @@ from utils.document_objects import DocumentObject, build_document_objects
 from utils.evidence_merge import (
     EvidenceMatch,
     build_evidence_catalog,
-    match_evidence,
     normalize_evidence_ids,
+    resolve_observation_evidence,
 )
 from utils.pdf_reader import PDFContent, PageContent
 from utils.object_routing import deduplicate_evidence_objects
+from utils.physical_objects import normalize_object_ids
 from utils.selective_ocr import (
     apply_triage_metadata,
     build_triage_plan,
@@ -94,6 +95,8 @@ DePlot 방식처럼 그래프 이미지를 먼저 선형화된 표 데이터로 
 16. 구조 도표는 수치가 없어도 노드·단계·관계를 행 단위로 분리하고 fields에 구조역할, 상위항목, 관계, 순서, 단계, 담당주체, 설명을 기록하세요.
 17. 전략 체계도는 target_sheet=vision_strategy, 기후위험 지도·리스크 행렬은 foundation_measures, 지역 현황 인포그래픽은 regional_conditions로 분류하세요.
 18. 구조를 읽을 수 있지만 기존 시트에 안전하게 매핑할 수 없으면 target_sheet=other로 두고 내용을 버리지 마세요.
+19. 캡션, X축, Y축, 범례를 서로 섞지 말고 각각 caption, x_axis, y_axis, legend에 원문 그대로 기록하세요.
+20. 각 값 행이 범례 계열에서 왔으면 fields.범례항목, 축 범주에서 왔으면 fields.축항목에 해당 라벨을 그대로 기록하세요.
 
 시트별 fields 예시:
 - vehicle: {"용도": "승용", "차종": "전기", "대수": 123, "주행거리": 45.1}
@@ -118,6 +121,21 @@ NEGATIVE_REVALIDATION_SYSTEM = """당신은 탄소중립 보고서의 시각자�
 보이는 텍스트·수치·단위·노드·관계만 기록하고 추측하거나 계산하지 마세요.
 실제로 사진·로고·장식·데이터 없는 홍보물이면 type을 해당없음으로 유지하세요.
 반드시 JSON만 반환하세요."""
+
+
+class VisionBatchContractError(llm_client.LLMCallError):
+    """A batch response that contains usable rows but misses object indexes."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial_rows: list[dict],
+        unresolved_indexes: list[int],
+    ) -> None:
+        super().__init__(message)
+        self.partial_rows = partial_rows
+        self.unresolved_indexes = unresolved_indexes
 
 
 _NEGATIVE_VISUAL_TYPES = frozenset({"해당없음", "not_relevant", "none", "irrelevant"})
@@ -1099,6 +1117,10 @@ class ImageAgent:
   "target_sheet": "regional_conditions|emissions_regional|emissions_management|emissions_forecast|reduction_targets|vision_strategy|mitigation_projects|financial_plan|foundation_measures|other",
   "chart_type": "막대|꺾은선|영역|원|표|복합|diagram|infographic|flow|strategy_map|risk_map|risk_matrix|기타",
   "title": "그래프/표 제목",
+  "caption": "그림·표 번호를 포함한 캡션 원문",
+  "x_axis": {{"title": "X축 제목", "unit": "X축 단위", "labels": ["축 라벨"]}},
+  "y_axis": {{"title": "Y축 제목", "unit": "Y축 단위", "labels": ["축 라벨"]}},
+  "legend": ["범례 원문"],
   "unit": "단위 원문",
   "page_number": {page_num},
   "table": [
@@ -1108,7 +1130,7 @@ class ImageAgent:
       "종류": "현황|전망|목표|기타",
       "값": 12345,
       "단위": "단위 원문",
-      "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU 또는 SSP/RCP", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "...", "평가유형": "projection|impact|vulnerability|risk|disaster", "기후변수": "...", "기준기간": "...", "미래기간": "...", "공간단위": "...", "리스크항목": "...", "취약성지표": "...", "리스크등급": "...", "구조역할": "비전|목표|전략|과제|단계|주체|지표|기타", "상위항목": "...", "관계": "포함|연결|선행|후속", "순서": 1, "단계": "...", "담당주체": "...", "설명": "..."}}
+      "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "범례항목": "이 행의 범례 계열 원문", "축항목": "이 행의 축 범주 원문", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU 또는 SSP/RCP", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "...", "평가유형": "projection|impact|vulnerability|risk|disaster", "기후변수": "...", "기준기간": "...", "미래기간": "...", "공간단위": "...", "리스크항목": "...", "취약성지표": "...", "리스크등급": "...", "구조역할": "비전|목표|전략|과제|단계|주체|지표|기타", "상위항목": "...", "관계": "포함|연결|선행|후속", "순서": 1, "단계": "...", "담당주체": "...", "설명": "..."}}
     }}
   ],
   "summary": "이미지 내용 요약 1문장",
@@ -1122,6 +1144,7 @@ class ImageAgent:
 fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣고, 확신이 없으면 생략하세요(추측 금지).
 이미지에 숫자축만 있고 정확한 값을 읽기 어려우면 대략값을 만들지 말고 null로 반환하세요.
 항목명·범례명·부호·기간·단위는 원문 그대로 기록하고 동의어나 축약어로 바꾸지 마세요.
+캡션·X축·Y축·범례는 각각 caption, x_axis, y_axis, legend에 분리하여 기록하고, 행별 계열/범주는 fields.범례항목 또는 fields.축항목에 기록하세요.
 `21~30년` 같은 기간은 연도=null, fields.기간원문="21~30년"으로 기록하세요.
 BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에 묶지 말고 값 하나당 table 한 행으로 분리하세요.
 합계와 세부값이 함께 보이면 모두 별도 행으로 반환하고 동일한 fields.합계그룹을 부여하세요.
@@ -1209,6 +1232,10 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
       "target_sheet": "regional_conditions|emissions_regional|emissions_management|emissions_forecast|reduction_targets|vision_strategy|mitigation_projects|financial_plan|foundation_measures|other",
       "chart_type": "막대|꺾은선|영역|원|표|복합|diagram|infographic|flow|strategy_map|risk_map|risk_matrix|기타",
       "title": "그래프/표 제목",
+      "caption": "그림·표 번호를 포함한 캡션 원문",
+      "x_axis": {{"title": "X축 제목", "unit": "X축 단위", "labels": ["축 라벨"]}},
+      "y_axis": {{"title": "Y축 제목", "unit": "Y축 단위", "labels": ["축 라벨"]}},
+      "legend": ["범례 원문"],
       "unit": "단위 원문",
       "table": [
         {{
@@ -1217,7 +1244,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
           "종류": "현황|전망|목표|기타",
           "값": 12345,
           "단위": "단위 원문",
-          "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU 또는 SSP/RCP", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "...", "평가유형": "projection|impact|vulnerability|risk|disaster", "기후변수": "...", "기준기간": "...", "미래기간": "...", "공간단위": "...", "리스크항목": "...", "취약성지표": "...", "리스크등급": "...", "구조역할": "비전|목표|전략|과제|단계|주체|지표|기타", "상위항목": "...", "관계": "포함|연결|선행|후속", "순서": 1, "단계": "...", "담당주체": "...", "설명": "..."}}
+          "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "범례항목": "이 행의 범례 계열 원문", "축항목": "이 행의 축 범주 원문", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU 또는 SSP/RCP", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "...", "평가유형": "projection|impact|vulnerability|risk|disaster", "기후변수": "...", "기준기간": "...", "미래기간": "...", "공간단위": "...", "리스크항목": "...", "취약성지표": "...", "리스크등급": "...", "구조역할": "비전|목표|전략|과제|단계|주체|지표|기타", "상위항목": "...", "관계": "포함|연결|선행|후속", "순서": 1, "단계": "...", "담당주체": "...", "설명": "..."}}
         }}
       ],
       "summary": "이미지 내용 요약 1문장",
@@ -1231,6 +1258,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
 - 이미지에 숫자축만 있고 정확한 값을 읽기 어려우면 값을 추정하지 말고 null로 반환하세요.
 - fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣고, 확신이 없으면 생략하세요(추측 금지).
 - 항목명·범례명·부호·기간·단위는 원문 그대로 기록하고 동의어나 축약어로 바꾸지 마세요.
+- 캡션·X축·Y축·범례는 각각 caption, x_axis, y_axis, legend에 분리하고, 각 행에는 fields.범례항목 또는 fields.축항목으로 출처 라벨을 연결하세요.
 - `21~30년` 같은 기간은 연도=null, fields.기간원문="21~30년"으로 기록하세요.
 - 정량값은 값 하나당 table 한 행으로 분리하고, fields에 다른 정량값을 중첩하지 마세요.
 - 합계와 세부값은 별도 행으로 반환하고 동일한 fields.합계그룹을 부여하세요.
@@ -1252,21 +1280,40 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             if fail_fast:
                 raise llm_client.LLMCallError("Vision 배치 응답 스키마 불일치")
             return []
-        if fail_fast:
-            returned_indexes: list[int] = []
+        returned_indexes: list[int] = []
+        for raw in raw_analyses:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                returned_indexes.append(int(raw.get("image_index")))
+            except (TypeError, ValueError):
+                continue
+        expected_indexes = list(range(1, len(batch) + 1))
+        index_counts = {
+            index: returned_indexes.count(index)
+            for index in expected_indexes
+        }
+        contract_violated = sorted(returned_indexes) != expected_indexes
+        unresolved_indexes = [
+            index for index in expected_indexes if index_counts[index] != 1
+        ]
+        if contract_violated:
+            # Preserve independently successful objects. Duplicate indexes are
+            # ambiguous, so only indexes returned exactly once are accepted.
+            unambiguous_indexes = {
+                index for index, count in index_counts.items() if count == 1
+            }
+            preserved_analyses: list[dict] = []
             for raw in raw_analyses:
                 if not isinstance(raw, dict):
                     continue
                 try:
-                    returned_indexes.append(int(raw.get("image_index")))
+                    image_index = int(raw.get("image_index"))
                 except (TypeError, ValueError):
                     continue
-            expected_indexes = list(range(1, len(batch) + 1))
-            if sorted(returned_indexes) != expected_indexes:
-                raise llm_client.LLMCallError(
-                    f"Vision 배치 객체 계약 위반: expected={expected_indexes}, "
-                    f"returned={sorted(returned_indexes)}"
-                )
+                if image_index in unambiguous_indexes:
+                    preserved_analyses.append(raw)
+            raw_analyses = preserved_analyses
 
         page_by_index = {idx: page.page_number for idx, (page, _) in enumerate(batch, start=1)}
         image_by_index = {idx: image for idx, (_, image) in enumerate(batch, start=1)}
@@ -1325,6 +1372,13 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             raw["page_number"] = page_number
             raw["municipality"] = municipality
             results.append(self._attach_source_metadata(raw, image))
+        if fail_fast and contract_violated:
+            raise VisionBatchContractError(
+                f"Vision 배치 객체 계약 위반: expected={expected_indexes}, "
+                f"returned={sorted(returned_indexes)}",
+                partial_rows=results,
+                unresolved_indexes=unresolved_indexes,
+            )
         return results
 
     def _infer_target_sheet(self, analysis: dict) -> str:
@@ -1458,12 +1512,22 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         if value_source == "unknown" and _is_table_like_chart(analysis):
             value_source = "table_cell"
         evidence_ids = normalize_evidence_ids(analysis.get("source_evidence_ids"))
+        if evidence_match is not None:
+            if evidence_match.exact:
+                evidence_ids = [evidence_match.evidence_id]
+            elif evidence_match.evidence_ids:
+                evidence_ids = list(evidence_match.evidence_ids)
+        source_object_ids = list(normalize_object_ids(
+            analysis.get("source_object_ids"),
+        ))
         physical_object_ids = [
             str(value)
             for value in (analysis.get("source_physical_object_ids") or [])
             if str(value or "").strip()
         ]
         physical_object_ids = list(dict.fromkeys(physical_object_ids))
+        if evidence_match is not None and evidence_match.physical_object_ids:
+            physical_object_ids = list(evidence_match.physical_object_ids)
         blockers = list(reasons or [])
         if evidence_match is not None and not evidence_match.exact:
             blockers.append(evidence_match.reason)
@@ -1513,6 +1577,10 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             "대상시트": target_sheet,
             "그래프유형": analysis.get("chart_type", ""),
             "제목": analysis.get("title", ""),
+            "캡션": analysis.get("caption", "") or analysis.get("title", ""),
+            "X축": analysis.get("x_axis") or {},
+            "Y축": analysis.get("y_axis") or {},
+            "범례목록": analysis.get("legend") or [],
             "단위": item.get("단위") or analysis.get("unit", ""),
             "항목": item.get("항목") or fields.get("용도") or fields.get("감축사업명") or "",
             "연도": item.get("연도"),
@@ -1533,8 +1601,17 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             ),
             "근거ID목록": evidence_ids,
             "근거객체ID": ",".join(evidence_match.object_ids) if evidence_match is not None else "",
+            "원본객체ID": source_object_ids[0] if len(source_object_ids) == 1 else "",
+            "원본객체ID목록": source_object_ids,
             "물리객체ID": physical_object_ids[0] if len(physical_object_ids) == 1 else "",
             "물리객체ID목록": physical_object_ids,
+            "근거분리방식": evidence_match.method if evidence_match is not None else "legacy",
+            "근거교정여부": bool(evidence_match.corrected) if evidence_match is not None else False,
+            "근거좌표": analysis.get("source_bbox"),
+            "렌더그룹ID": analysis.get("render_group_id", "") or "",
+            "패널인덱스": analysis.get("panel_index"),
+            "패널수": analysis.get("panel_count") or 0,
+            "재구성방식": analysis.get("reconstruction_method", "") or "",
             "렌더변형": analysis.get("render_variant", "") or "",
             "렌더변형목록": [analysis.get("render_variant")] if analysis.get("render_variant") else [],
             "물리중복통합수": 0,
@@ -1592,10 +1669,23 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
 
         for analysis in analyses:
             evidence_match = (
-                match_evidence(analysis.get("source_evidence_ids"), evidence_catalog or {})
+                resolve_observation_evidence(
+                    analysis,
+                    evidence_catalog or {},
+                    enabled=getattr(
+                        config, "VISUAL_EXACT_OBJECT_RESOLUTION_ENABLED", True
+                    ),
+                )
                 if strict_evidence
                 else None
             )
+            if evidence_match is not None and evidence_match.exact:
+                analysis["source_evidence_ids"] = [evidence_match.evidence_id]
+                analysis["source_object_ids"] = list(evidence_match.object_ids)
+                if evidence_match.physical_object_ids:
+                    analysis["source_physical_object_ids"] = list(
+                        evidence_match.physical_object_ids
+                    )
             chart_rows = analysis.get("table", []) if analysis.get("type") == "chart_table" else []
             target_sheet = self._infer_target_sheet(analysis)
             if isinstance(chart_rows, list):
@@ -2060,6 +2150,75 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                         )
                     if result:
                         rows.append(result)
+        except VisionBatchContractError as exc:
+            max_depth = max(0, int(getattr(config, "VISION_RECOVERY_MAX_SPLIT_DEPTH", 6)))
+            unresolved_index_set = set(exc.unresolved_indexes)
+            unresolved_batch = [
+                item for index, item in enumerate(batch, start=1)
+                if index in unresolved_index_set
+            ]
+            unresolved_evidence = list(dict.fromkeys(
+                evidence_id
+                for _page, image in unresolved_batch
+                for evidence_id in self._image_evidence_ids(image)
+            ))
+            can_retry = (
+                bool(unresolved_batch)
+                and bool(getattr(config, "VISION_SPLIT_ON_FAILURE", True))
+                and int(task.get("split_depth", 0)) < max_depth
+                and (
+                    not unresolved_evidence
+                    or any(
+                        self._object_outcomes.attempt_count(value) < max_object_attempts
+                        for value in unresolved_evidence
+                    )
+                )
+            )
+            recovered_rows: list[dict] = []
+            recovery_failed = False
+            if can_retry:
+                child = {
+                    **task,
+                    "batch": unresolved_batch,
+                    "batch_num": f"{task.get('batch_num', '?')}.missing",
+                    "batch_total": 1,
+                    "split_depth": int(task.get("split_depth", 0)) + 1,
+                }
+                with self._counter_lock:
+                    self.split_batches += 1
+                try:
+                    recovered_rows = self._run_vision_task(child, municipality)
+                except (
+                    llm_client.LLMQuotaExceededError,
+                    llm_client.LLMTimeoutError,
+                    llm_client.LLMCallError,
+                ):
+                    recovery_failed = True
+                if len(recovered_rows) < len(unresolved_batch):
+                    recovery_failed = True
+            elif unresolved_batch:
+                recovery_failed = True
+
+            merged = self._merge_vision_results([exc.partial_rows, recovered_rows])
+            merged = self._replace_forced_results(restored_rows, merged, forced_ids)
+            if recovery_failed:
+                for evidence_id in unresolved_evidence:
+                    self._object_outcomes.record(
+                        evidence_id,
+                        "needs_review",
+                        response_received=False,
+                        reason=f"Vision 부분 결과 보존 후 미복구: {exc}",
+                    )
+                with self._counter_lock:
+                    self.failed_batches += 1
+            self._persist_vision(
+                checkpoint_task,
+                "partial" if recovery_failed else "ok",
+                result=merged,
+                error=str(exc) if recovery_failed else "",
+                recovered=True,
+            )
+            return merged
         except llm_client.LLMQuotaExceededError as exc:
             if restored_rows and forced_ids:
                 stale_rows = self._mark_forced_retry_failure(restored_rows, forced_ids, str(exc))

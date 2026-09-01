@@ -9,8 +9,18 @@ from typing import Any, Iterable
 
 from utils.physical_objects import (
     PhysicalObjectIdentity,
+    bbox_iou,
+    caption_similarity,
+    normalize_object_number,
     normalize_object_ids,
     same_physical_object as identities_match,
+)
+
+
+_OBJECT_NUMBER_RE = re.compile(
+    r"\b(?:표|그림|figure|fig\.?)\s*"
+    r"[0-9ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+(?:\s*[-–—.]\s*\d+)?",
+    re.IGNORECASE,
 )
 
 
@@ -47,6 +57,10 @@ class EvidenceMatch:
     object_ids: tuple[str, ...] = ()
     final_statuses: tuple[str, ...] = ()
     reason: str = ""
+    evidence_ids: tuple[str, ...] = ()
+    physical_object_ids: tuple[str, ...] = ()
+    method: str = ""
+    corrected: bool = False
 
     @property
     def exact(self) -> bool:
@@ -338,11 +352,13 @@ def match_evidence(
     """정확히 한 근거 ID가 정확히 한 extracted 객체에 연결되는지 판정한다."""
     evidence_ids = normalize_evidence_ids(evidence_values)
     if not evidence_ids:
-        return EvidenceMatch("missing", reason="근거 ID 없음")
+        return EvidenceMatch("missing", reason="근거 ID 없음", method="carried_evidence_id")
     if len(evidence_ids) > 1:
         return EvidenceMatch(
             "multiple_ids",
             reason=f"복수 근거 ID({len(evidence_ids)}개)",
+            evidence_ids=tuple(evidence_ids),
+            method="carried_evidence_id",
         )
 
     evidence_id = evidence_ids[0]
@@ -352,6 +368,8 @@ def match_evidence(
             "unknown",
             evidence_id=evidence_id,
             reason="객체 원장에 없는 근거 ID",
+            evidence_ids=(evidence_id,),
+            method="carried_evidence_id",
         )
     object_ids = tuple(dict.fromkeys(
         object_id
@@ -366,6 +384,13 @@ def match_evidence(
             object_ids=object_ids,
             final_statuses=statuses,
             reason=f"동일 근거 ID에 복수 객체 매칭({len(references)}개)",
+            evidence_ids=(evidence_id,),
+            physical_object_ids=tuple(dict.fromkeys(
+                reference.physical_object_id
+                for reference in references
+                if reference.physical_object_id
+            )),
+            method="carried_evidence_id",
         )
     if statuses[0] != "extracted":
         return EvidenceMatch(
@@ -374,6 +399,12 @@ def match_evidence(
             object_ids=object_ids,
             final_statuses=statuses,
             reason=f"근거 객체 최종상태가 extracted 아님({statuses[0] or '미지정'})",
+            evidence_ids=(evidence_id,),
+            physical_object_ids=tuple(
+                [references[0].physical_object_id]
+                if references[0].physical_object_id else []
+            ),
+            method="carried_evidence_id",
         )
     return EvidenceMatch(
         "exact",
@@ -381,4 +412,343 @@ def match_evidence(
         object_ids=object_ids,
         final_statuses=statuses,
         reason="단일 근거 ID와 단일 extracted 객체 정확 일치",
+        evidence_ids=(evidence_id,),
+        physical_object_ids=tuple(
+            [references[0].physical_object_id]
+            if references[0].physical_object_id else []
+        ),
+        method="carried_evidence_id",
     )
+
+
+def _all_references(
+    catalog: dict[str, tuple[EvidenceReference, ...]],
+) -> list[EvidenceReference]:
+    references: list[EvidenceReference] = []
+    seen: set[tuple[str, str, int | None]] = set()
+    for evidence_id in sorted(catalog):
+        for reference in catalog[evidence_id]:
+            key = (reference.evidence_id, reference.object_id, reference.page_number)
+            if key not in seen:
+                seen.add(key)
+                references.append(reference)
+    return references
+
+
+def _reference_group_key(reference: EvidenceReference) -> tuple[Any, ...]:
+    if reference.physical_object_id:
+        return ("physical", reference.page_number, reference.physical_object_id)
+    return (
+        "object",
+        reference.page_number,
+        reference.canonical_object_id or reference.object_id,
+    )
+
+
+def _reference_object_ids(reference: EvidenceReference) -> tuple[str, ...]:
+    return normalize_object_ids(
+        reference.object_id,
+        reference.canonical_object_id,
+        reference.alias_object_ids,
+    )
+
+
+def _match_selected_references(
+    references: Iterable[EvidenceReference],
+    *,
+    method: str,
+    reason: str,
+    input_evidence_ids: Iterable[str] = (),
+    ambiguous_status: str = "multiple_objects",
+) -> EvidenceMatch:
+    selected = list(references)
+    input_ids = tuple(normalize_evidence_ids(list(input_evidence_ids)))
+    if not selected:
+        return EvidenceMatch(
+            "missing",
+            reason=f"{reason}: 일치 객체 없음",
+            evidence_ids=input_ids,
+            method=method,
+        )
+
+    groups: dict[tuple[Any, ...], list[EvidenceReference]] = {}
+    for reference in selected:
+        groups.setdefault(_reference_group_key(reference), []).append(reference)
+    matched_evidence_ids = tuple(dict.fromkeys(
+        reference.evidence_id for reference in selected if reference.evidence_id
+    ))
+    object_ids = tuple(dict.fromkeys(
+        object_id
+        for reference in selected
+        for object_id in _reference_object_ids(reference)
+    ))
+    physical_ids = tuple(dict.fromkeys(
+        reference.physical_object_id
+        for reference in selected
+        if reference.physical_object_id
+    ))
+    statuses = tuple(dict.fromkeys(
+        reference.final_status for reference in selected
+    ))
+    if len(groups) != 1:
+        return EvidenceMatch(
+            ambiguous_status,
+            object_ids=object_ids,
+            final_statuses=statuses,
+            reason=f"{reason}: 서로 다른 물리 객체 {len(groups)}개",
+            evidence_ids=matched_evidence_ids,
+            physical_object_ids=physical_ids,
+            method=method,
+        )
+
+    current = [
+        reference for reference in selected
+        if reference.evidence_id in input_ids
+    ]
+    preferred_pool = current or selected
+    preferred = max(
+        preferred_pool,
+        key=lambda reference: (
+            reference.final_status == "extracted",
+            bool(reference.number),
+            not reference.context_only,
+            not reference.render_proxy,
+            bool(reference.bbox),
+        ),
+    )
+    if preferred.final_status != "extracted":
+        return EvidenceMatch(
+            "object_not_extracted",
+            evidence_id=preferred.evidence_id,
+            object_ids=object_ids,
+            final_statuses=statuses,
+            reason=f"{reason}: 근거 객체 최종상태가 extracted 아님({preferred.final_status})",
+            evidence_ids=matched_evidence_ids,
+            physical_object_ids=physical_ids,
+            method=method,
+            corrected=(len(input_ids) != 1 or preferred.evidence_id not in input_ids),
+        )
+    return EvidenceMatch(
+        "exact",
+        evidence_id=preferred.evidence_id,
+        object_ids=object_ids,
+        final_statuses=statuses,
+        reason=reason,
+        evidence_ids=matched_evidence_ids,
+        physical_object_ids=physical_ids,
+        method=method,
+        corrected=(len(input_ids) != 1 or preferred.evidence_id not in input_ids),
+    )
+
+
+def _observation_value(observation: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = observation.get(key)
+        if value not in (None, "", [], ()):
+            return value
+    return None
+
+
+def _observation_page(observation: dict[str, Any]) -> int | None:
+    return _normalize_page(_observation_value(observation, "page_number", "페이지"))
+
+
+def _same_page_references(
+    references: Iterable[EvidenceReference],
+    page: int | None,
+) -> list[EvidenceReference]:
+    if page is None:
+        return list(references)
+    return [reference for reference in references if reference.page_number == page]
+
+
+def resolve_observation_evidence(
+    observation: dict[str, Any],
+    catalog: dict[str, tuple[EvidenceReference, ...]],
+    *,
+    enabled: bool = True,
+) -> EvidenceMatch:
+    """관찰값을 하나의 원문 물리 객체에 보수적으로 귀속한다.
+
+    명시 표·그림 번호는 잘못 운반된 근거 ID보다 우선한다. 한 관찰 제목에
+    서로 다른 번호가 함께 있거나 강한 선택자가 복수 객체를 가리키면 자동
+    병합을 중단한다. 강한 신호가 없을 때만 기존 근거 ID 계약으로 폴백한다.
+    """
+    evidence_ids = normalize_evidence_ids(
+        observation.get("source_evidence_ids"),
+        observation.get("근거ID목록"),
+        observation.get("근거ID"),
+    )
+    if not enabled:
+        return match_evidence(evidence_ids, catalog)
+
+    references = _all_references(catalog)
+    page = _observation_page(observation)
+    same_page = _same_page_references(references, page)
+    title = str(_observation_value(
+        observation, "title", "제목", "caption", "캡션"
+    ) or "").strip()
+
+    title_numbers = tuple(dict.fromkeys(
+        normalized
+        for match in _OBJECT_NUMBER_RE.finditer(title)
+        if (normalized := normalize_object_number(match.group(0)))
+    ))
+    if len(title_numbers) > 1:
+        matched = [
+            reference
+            for reference in same_page
+            if normalize_object_number(reference.number or reference.caption) in title_numbers
+        ]
+        return _match_selected_references(
+            matched,
+            method="mixed_object_numbers",
+            reason=f"관찰 제목에 복수 표·그림 번호({len(title_numbers)}개)",
+            input_evidence_ids=evidence_ids,
+            ambiguous_status="mixed_objects",
+        ) if matched else EvidenceMatch(
+            "mixed_objects",
+            reason=f"관찰 제목에 복수 표·그림 번호({len(title_numbers)}개)",
+            evidence_ids=tuple(evidence_ids),
+            method="mixed_object_numbers",
+        )
+    if len(title_numbers) == 1:
+        number = title_numbers[0]
+        explicit = [
+            reference for reference in same_page
+            if reference.number and normalize_object_number(reference.number) == number
+        ]
+        caption_derived = [
+            reference for reference in same_page
+            if not reference.number and normalize_object_number(reference.caption) == number
+        ]
+        selected = explicit or caption_derived
+        if selected:
+            return _match_selected_references(
+                selected,
+                method=("object_number_explicit" if explicit else "object_number_caption"),
+                reason=f"명시 객체 번호 정확 일치({number})",
+                input_evidence_ids=evidence_ids,
+            )
+
+    deferred_ambiguity: EvidenceMatch | None = None
+    source_object_ids = set(normalize_object_ids(
+        observation.get("source_object_ids"),
+        observation.get("원본객체ID목록"),
+        observation.get("원본객체ID"),
+    ))
+    if source_object_ids:
+        selected = [
+            reference for reference in same_page
+            if source_object_ids.intersection(_reference_object_ids(reference))
+        ]
+        if selected:
+            selected_match = _match_selected_references(
+                selected,
+                method="source_object_id",
+                reason="원본 객체 ID 정확 일치",
+                input_evidence_ids=evidence_ids,
+            )
+            if selected_match.exact:
+                return selected_match
+            deferred_ambiguity = selected_match
+
+    render_group_id = str(_observation_value(
+        observation, "render_group_id", "렌더그룹ID"
+    ) or "").strip()
+    panel_index = _normalize_positive_int(_observation_value(
+        observation, "panel_index", "패널인덱스"
+    ))
+    if render_group_id and panel_index is not None:
+        selected = [
+            reference for reference in same_page
+            if reference.render_group_id == render_group_id
+            and reference.panel_index == panel_index
+        ]
+        if selected:
+            selected_match = _match_selected_references(
+                selected,
+                method="render_group_panel",
+                reason="렌더 그룹과 패널 인덱스 정확 일치",
+                input_evidence_ids=evidence_ids,
+            )
+            if selected_match.exact:
+                return selected_match
+            deferred_ambiguity = selected_match
+
+    source_bbox = _normalize_bbox(_observation_value(
+        observation, "source_bbox", "근거좌표"
+    ))
+    if source_bbox is not None:
+        selected = [
+            reference for reference in same_page
+            if bbox_iou(source_bbox, reference.bbox) >= 0.82
+        ]
+        if selected:
+            selected_match = _match_selected_references(
+                selected,
+                method="bbox_iou",
+                reason="동일 페이지 좌표 영역 정확 중첩(IoU>=0.82)",
+                input_evidence_ids=evidence_ids,
+            )
+            if selected_match.exact:
+                return selected_match
+            deferred_ambiguity = selected_match
+
+    if title:
+        expected = PhysicalObjectIdentity(
+            object_id="observation",
+            page_number=page,
+            object_type="visual",
+            caption=title,
+        )
+        scored = [
+            (reference, caption_similarity(expected, PhysicalObjectIdentity(
+                object_id=reference.object_id,
+                page_number=reference.page_number,
+                object_type=reference.object_type,
+                caption=reference.caption,
+                number=reference.number,
+            )))
+            for reference in same_page
+            if reference.caption
+        ]
+        strong = [(reference, score) for reference, score in scored if score >= 0.90]
+        if strong:
+            best_score = max(score for _reference, score in strong)
+            selected = [
+                reference for reference, score in strong
+                if best_score - score < 0.12
+            ]
+            selected_match = _match_selected_references(
+                selected,
+                method="caption_unique",
+                reason=f"동일 페이지 캡션 고유 일치(score={best_score:.2f})",
+                input_evidence_ids=evidence_ids,
+            )
+            if selected_match.exact:
+                return selected_match
+            deferred_ambiguity = selected_match
+
+    source_physical_ids = set(normalize_object_ids(
+        observation.get("source_physical_object_ids"),
+        observation.get("물리객체ID목록"),
+        observation.get("물리객체ID"),
+    ))
+    if source_physical_ids:
+        selected = [
+            reference for reference in same_page
+            if reference.physical_object_id in source_physical_ids
+        ]
+        if selected:
+            selected_match = _match_selected_references(
+                selected,
+                method="physical_object_id",
+                reason="물리 객체 ID 정확 일치",
+                input_evidence_ids=evidence_ids,
+            )
+            if selected_match.exact:
+                return selected_match
+            deferred_ambiguity = selected_match
+
+    return deferred_ambiguity or match_evidence(evidence_ids, catalog)
