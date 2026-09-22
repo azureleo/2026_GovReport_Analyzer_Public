@@ -45,7 +45,7 @@ class ImageFallbackTests(unittest.TestCase):
                 super().__init__()
                 self.calls = 0
 
-            def _analyze_image(self, image, page_num, municipality):
+            def _analyze_image(self, image, page_num, municipality, *, fail_fast=False):
                 self.calls += 1
                 return None
 

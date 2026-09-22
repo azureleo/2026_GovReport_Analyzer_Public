@@ -24,6 +24,34 @@ def test_detect_prior_plan_pages_finds_seoul_like_chapter_range() -> None:
     assert detected == set(range(148, 161))
 
 
+def test_detect_prior_plan_pages_supports_zero_padded_plain_chapter_titles() -> None:
+    # Given: 서울 원문처럼 '03 제목', '04 제목' 형식을 쓰는 문서
+    pages = [
+        _page(147, "02 지역현황 분석\n본문"),
+        *[
+            _page(
+                number,
+                "02\n온실가스 감축사업의 성과 평가" if number == 153
+                else "03 기존 계획의 평가\n성과평가 및 시사점",
+            )
+            for number in range(148, 171)
+        ],
+        _page(171, "04\n비전 및 전략\n본문"),
+        _page(172, "04 비전 및 전략\n추진방향"),
+    ]
+
+    assert detect_prior_plan_pages(pages) == set(range(148, 171))
+
+
+def test_detect_prior_plan_pages_fails_closed_when_next_chapter_is_missing(monkeypatch) -> None:
+    # Given: 시작 헤딩 뒤에 다음 장 제목 없이 비정상적으로 긴 문서가 이어지면
+    monkeypatch.setattr(config, "PRIOR_PLAN_MAX_PAGES", 3)
+    pages = [_page(number, "03 기존 계획의 평가\n본문") for number in range(10, 15)]
+
+    # Then: 문서 끝까지 기존계획으로 오인하지 않고 탐지를 무효화한다.
+    assert detect_prior_plan_pages(pages) == set()
+
+
 def test_detect_prior_plan_pages_noops_without_heading_pattern() -> None:
     # Given: 기존계획 평가 헤딩이 없는 문서
     pages = [_page(1, "제1장 개요"), _page(2, "제2장 지역현황 분석")]
@@ -52,6 +80,25 @@ def test_prior_plan_rows_are_tagged_and_reported_without_deletion() -> None:
     assert prior["계획구분출처"] == "기존계획"
     assert current["계획구분출처"] == "본계획"
     assert any("기존계획 평가 장" in issue["문제내용"] for issue in cleaned["validation_report"])
+
+
+def test_prior_plan_warning_is_aggregated_once_per_sheet() -> None:
+    raw = {
+        "municipality_name": "서울특별시",
+        "mitigation_projects": [
+            {"관리번호": f"M1-{index}", "부문": "수송", "사업명": f"기존사업 {index}", "출처페이지": "p149"}
+            for index in range(1, 6)
+        ],
+    }
+
+    cleaned = OrganizerAgent().organize(raw, prior_plan_pages={149})
+    warnings = [
+        issue for issue in cleaned["validation_report"]
+        if issue["심각도"] == "경고" and "기존계획 평가 장" in issue["문제내용"]
+    ]
+
+    assert len(warnings) == 1
+    assert "5건" in warnings[0]["문제내용"]
 
 
 def test_prior_plan_tag_does_not_overwrite_financial_plan_budget_category() -> None:

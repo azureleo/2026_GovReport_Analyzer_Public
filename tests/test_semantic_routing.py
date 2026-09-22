@@ -1,0 +1,274 @@
+from __future__ import annotations
+
+from utils.pdf_reader import PDFContent, PageContent
+from utils.document_objects import build_document_objects
+from utils.semantic_routing import validate_and_reclassify
+from utils.selective_ocr import evidence_id
+from utils.source_verifier import build_source_object_inventory
+
+
+def _forecast_document() -> PDFContent:
+    table = """
+    <table>
+      <tr><th>부문</th><th>2021</th><th>2030</th></tr>
+      <tr><td>건물</td><td>120</td><td>100</td></tr>
+    </table>
+    """
+    text = (
+        "제4장 온실가스 배출 전망\n"
+        "표 4-2 부문별 온실가스 배출량 전망(BAU)\n"
+    )
+    page = PageContent(page_number=10, text=text, tables=[table], images=[])
+    return PDFContent(total_pages=10, pages=[page], full_text=text)
+
+
+def _forecast_evidence_id() -> str:
+    table = next(
+        obj for obj in build_document_objects(_forecast_document().pages)
+        if obj.object_type == "table"
+    )
+    return evidence_id(table)
+
+
+def test_future_current_emission_on_forecast_table_is_reclassified() -> None:
+    final_data = {
+        "document_meta": [{
+            "지자체명": "서울특별시",
+            "계획명": "기본계획",
+            "계획시작연도": 2024,
+            "계획종료연도": 2033,
+        }],
+        "emissions_regional": [
+            {
+                "지자체명": "서울특별시",
+                "배출유형": "직접배출",
+                "부문": "건물",
+                "연도": 2021,
+                "배출량": 120,
+                "단위": "천톤CO2eq",
+                "출처페이지": 10,
+            },
+            {
+                "지자체명": "서울특별시",
+                "배출유형": "직접배출",
+                "부문": "건물",
+                "연도": 2030,
+                "배출량": 100,
+                "단위": "천톤CO2eq",
+                "출처페이지": 10,
+                "근거ID": "ev-forecast-source",
+                "derivation_type": "normalized",
+            },
+        ],
+        "emissions_forecast": [],
+    }
+
+    report = validate_and_reclassify(final_data, _forecast_document())
+
+    assert [row["연도"] for row in final_data["emissions_regional"]] == [2021]
+    assert final_data["emissions_forecast"][0]["연도"] == 2030
+    assert final_data["emissions_forecast"][0]["전망값"] == 100
+    assert final_data["emissions_forecast"][0]["출처페이지"] == 10
+    assert final_data["emissions_forecast"][0]["근거ID"] == "ev-forecast-source"
+    assert final_data["emissions_forecast"][0]["derivation_type"] == "normalized"
+    assert report.mismatches_before == 1
+    assert report.mismatches_after == 0
+    assert report.reclassified_rows == 1
+    assert report.evaluable_rows == 1
+    assert report.error_rate == 0.0
+
+
+def test_duplicate_forecast_merges_provenance_before_source_removal() -> None:
+    final_data = {
+        "document_meta": [{"계획시작연도": 2024}],
+        "emissions_regional": [{
+            "지자체명": "강원특별자치도",
+            "배출유형": "직접배출",
+            "부문": "건물",
+            "연도": 2030,
+            "배출량": 100,
+            "단위": "천톤CO2eq",
+            "출처페이지": 10,
+            "근거ID": "ev-current-sheet",
+            "derivation_type": "normalized",
+            "데이터상태": "visual_only",
+        }],
+        "emissions_forecast": [{
+            "지자체명": "강원특별자치도",
+            "시나리오": "BAU",
+            "부문": "건물",
+            "연도": 2030,
+            "전망값": 100,
+            "단위": "천톤CO2eq",
+            "출처페이지": 9,
+            "근거ID": "ev-forecast-sheet",
+            "derivation_type": "explicit",
+            "데이터상태": "reported",
+        }],
+    }
+
+    report = validate_and_reclassify(final_data, _forecast_document())
+
+    assert final_data["emissions_regional"] == []
+    assert len(final_data["emissions_forecast"]) == 1
+    forecast = final_data["emissions_forecast"][0]
+    assert forecast["출처페이지"] == "9,10"
+    assert forecast["근거ID"] == "ev-forecast-sheet"
+    assert forecast["근거ID목록"] == ["ev-forecast-sheet", "ev-current-sheet"]
+    assert forecast["derivation_type"] == "normalized"
+    assert forecast["데이터상태"] == "visual_only"
+    assert report.removed_duplicates == 1
+    assert report.reclassified_rows == 0
+    assert report.actions[0].action == "근거 병합 후 원본시트에서 제거"
+
+
+def test_reclassified_forecast_keeps_source_object_link() -> None:
+    document = _forecast_document()
+    evidence = _forecast_evidence_id()
+    final_data = {
+        "document_meta": [{"계획시작연도": 2024}],
+        "emissions_management": [{
+            "지자체명": "경기도",
+            "관리부문": "건물",
+            "연도": 2030,
+            "배출량": 100,
+            "단위": "천톤CO2eq",
+            "출처페이지": 10,
+            "근거ID": evidence,
+            "derivation_type": "explicit",
+        }],
+        "emissions_forecast": [],
+    }
+
+    validate_and_reclassify(final_data, document)
+    inventory = build_source_object_inventory(final_data, document)
+
+    assert final_data["emissions_management"] == []
+    assert final_data["emissions_forecast"][0]["근거ID"] == evidence
+    assert inventory.rows[0].linked_sheets == ["05_배출전망"]
+    assert inventory.rows[0].routing_status == "일치"
+
+
+def test_source_object_inventory_reports_wrong_sheet_semantics() -> None:
+    final_data = {
+        "emissions_regional": [{
+            "지자체명": "서울특별시",
+            "배출유형": "직접배출",
+            "부문": "건물",
+            "연도": 2030,
+            "배출량": 100,
+            "단위": "천톤CO2eq",
+            "출처페이지": 10,
+            "근거ID": _forecast_evidence_id(),
+        }],
+    }
+
+    inventory = build_source_object_inventory(final_data, _forecast_document())
+
+    assert inventory.total_objects == 1
+    assert inventory.routing_evaluable_objects == 1
+    assert inventory.routing_mismatch_objects == 1
+    assert inventory.routing_error_rate == 1.0
+    assert inventory.rows[0].expected_sheet == "05_배출전망"
+    assert inventory.rows[0].routing_status == "오배치의심"
+
+
+def test_mixed_semantic_tables_on_one_page_are_not_auto_reclassified() -> None:
+    text = (
+        "제4장 온실가스 분석\n"
+        "표 4-1 지역 온실가스 인벤토리 및 지역 배출량 현황\n"
+        "표 4-2 온실가스 배출량 전망(BAU)\n"
+    )
+    tables = [
+        "<table><tr><th>부문</th><th>2021</th></tr>"
+        "<tr><td>건물</td><td>120</td></tr></table>",
+        "<table><tr><th>부문</th><th>2030</th></tr>"
+        "<tr><td>건물</td><td>100</td></tr></table>",
+    ]
+    document = PDFContent(
+        total_pages=10,
+        pages=[PageContent(page_number=10, text=text, tables=tables, images=[])],
+        full_text=text,
+    )
+    final_data = {
+        "document_meta": [{"계획시작연도": 2024}],
+        "emissions_regional": [{
+            "지자체명": "서울특별시",
+            "배출유형": "직접배출",
+            "부문": "건물",
+            "연도": 2030,
+            "배출량": 100,
+            "단위": "천톤CO2eq",
+            "출처페이지": 10,
+        }],
+        "emissions_forecast": [],
+    }
+
+    report = validate_and_reclassify(final_data, document)
+
+    assert len(final_data["emissions_regional"]) == 1
+    assert final_data["emissions_forecast"] == []
+    assert report.reclassified_rows == 0
+
+
+def test_visual_inventory_is_auxiliary_not_a_body_routing_match() -> None:
+    document = _forecast_document()
+    final_data = {
+        "visual_inventory": [{
+            "지자체명": "서울특별시",
+            "시각자료ID": "V010-1",
+            "유형": "차트",
+            "캡션": "표 4-2 부문별 온실가스 배출량 전망(BAU)",
+            "출처페이지": 10,
+            "근거ID": _forecast_evidence_id(),
+        }],
+    }
+
+    inventory = build_source_object_inventory(final_data, document)
+
+    assert inventory.rows[0].routing_status == "본문미연결"
+    assert inventory.rows[0].auxiliary_linked_sheets == ["16_시각자료목록"]
+    assert inventory.routing_evaluable_objects == 1
+    assert inventory.routing_mismatch_objects == 1
+
+
+def test_object_can_match_any_human_allowed_body_sheet() -> None:
+    document = PDFContent(
+        total_pages=20,
+        pages=[PageContent(
+            page_number=20,
+            text="표 3-1 계획 개요와 온실가스 감축 목표",
+            tables=[],
+            images=[],
+        )],
+        full_text="표 3-1 계획 개요와 온실가스 감축 목표",
+    )
+    final_data = {
+        "document_objects": [{
+            "object_id": "p20_table_1",
+            "object_type": "table",
+            "page_number": 20,
+            "sequence": 1,
+            "number": "표 3-1",
+            "caption": "표 3-1 계획 개요와 온실가스 감축 목표",
+            "rows": [["구분", "2030"], ["목표", "100"]],
+            "metadata": {
+                "allowed_sheet_keys": ["plan_overview", "reduction_targets"],
+                "evidence_id": "ev-plan-target",
+            },
+        }],
+        "reduction_targets": [{
+            "지자체명": "강원특별자치도",
+            "목표수준": "총괄",
+            "기준연도": 2018,
+            "목표연도": 2030,
+            "목표배출량": 100,
+            "출처페이지": 20,
+            "근거ID": "ev-plan-target",
+        }],
+    }
+
+    inventory = build_source_object_inventory(final_data, document)
+
+    assert inventory.rows[0].routing_status == "일치"
+    assert inventory.rows[0].allowed_sheets == ["01_계획개요", "06_감축목표"]

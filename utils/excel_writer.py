@@ -16,6 +16,7 @@ from openpyxl.styles import (
 from openpyxl.utils import get_column_letter
 
 import config
+from utils.run_state import merge_rows_stably
 
 
 COLOR_HEADER_BG = "2E75B6"
@@ -31,11 +32,11 @@ HEADER_KEY_ALIASES = {
 
 
 def _headers_for_output(sheet_name: str, headers: list[str]) -> list[str]:
-    """출처페이지·데이터상태 opt-out을 엑셀 쓰기 직전에 적용한다."""
+    """출처페이지·근거ID·데이터상태 opt-out을 엑셀 쓰기 직전에 적용한다."""
     output = list(headers)
     if sheet_name[:2].isdigit() and int(sheet_name[:2]) <= 15:
         if not getattr(config, "PROVENANCE_ENABLED", True):
-            output = [header for header in output if header != "출처페이지"]
+            output = [header for header in output if header not in {"출처페이지", "근거ID"}]
         if not getattr(config, "DATA_STATUS_ENABLED", True):
             output = [header for header in output if header != "데이터상태"]
     return output
@@ -84,7 +85,7 @@ def _fallback_output_path(output_path: Path) -> Path:
 
 def _sanitize_cell_value(value):
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
     if isinstance(value, str):
         return ILLEGAL_CHARACTERS_RE.sub("", value)
     return value
@@ -123,6 +124,16 @@ def _write_generic_sheet(ws, headers: list[str], data: list[dict]):
                 cell.number_format = "#,##0.##"
 
     _auto_column_widths(ws)
+
+
+def _stable_output_rows(sheet_name: str, data: list[dict]) -> list[dict]:
+    """병렬 완료 순서와 무관하게 같은 행 집합을 같은 순서로 기록한다."""
+    data_key = next(
+        (key for key, configured_name in config.SHEET_KEY_TO_NAME.items() if configured_name == sheet_name),
+        sheet_name,
+    )
+    rows, _ = merge_rows_stably(data_key, [], data)
+    return rows
 
 
 def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
@@ -164,7 +175,11 @@ def write_excel(extracted_data: dict, output_path: str | Path) -> Path:
             continue
 
         ws = wb.create_sheet(sheet_name)
-        _write_generic_sheet(ws, _headers_for_output(sheet_name, headers), data)
+        _write_generic_sheet(
+            ws,
+            _headers_for_output(sheet_name, headers),
+            _stable_output_rows(sheet_name, data),
+        )
 
     try:
         wb.save(str(output_path))

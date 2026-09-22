@@ -55,7 +55,7 @@ def _labeled_observation(target_sheet: str, fields: dict) -> dict:
     }
 
 
-def test_forecast와_reduction_targets_라벨_후보는_G3에서_차단하고_16시트_관찰값은_유지한다(
+def test_forecast와_reduction_targets_라벨_후보는_완전한_키일_때_본문에_반영한다(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
@@ -81,14 +81,10 @@ def test_forecast와_reduction_targets_라벨_후보는_G3에서_차단하고_16
         "chart_observations": observations,
     })
 
-    assert cleaned["emissions_forecast"] == []
-    assert cleaned["reduction_targets"] == []
+    assert len(cleaned["emissions_forecast"]) == 1
+    assert len(cleaned["reduction_targets"]) == 1
     assert cleaned["chart_observations"] == observations
-    blocked_sheet_keys = {
-        issue.get("대상시트키")
-        for issue in cleaned["validation_report"]
-        if issue.get("영역") == "시각병합"
-        and issue.get("항목") == "차단"
-        and "G3 대상 시트 미지원" in issue.get("문제내용", "")
-    }
-    assert blocked_sheet_keys == {"emissions_forecast", "reduction_targets"}
+    assert {row["병합상태"] for row in observations} == {"accept"}
+    assert all(row["데이터상태"] == "visual_only" for row in (
+        cleaned["emissions_forecast"] + cleaned["reduction_targets"]
+    ))

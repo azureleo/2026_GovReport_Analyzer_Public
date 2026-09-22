@@ -24,6 +24,9 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from utils.pipeline_result import saved_review_result
 OUTPUT_DIR = ROOT / "output"
 
 
@@ -34,7 +37,10 @@ def _timestamp() -> str:
 def _run_command(command: str, source: Path, output: Path, env_extra: dict[str, str]) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.update(env_extra)
-    args = [*shlex.split(command), str(source), "--output", str(output)]
+    tokens = shlex.split(command, posix=os.name != "nt")
+    if os.name == "nt":
+        tokens = [token[1:-1] if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"} else token for token in tokens]
+    args = [*tokens, str(source), "--output", str(output)]
     return subprocess.run(args, cwd=ROOT, env=env, text=True, capture_output=True, check=False)
 
 
@@ -95,7 +101,7 @@ def main() -> int:
         },
     )
     report.append(_section("스니펫 주입 실행", snippet.stdout + "\n" + snippet.stderr))
-    if snippet.returncode != 0:
+    if snippet.returncode != 0 and not saved_review_result(snippet.returncode, snippet_xlsx):
         report.append(f"스니펫 주입 실행 실패(exit={snippet.returncode})\n")
         report_path.write_text("".join(report), encoding="utf-8")
         print(report_path)
@@ -111,7 +117,9 @@ def main() -> int:
         },
     )
     report.append(_section("구조 주입 실행", structured.stdout + "\n" + structured.stderr))
-    if structured.returncode != 0:
+    if snippet.returncode == 3 or structured.returncode == 3:
+        report.append("결과 저장됨·검토 필요(exit=3): 아래 비교는 성공 또는 정확도 보장을 뜻하지 않습니다.\n\n")
+    if structured.returncode != 0 and not saved_review_result(structured.returncode, structured_xlsx):
         report.append(f"구조 주입 실행 실패(exit={structured.returncode})\n")
         report_path.write_text("".join(report), encoding="utf-8")
         print(report_path)
@@ -139,7 +147,7 @@ def main() -> int:
     )
     report_path.write_text("".join(report), encoding="utf-8")
     print(report_path)
-    return compare.returncode
+    return compare.returncode or (3 if 3 in {snippet.returncode, structured.returncode} else 0)
 
 
 if __name__ == "__main__":

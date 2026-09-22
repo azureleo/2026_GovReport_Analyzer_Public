@@ -30,6 +30,7 @@ def _item(element_id: str, page: int, element_type: str = "그래프", expected:
         expected=expected,
         related_sheet="03_배출현황_지역",
         note="",
+        object_id=element_id,
     )
 
 
@@ -112,7 +113,7 @@ def test_funnel_statuses_when_each_stage_loses_or_records_element() -> None:
         4: _page(4, image_count=1, passed_count=1, score=7),
         5: _page(5, image_count=1, passed_count=1, score=7),
     }
-    records = [audit.VisualRecord("V5-001", 5, "캡션", "그래프", "Y", "N", "03_배출현황_지역")]
+    records = [audit.VisualRecord("V5-001", 5, "캡션", "그래프", "Y", "N", "03_배출현황_지역", object_id="E005")]
 
     # When: 요소별 funnel 상태를 판정하면
     results = audit.classify_inventory(items, pages, records)
@@ -132,17 +133,17 @@ def test_parse_visual_page_id_when_id_has_page_or_only_sequence() -> None:
     assert audit.parse_visual_page_id("") is None
 
 
-def test_same_page_partial_record_when_two_expected_elements_share_one_output_row() -> None:
+def test_same_page_record_does_not_confirm_a_different_expected_object() -> None:
     # Given: 같은 페이지에 기대추출 요소 2개와 16 시트 행 1개만 있으면
     items = [_item("E001", 10), _item("E002", 10)]
     pages = {10: _page(10, image_count=2, passed_count=2, score=8)}
-    records = [audit.VisualRecord("V10-001", 10, "캡션", "그래프", "Y", "Y", "06_감축목표")]
+    records = [audit.VisualRecord("V10-001", 10, "캡션", "그래프", "Y", "Y", "06_감축목표", object_id="E001")]
 
-    # When: 페이지 단위로 보수적 매칭을 수행하면
+    # When: 객체 ID 우선 매칭을 수행하면
     results = audit.classify_inventory(items, pages, records)
 
-    # Then: 부족분만 동일페이지_부분기록으로 표시된다.
-    assert [row.status for row in results] == ["기록됨", "동일페이지_부분기록"]
+    # Then: 정확히 연결된 첫 객체만 기록되고 같은 페이지의 둘째 객체는 누락으로 남는다.
+    assert [row.status for row in results] == ["기록됨", "vision_유실"]
 
 
 def test_threshold_sensitivity_when_scores_cross_min_score() -> None:
@@ -258,8 +259,8 @@ def _make_vector_only_pdf(path: Path, drawing_count: int) -> None:
     doc.close()
 
 
-def test_reference_filtered_page_keeps_original_triage_score_in_sensitivity(tmp_path: Path) -> None:
-    # Given: 참고자료 키워드 때문에 제외되는 이미지 페이지가 있으면
+def test_reference_page_is_flagged_without_prefiltering_in_p3(tmp_path: Path) -> None:
+    # Given: P3 기본 정책에서 참고자료 키워드가 있는 이미지 페이지가 있으면
     source = tmp_path / "reference.pdf"
     doc = fitz.open()
     page = doc.new_page(width=595, height=842)
@@ -272,9 +273,10 @@ def test_reference_filtered_page_keeps_original_triage_score_in_sensitivity(tmp_
     evidence = audit._triage_page_evidence(source, "서울특별시")
     page_evidence = evidence[1]
 
-    # Then: 참고자료 상태는 유지하되 민감도 점수는 -20 오염 없이 원점수를 보존한다.
-    assert page_evidence.reference_filtered_count == 1
-    assert page_evidence.triage_passed_count == 0
+    # Then: 참고자료 상태는 유지하고 판독 대상에서는 제외하지 않는다.
+    assert page_evidence.reference_flagged_count == 1
+    assert page_evidence.reference_filtered_count == 0
+    assert page_evidence.triage_passed_count == 1
     assert page_evidence.top_score is not None
     assert page_evidence.top_score >= 3
     assert any(reason.startswith("reference_context:") for reason in page_evidence.top_reasons)
@@ -299,23 +301,23 @@ def test_dump_adds_vector_page_when_no_caption_or_image_but_drawings_cross_low_t
     assert row["자동_벡터드로잉수"] == 40
 
 
-def test_recorded_elements_list_all_records_on_same_page() -> None:
+def test_recorded_elements_only_list_their_exact_object_record() -> None:
     # Given: 같은 페이지에 요소 2개와 16시트 레코드 2개가 있으면
     items = [_item("E001", 10), _item("E002", 10)]
     pages = {10: _page(10, image_count=2, passed_count=2, score=8)}
     records = [
-        audit.VisualRecord("V10-001", 10, "첫째", "그래프", "Y", "N", "03_배출현황_지역"),
-        audit.VisualRecord("V10-002", 10, "둘째", "이미지표", "Y", "Y", "06_감축목표"),
+        audit.VisualRecord("V10-001", 10, "첫째", "그래프", "Y", "N", "03_배출현황_지역", object_id="E001"),
+        audit.VisualRecord("V10-002", 10, "둘째", "이미지표", "Y", "Y", "06_감축목표", object_id="E002"),
     ]
 
-    # When: 페이지 단위 매칭을 수행하면
+    # When: 객체 단위 매칭을 수행하면
     results = audit.classify_inventory(items, pages, records)
 
-    # Then: 두 요소 모두 해당 페이지의 전체 16시트 레코드를 나열한다.
+    # Then: 각 요소에는 정확히 대응하는 16시트 레코드만 연결된다.
     assert [row.status for row in results] == ["기록됨", "기록됨"]
     assert [[record.visual_id for record in row.matched_records] for row in results] == [
-        ["V10-001", "V10-002"],
-        ["V10-001", "V10-002"],
+        ["V10-001"],
+        ["V10-002"],
     ]
 
 
@@ -352,7 +354,7 @@ def test_json_report_contains_sensitivity_type_breakdown_false_positive_and_form
     )
     items = [_item("E001", 1, "그래프", True), _item("E002", 1, "장식", False)]
     pages = {1: _page(1, image_count=1, passed_count=1, score=6)}
-    records = [audit.VisualRecord("V1-001", 1, "캡션", "그래프", "Y", "N", "03_배출현황_지역")]
+    records = [audit.VisualRecord("V1-001", 1, "캡션", "그래프", "Y", "N", "03_배출현황_지역", object_id="E001")]
     audits = audit.classify_inventory(items, pages, records)
     sensitivity = audit.calculate_sensitivity(audits, pages)
 
@@ -365,14 +367,15 @@ def test_json_report_contains_sensitivity_type_breakdown_false_positive_and_form
     assert payload["sensitivity"]["image_thresholds"]["5"]["passed_elements"] == 1
     assert "type_breakdown" in payload
     assert payload["type_breakdown"]["그래프"]["recorded"] == 1
-    assert payload["false_positive_stats"]["excluded_recorded_pages"] == 1
+    assert payload["false_positive_stats"]["excluded_recorded_pages"] == 0
+    assert payload["metrics"]["fixed_denominator"] is True
     assert payload["format_errors"] == []
 
 
-def test_image_agent_reference_context_import_is_same_object() -> None:
-    # Given: 참고자료 게이트도 기존 image_agent helper를 그대로 재사용하면
+def test_image_agent_reference_policy_import_is_same_object() -> None:
+    # Given: 감사 도구도 운영 경로의 P3 참고자료 정책을 그대로 재사용하면
     # When / Then: 감사 도구의 import 객체가 원본과 같다.
-    assert audit._has_reference_context is image_agent._has_reference_context
+    assert audit._apply_reference_context_policy is image_agent._apply_reference_context_policy
 
 
 def test_detail_table_keeps_reference_context_reason_when_reason_list_is_long() -> None:

@@ -1,8 +1,11 @@
 """
 라우팅 커버리지 검증기 (LLM 토큰 0).
 
-라우팅 변경의 유일한 품질 리스크는 "데이터가 실제로 있는 페이지를 라우팅이 누락하는가?"
-뿐이다. 이 스크립트는 두 가지 무료 검사로 그것을 증명한다.
+기본 --policy text-input은 실제 Extractor의 이번 입력 정책을 비교한다.
+아래의 키워드 비교는 --policy legacy-keywords로만 실행된다.
+원문 문구의 후보 보존을 검사할 뿐, 최종 셀 정확도나 완전한 리콜을 증명하지 않는다.
+
+라우팅 변경에 따른 데이터 후보 누락 위험을 두 가지 무료 검사로 점검한다.
 
   Check A (정답 리콜 비회귀):
     정답지(서울..._정리.xlsx)의 시트별 고유 텍스트 앵커를 원문 PDF 페이지에 매핑한 뒤,
@@ -83,7 +86,26 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("golden")
     ap.add_argument("pdf")
+    ap.add_argument("--policy", choices=["text-input", "legacy-keywords"], default="text-input")
+    ap.add_argument("--output", type=Path)
     args = ap.parse_args()
+
+    if args.policy == "text-input":
+        import json
+        from scripts.preflight_text import compare_plans, golden_coverage
+        if args.output and args.output.exists():
+            ap.error("기존 결과 보호: 새 --output 경로를 지정하세요.")
+        pages = extract_pdf(args.pdf, render_graph_pages=False).pages
+        plans = compare_plans(pages)
+        coverage = golden_coverage(pages, plans, args.golden)
+        report = {"policy": "text-input-v1", "checks": plans['checks'], "coverage": coverage,
+                  "removed_pairs": plans['removed_pairs'], "model_calls": 0}
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            with args.output.open('x', encoding='utf-8') as stream:
+                json.dump(report, stream, ensure_ascii=False, indent=2)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if coverage['passed'] and all(plans['checks'].values()) else 1
 
     print(f"[1/4] PDF 파싱: {args.pdf}")
     pc = extract_pdf(args.pdf, render_graph_pages=False)

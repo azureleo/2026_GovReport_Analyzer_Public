@@ -85,15 +85,105 @@ LOCAL_AGENT_MODEL = os.environ.get("LOCAL_AGENT_MODEL", "").strip()
 # 정상 추출 호출은 보통 1~2분 내 끝난다. 900초 기본값은 hang을 15분씩 방치해
 # 로컬 에이전트 실행을 수 시간 지연시켰으므로, 필요 시 env로만 되돌린다.
 LOCAL_AGENT_TIMEOUT = _env_int("LOCAL_AGENT_TIMEOUT", 300)
+# 타임아웃은 quota로 추정하지 않는다. 최초 호출 뒤 허용할 추가 재시도 횟수와
+# 재시도 간격을 별도로 제한해 한 배치가 수십 분씩 점유하지 않게 한다.
+LOCAL_AGENT_TIMEOUT_RETRIES = _env_int("LOCAL_AGENT_TIMEOUT_RETRIES", 1)
+LOCAL_AGENT_TIMEOUT_RETRY_DELAY_SECONDS = _env_int(
+    "LOCAL_AGENT_TIMEOUT_RETRY_DELAY_SECONDS", 5
+)
+# 텍스트 추출 배치가 끝내 타임아웃되면 페이지 묶음을 더 작게 나눠 다시 시도한다.
+# 모델 호출 전에도 문자 수가 큰 배치를 미리 분할해, 300초 타임아웃을 먼저 소비하지 않는다.
+EXTRACTION_SPLIT_ON_TIMEOUT = _env_bool("EXTRACTION_SPLIT_ON_TIMEOUT", True)
+EXTRACTION_TIMEOUT_MIN_BATCH_PAGES = _env_int("EXTRACTION_TIMEOUT_MIN_BATCH_PAGES", 2)
+EXTRACTION_TIMEOUT_MAX_SPLIT_DEPTH = _env_int("EXTRACTION_TIMEOUT_MAX_SPLIT_DEPTH", 6)
+EXTRACTION_TIMEOUT_RECOVERY_BUDGET_SECONDS = _env_int(
+    "EXTRACTION_TIMEOUT_RECOVERY_BUDGET_SECONDS", 900
+)
+# 타임아웃뿐 아니라 최종 호출 실패·JSON 파싱 실패도 작은 배치에서 복구한다.
+EXTRACTION_SPLIT_ON_FAILURE = _env_bool("EXTRACTION_SPLIT_ON_FAILURE", True)
+# 일반 호출의 최대 배치 문자 수. 초과 배치는 호출 전에 페이지/문서객체 단위로 분할한다.
+EXTRACTION_MAX_BATCH_CHARS = _env_int("EXTRACTION_MAX_BATCH_CHARS", 18000)
+# 실패 복구 자식은 일반 배치보다 작게 유지한다.
+EXTRACTION_RECOVERY_MAX_BATCH_CHARS = _env_int("EXTRACTION_RECOVERY_MAX_BATCH_CHARS", 12000)
+# 단일 페이지의 큰 표는 헤더를 반복하면서 이 행 수 단위로 잘라 정규화한다.
+EXTRACTION_TABLE_ROWS_PER_BATCH = _env_int("EXTRACTION_TABLE_ROWS_PER_BATCH", 20)
+
+# 성공 배치 결과와 실패 상태를 입력/프롬프트/모델 해시별로 영속화한다.
+RUN_STATE_ENABLED = _env_bool("RUN_STATE_ENABLED", True)
+RUN_STATE_DIR = os.environ.get("RUN_STATE_DIR", ".cache/runs").strip()
+EXTRACTION_RESUME = _env_bool("EXTRACTION_RESUME", False)
+EXTRACTION_RETRY_FAILED_ONLY = _env_bool("EXTRACTION_RETRY_FAILED_ONLY", False)
 CODEX_COMMAND = os.environ.get("CODEX_COMMAND", "codex").strip()
 CLAUDE_COMMAND = os.environ.get("CLAUDE_COMMAND", "claude").strip()
 GUIDELINE_STRUCTURED_INJECTION = _env_bool("GUIDELINE_STRUCTURED_INJECTION", True)
 GUIDELINE_PROMPT_MAX_CHARS = _env_int("GUIDELINE_PROMPT_MAX_CHARS", 3000)
 APPENDIX4_MATCH_THRESHOLD = _env_float("APPENDIX4_MATCH_THRESHOLD", 0.55)
 APPENDIX3_MATCH_THRESHOLD = _env_float("APPENDIX3_MATCH_THRESHOLD", APPENDIX4_MATCH_THRESHOLD)
+# 일반 실행은 기존 참조 조회를 유지한다. 격리 검증 프로세스만 False로 설정한다.
+REFERENCE_ENRICHMENT_ENABLED = _env_bool("REFERENCE_ENRICHMENT_ENABLED", True)
 CODEBOOK_SHEET_ENABLED = _env_bool("CODEBOOK_SHEET_ENABLED", True)
 DATA_STATUS_ENABLED = _env_bool("DATA_STATUS_ENABLED", True)
 MIN_DOCUMENT_TEXT_CHARS = _env_int("MIN_DOCUMENT_TEXT_CHARS", 500)
+
+# 최종 데이터의 원문 근거를 LLM 없이 행 단위로 대조한다. 원문 표·그래프
+# 인벤토리가 비활성 또는 미연결인 실행에만 보수적인 품질 점수 상한을 적용한다.
+SOURCE_VERIFICATION_ENABLED = _env_bool("SOURCE_VERIFICATION_ENABLED", True)
+SOURCE_VERIFICATION_PAGE_RADIUS = _env_int("SOURCE_VERIFICATION_PAGE_RADIUS", 1)
+SOURCE_VERIFICATION_MAX_TERMS = _env_int("SOURCE_VERIFICATION_MAX_TERMS", 12)
+SOURCE_VERIFICATION_GLOBAL_SEARCH = _env_bool("SOURCE_VERIFICATION_GLOBAL_SEARCH", True)
+SOURCE_VERIFICATION_MARK_PDF = _env_bool("SOURCE_VERIFICATION_MARK_PDF", True)
+SOURCE_VERIFICATION_MAX_MARKS = _env_int("SOURCE_VERIFICATION_MAX_MARKS", 10000)
+SOURCE_OBJECT_INVENTORY_ENABLED = _env_bool("SOURCE_OBJECT_INVENTORY_ENABLED", True)
+# 표·그림 객체 완전성에서 같은 페이지 행만 있는 경우는 부분 확인으로 계산한다.
+SOURCE_OBJECT_PARTIAL_WEIGHT = _env_float("SOURCE_OBJECT_PARTIAL_WEIGHT", 0.5)
+# 표 번호·캡션·섹션을 이용해 결과 행이 올바른 시트에 배치됐는지 별도로 검증한다.
+# 자동 이동은 계획 시작 이후의 배출현황 행이 명시적인 전망표에 놓인 경우로 제한한다.
+SEMANTIC_ROUTING_ENABLED = _env_bool("SEMANTIC_ROUTING_ENABLED", True)
+SEMANTIC_ROUTING_AUTO_RECLASSIFY = _env_bool("SEMANTIC_ROUTING_AUTO_RECLASSIFY", True)
+SEMANTIC_ROUTING_MIN_SCORE = _env_float("SEMANTIC_ROUTING_MIN_SCORE", 5.0)
+SEMANTIC_ROUTING_MIN_MARGIN = _env_float("SEMANTIC_ROUTING_MIN_MARGIN", 1.5)
+# 한 표가 계획개요와 감축목표처럼 둘 이상의 본문 시트에 합법적으로 대응할 때,
+# 최고 점수와 가까운 후보를 허용 집합으로 보존한다. 단일 행 자동 이동에는 사용하지 않는다.
+SEMANTIC_ROUTING_ALLOWED_SCORE_DELTA = _env_float(
+    "SEMANTIC_ROUTING_ALLOWED_SCORE_DELTA", 1.5
+)
+SEMANTIC_ROUTING_MAX_ALLOWED_TARGETS = _env_int(
+    "SEMANTIC_ROUTING_MAX_ALLOWED_TARGETS", 3
+)
+# 06_감축목표의 세부사업·연차경로를 페이지 겹침만으로 재태깅하지 않고,
+# 근거 객체/캡션/섹션/사업 식별자/연도 구조를 함께 평가한다.
+# context: 새 분류기, legacy: v7-1 페이지·연속연도 규칙, off: 재태깅 없음.
+REDUCTION_TARGET_CONTEXT_MODE = os.environ.get(
+    "REDUCTION_TARGET_CONTEXT_MODE", "context"
+).strip().lower()
+if REDUCTION_TARGET_CONTEXT_MODE not in {"context", "legacy", "off"}:
+    REDUCTION_TARGET_CONTEXT_MODE = "context"
+REDUCTION_TARGET_CONTEXT_MIN_SCORE = _env_float(
+    "REDUCTION_TARGET_CONTEXT_MIN_SCORE", 6.0
+)
+REDUCTION_TARGET_CONTEXT_MIN_MARGIN = _env_float(
+    "REDUCTION_TARGET_CONTEXT_MIN_MARGIN", 2.0
+)
+REDUCTION_TARGET_CONTEXT_REVIEW_SCORE = _env_float(
+    "REDUCTION_TARGET_CONTEXT_REVIEW_SCORE", 4.0
+)
+REDUCTION_TARGET_CONTEXT_MIN_ANNUAL_RUN = _env_int(
+    "REDUCTION_TARGET_CONTEXT_MIN_ANNUAL_RUN", 4
+)
+# 06·12 시트의 행 증식을 보수적으로 억제한다. 고정 페이지나 지자체명 대신
+# 시트 의미 계약과 08·10 시트의 동일 근거를 사용하며, 제외 행은 내부 원장에 남긴다.
+# 12a 독립 시트 승격은 여러 지자체 문서에서 필드 밀도를 검증한 뒤 별도로 진행한다.
+SEMANTIC_OVEREXTRACTION_GUARD_ENABLED = _env_bool(
+    "SEMANTIC_OVEREXTRACTION_GUARD_ENABLED", True
+)
+QUALITY_THRESHOLD = _env_float("QUALITY_THRESHOLD", 70.0)
+QUALITY_MAX_WITHOUT_SOURCE_INVENTORY = _env_float("QUALITY_MAX_WITHOUT_SOURCE_INVENTORY", 95.0)
+
+# 고정 골든셋/홀드아웃 평가는 일반 실행과 분리된 명시적 테스트 모드다.
+EVALUATION_MANIFEST_PATH = os.environ.get(
+    "EVALUATION_MANIFEST_PATH",
+    "data/evaluation/benchmark_manifest.json",
+).strip()
 
 # 추출은 단발 JSON 작업이라 레포 파일·MCP 서버·스킬·프로젝트 메모리(CLAUDE.md)가 불필요하다.
 # True이면 claude/codex를 중립 임시 디렉터리에서 실행하고, claude는 MCP/스킬/설정/동적
@@ -117,6 +207,10 @@ GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-2.5-pro").st
 # 명시 지정한다. 채택 승인 2026-07-10.
 # 우선순위: STAGE_MODEL_VISION > CODEX_VISION_MODEL. 빈 값이면 CLI 기본 모델.
 CODEX_VISION_MODEL = os.environ.get("CODEX_VISION_MODEL", "gpt-5.6-luna").strip()
+# 에이전트(codex) 모드 텍스트 기본 모델.
+# 우선순위: STAGE_MODEL_* > LOCAL_AGENT_MODEL > CODEX_TEXT_MODEL.
+# 빈 값이면 Codex CLI 기본 모델을 사용한다.
+CODEX_TEXT_MODEL = os.environ.get("CODEX_TEXT_MODEL", "gpt-5.6-luna").strip()
 MAX_TOKENS = 65536  # Gemini 백엔드 사용 시 최대 출력 토큰
 
 # Gemini 503/일시 과부하 대응 설정.
@@ -127,6 +221,9 @@ GEMINI_RETRY_BASE_SECONDS = _env_int("GEMINI_RETRY_BASE_SECONDS", 20)
 GEMINI_RETRY_MAX_SECONDS = _env_int("GEMINI_RETRY_MAX_SECONDS", 90)
 GEMINI_FAIL_SOFT_ON_TRANSIENT = _env_bool("GEMINI_FAIL_SOFT_ON_TRANSIENT", True)
 GEMINI_REQUEST_TIMEOUT_SECONDS = _env_int("GEMINI_REQUEST_TIMEOUT_SECONDS", 180)
+# 추출 재현성을 우선한다. 일부 추론 모델/CLI는 이 값을 지원하지 않으므로 Gemini
+# GenerateContent 요청에만 직접 적용하고, 나머지는 캐시·체크포인트로 고정한다.
+LLM_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.0)
 
 # OpenAI API 설정.
 # Gemini Flash 계열과 비교 테스트하기 위한 기본 모델은 사용자가 지정한 gpt-5.4-mini로 둔다.
@@ -149,6 +246,21 @@ STAGE_MODELS = {
     "vision": os.environ.get("STAGE_MODEL_VISION", "").strip(),
     "gap_fill": os.environ.get("STAGE_MODEL_GAP_FILL", "").strip(),
     "review": os.environ.get("STAGE_MODEL_REVIEW", "").strip(),
+}
+
+# 로컬 에이전트가 명시적으로 "model at capacity"를 반환하면 같은 모델에 대한
+# 후속 호출을 잠시 차단한다. 대체 모델은 단계별로 명시한 경우에만 사용해, 기본
+# 실행의 모델·정확도 계약이 조용히 바뀌지 않게 한다.
+LLM_CAPACITY_CIRCUIT_ENABLED = _env_bool("LLM_CAPACITY_CIRCUIT_ENABLED", True)
+LLM_CAPACITY_FAILURE_THRESHOLD = _env_int("LLM_CAPACITY_FAILURE_THRESHOLD", 1)
+LLM_CAPACITY_COOLDOWN_SECONDS = _env_int("LLM_CAPACITY_COOLDOWN_SECONDS", 120)
+LLM_CAPACITY_FALLBACK_ENABLED = _env_bool("LLM_CAPACITY_FALLBACK_ENABLED", True)
+LLM_CAPACITY_FALLBACK_MODEL = os.environ.get("LLM_CAPACITY_FALLBACK_MODEL", "").strip()
+STAGE_FALLBACK_MODELS = {
+    "extraction": os.environ.get("STAGE_FALLBACK_MODEL_EXTRACTION", "").strip(),
+    "vision": os.environ.get("STAGE_FALLBACK_MODEL_VISION", "").strip(),
+    "gap_fill": os.environ.get("STAGE_FALLBACK_MODEL_GAP_FILL", "").strip(),
+    "review": os.environ.get("STAGE_FALLBACK_MODEL_REVIEW", "").strip(),
 }
 
 # GPT-Mini/OpenAI 기본본 + Gemini 타깃 검수 구조.
@@ -191,6 +303,34 @@ HYBRID_AUTO_MERGE_MIN_CONFIDENCE = os.environ.get("HYBRID_AUTO_MERGE_MIN_CONFIDE
 # 라벨 기반 시각 판독값을 Organizer에서 본 시트로 병합한다.
 # 기본 활성화하되 환경변수를 0으로 지정하면 기존 비활성 경로를 유지한다.
 VISUAL_MERGE_LABELED_ENABLED = _env_bool("VISUAL_MERGE_LABELED_ENABLED", True)
+# 객체 인벤토리가 연결된 운영 경로에서는 단일 근거 ID가 단일 extracted 객체와
+# 정확히 일치한 시각 후보만 본문 시트에 병합한다. 나머지는 16번 시트에 격리한다.
+VISUAL_EVIDENCE_MERGE_ENABLED = _env_bool("VISUAL_EVIDENCE_MERGE_ENABLED", True)
+# 02_지역여건 시각 후보에 값·연도·정확 근거가 이미 있을 때만 캡션과 차트 문맥으로
+# 누락된 범주를 보완한다. 애매한 문맥은 기존처럼 needs_review에 남긴다.
+REGIONAL_VISUAL_ENRICHMENT_ENABLED = _env_bool(
+    "REGIONAL_VISUAL_ENRICHMENT_ENABLED", True
+)
+VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED = _env_bool(
+    "VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED", True
+)
+# 운반된 근거 ID만 신뢰하지 않고 표·그림 번호, 원본/물리 객체 ID, 패널,
+# 좌표, 캡션 순서로 하나의 원문 객체를 확정한다. 복수 객체는 자동 병합하지 않는다.
+VISUAL_EXACT_OBJECT_RESOLUTION_ENABLED = _env_bool(
+    "VISUAL_EXACT_OBJECT_RESOLUTION_ENABLED", True
+)
+VISUAL_FIELD_COMPOSITION_ENABLED = _env_bool(
+    "VISUAL_FIELD_COMPOSITION_ENABLED", True
+)
+# G4 완화는 시각값의 직접 통계 전환 효과가 확인된 시트에만 적용한다. 다른 시트는
+# 기존 참고 키워드 판정을 유지해 이행평가·설비현황 등이 사업 목록으로 유입되지 않게 한다.
+VISUAL_REFERENCE_GATE_RELAXED_SHEETS = set(_env_list(
+    "VISUAL_REFERENCE_GATE_RELAXED_SHEETS",
+    ["regional_conditions"],
+))
+# 운영 Vision 결과를 모델 호출 없이 병합 정책 A/B에 재사용할 수 있도록
+# 정제 직전의 최소 입력을 gzip JSON 스냅샷으로 보존한다.
+VISUAL_MERGE_SNAPSHOT_ENABLED = _env_bool("VISUAL_MERGE_SNAPSHOT_ENABLED", True)
 
 # 연도 범위 (탄소중립 기본계획 기준)
 YEARS = list(range(2018, 2051))
@@ -247,8 +387,9 @@ EXCEL_HEADERS = {
     ],
     "06_감축목표": [
         "지자체명", "목표수준", "목표범위", "부문",
-        "기준연도", "기준배출량", "목표연도", "배출전망",
-        "목표감축량", "목표배출량", "감축률(%)",
+        "기준연도", "기준배출량", "기준배출량기준",
+        "목표연도", "배출전망", "목표감축량", "목표배출량",
+        "목표배출량기준", "감축률(%)", "감축률계산값",
     ],
     "07_비전전략": [
         "지자체명", "비전문구", "전략수준", "전략명",
@@ -267,7 +408,8 @@ EXCEL_HEADERS = {
     "10_정량감축량": [
         "지자체명", "관리번호", "사업명", "연도",
         "모니터링인자", "활동량", "활동단위",
-        "감축원단위ID", "감축원단위값", "예상감축량", "단위",
+        "감축원단위ID", "감축원단위값", "예상감축량",
+        "감축량유형", "시간기준", "단위",
     ],
     "11_재정투자계획": [
         "지자체명", "계획구분", "부문", "사업명",
@@ -276,6 +418,9 @@ EXCEL_HEADERS = {
     "12_대응기반강화": [
         "지자체명", "대응기반영역", "과제ID", "과제명",
         "정책방향", "주요내용", "대상", "주관부서", "기간",
+        "평가유형", "기후변수", "시나리오", "기준기간", "미래기간",
+        "공간단위", "부문", "리스크항목", "취약성지표", "값", "단위",
+        "리스크등급", "방법론", "자료출처", "연계적응과제",
     ],
     "13_이행관리환류": [
         "지자체명", "거버넌스기구", "역할", "담당부서",
@@ -283,7 +428,8 @@ EXCEL_HEADERS = {
     ],
     "14_점검실적": [
         "지자체명", "점검연도", "부문", "관리번호", "사업명",
-        "연간계획", "이행실적", "소요예산", "달성여부", "사업유형",
+        "연간계획", "이행실적", "소요예산", "예산액", "예산유형",
+        "예산단위", "예산집행률", "달성여부", "사업유형",
     ],
     "15_변경과제_조치": [
         "지자체명", "점검연도", "부문", "관리번호", "사업명",
@@ -292,7 +438,16 @@ EXCEL_HEADERS = {
     ],
     "16_시각자료목록": [
         "지자체명", "시각자료ID", "캡션", "유형",
-        "데이터포함여부", "추출값요약", "디지타이징필요", "관련시트",
+        "데이터포함여부", "추출값요약", "원문값", "원문단위",
+        "정규화값", "정규화단위", "정규화배율",
+        "값근거", "값검증상태", "계약버전",
+        "디지타이징필요", "관련시트",
+        "참고자료여부", "참고자료근거", "시각구조유형",
+        "음성재검증상태", "음성재검증근거", "자동병합정책",
+        "근거ID", "근거매칭상태", "근거분리방식", "원본객체ID",
+        "물리객체ID", "렌더그룹ID", "패널인덱스", "패널수", "근거좌표", "렌더변형",
+        "렌더변형목록", "물리중복통합수", "병합상태", "병합차단사유",
+        "필드조합상태", "필드조합목록", "필드조합근거", "필드조합충돌",
     ],
     "17_보조검수후보": [
         "지자체명", "대상시트", "후보유형", "신뢰도", "근거페이지",
@@ -305,6 +460,22 @@ EXCEL_HEADERS = {
     ],
     "19_검증리포트": [
         "지자체명", "심각도", "영역", "항목", "문제내용", "권장조치",
+    ],
+    "20_원문대조": [
+        "지자체명", "대상시트", "원본행번호", "상태", "신뢰도",
+        "출처페이지", "확인페이지", "점수", "검색어", "일치검색어",
+        "행요약", "검수메시지",
+    ],
+    "21_원문객체인벤토리": [
+        "지자체명", "객체ID", "객체유형", "출처페이지", "번호", "캡션",
+        "섹션", "행수", "열수", "연결상태", "완전성점수", "연결시트",
+        "연결행수", "검수메시지", "예상시트", "시트정합상태", "좌표",
+        "원본신뢰도", "Triage판정", "Triage사유", "보완백엔드", "보완상태",
+        "최종상태", "시도횟수", "종결사유", "근거ID",
+        "근거매칭단계", "일치근거ID", "평가분모상태", "Triage평가상태",
+        "허용시트", "보조연결시트", "목차참조페이지", "중복객체ID",
+        "물리객체ID", "대표객체ID", "별칭객체ID", "물리통합상태",
+        "물리통합방식", "물리통합신뢰도", "물리통합좌표",
     ],
     "90_코드북": [
         "코드유형", "코드", "라벨", "정의", "비고",
@@ -326,22 +497,28 @@ EXTRACTION_SHEETS = [
 # ──────────────────────────────────────────────────────────────────────
 # 시트 클러스터링 추출 (agent 모드 핵심 최적화)
 # ──────────────────────────────────────────────────────────────────────
-# 같은 페이지가 시트마다 따로 호출되는 중복(서울 기준 8.8×)을, 관련 시트를 묶어
-# "페이지 묶음당 1회 호출로 여러 시트 동시 추출"해 줄인다. 측정상 텍스트 호출 383→173회
-# (−55%), 입력 page-send 4514→2119(−53%). codex/claude처럼 호출당 오버헤드가 큰
-# agent 모드에서 시간·토큰 절감이 특히 크다.
+# 같은 페이지가 시트마다 따로 호출되는 중복을 관련 시트끼리만 묶어 줄인다.
+# 단독 그룹은 기존 per-sheet 경로를 그대로 사용하고, 결합 그룹만 한 번의 호출에서
+# 여러 시트를 추출한다. codex/claude처럼 호출당 오버헤드가 큰 agent 모드에서
+# 시간·토큰 절감 효과를 기대할 수 있다.
 #
-# 품질 주의(기본 비활성): 한 번에 2~4개 시트 스키마를 추출하면 출력 JSON이 길어져
+# 품질 주의(기본 비활성): 한 번에 여러 시트 스키마를 추출하면 출력 JSON이 길어져
 # 파싱 실패·시트별 정확도 저하 위험이 있다. 그래서 기본은 안전한 per-sheet(False)이며,
 # 실제 추출 A/B로 시트별 행 수·정확도 무회귀를 증명한 뒤 1로 켠다.
 EXTRACTION_SHEET_CLUSTERING = _env_bool("EXTRACTION_SHEET_CLUSTERING", False)
-# 클러스터는 (a) 원문에서 같은 구간을 공유하고 (b) 개념적으로 함께 읽히는 시트끼리 묶는다.
+# 클러스터는 원문 구간과 스키마 의미가 가까운 시트만 보수적으로 묶는다.
+# 행 수가 많거나 의미 경계가 중요한 시트는 단독으로 유지하고 그룹 크기는 최대 3개다.
 EXTRACTION_SHEET_CLUSTERS = [
-    ["document_meta", "plan_overview", "regional_conditions"],
-    ["emissions_regional", "emissions_management", "emissions_forecast"],
-    ["reduction_targets", "vision_strategy"],
-    ["mitigation_projects", "annual_implementation", "quantitative_reductions", "financial_plan"],
-    ["foundation_measures", "governance_feedback", "monitoring_performance", "changes_actions"],
+    ["document_meta", "plan_overview"],
+    ["regional_conditions"],
+    ["emissions_regional", "emissions_management"],
+    ["emissions_forecast"],
+    ["reduction_targets"],
+    ["vision_strategy"],
+    ["mitigation_projects", "annual_implementation"],
+    ["quantitative_reductions", "financial_plan"],
+    ["foundation_measures"],
+    ["governance_feedback", "monitoring_performance", "changes_actions"],
 ]
 
 # 시트 내부 키 → 엑셀 시트명 매핑
@@ -366,21 +543,62 @@ SHEET_KEY_TO_NAME = {
     "hybrid_review_candidates": "17_보조검수후보",
     "hybrid_merge_log": "18_보조병합로그",
     "validation_report": "19_검증리포트",
+    "source_verification": "20_원문대조",
+    "source_object_inventory": "21_원문객체인벤토리",
     "codebook": "90_코드북",
 }
 
 # 데이터가 있을 때만 생성하는 선택 시트
-OPTIONAL_EXCEL_SHEETS = {"17_보조검수후보", "18_보조병합로그", "19_검증리포트", "90_코드북"}
+OPTIONAL_EXCEL_SHEETS = {
+    "17_보조검수후보", "18_보조병합로그", "19_검증리포트",
+    "20_원문대조", "21_원문객체인벤토리", "90_코드북",
+}
+
+# 원문 객체 검증 단계에서만 사용하는 내부 원장. Excel 시트 행 수, 최종 LLM 요약,
+# 사용자용 작성 데이터 집계에는 포함하지 않는다.
+INTERNAL_OBJECT_KEYS = {
+    "object_triage", "ocr_document_objects", "document_objects",
+    "reduction_target_context", "semantic_contract_review", "reading_pipeline_audit",
+}
+
+# Production A/B rule bridge. Pure local transformation; no extra LLM calls.
+READING_PIPELINE_ENABLED = _env_bool("READING_PIPELINE_ENABLED", True)
 
 # 행 단위 원문 대조를 위한 페이지 근거. 헤더에는 항상 맨 뒤에 추가하되,
 # 실제 엑셀 출력에서만 PROVENANCE_ENABLED=0으로 v3 스키마를 복원할 수 있다.
 PROVENANCE_ENABLED = _env_bool("PROVENANCE_ENABLED", True)
 _PROVENANCE_DATA_SHEETS = [name for name in EXCEL_HEADERS if name[:2].isdigit() and int(name[:2]) <= 15]
 for _sheet_name in _PROVENANCE_DATA_SHEETS:
+    if "derivation_type" not in EXCEL_HEADERS[_sheet_name]:
+        EXCEL_HEADERS[_sheet_name].append("derivation_type")
+    if "근거ID" not in EXCEL_HEADERS[_sheet_name]:
+        EXCEL_HEADERS[_sheet_name].append("근거ID")
     if "출처페이지" not in EXCEL_HEADERS[_sheet_name]:
         EXCEL_HEADERS[_sheet_name].append("출처페이지")
     if "데이터상태" not in EXCEL_HEADERS[_sheet_name]:
         EXCEL_HEADERS[_sheet_name].append("데이터상태")
+
+# 정규화 전 부문 표현을 Excel에도 보존한다. 기존 열 위치는 유지한다.
+RAW_SECTOR_EXCEL_COLUMNS = {
+    "03_배출현황_지역": "부문원문",
+    "04_배출현황_관리권한": "관리부문원문",
+    "06_감축목표": "부문원문",
+    "08_감축사업목록": "부문원문",
+}
+for _sheet_name, _raw_column in RAW_SECTOR_EXCEL_COLUMNS.items():
+    if _raw_column not in EXCEL_HEADERS[_sheet_name]:
+        EXCEL_HEADERS[_sheet_name].append(_raw_column)
+
+# Append-only schema extension: retain all existing Excel cell positions.
+from utils.reading_financial_period import EXTRA_COLUMNS as _READING_EXTRA_COLUMNS
+from utils.reading_context_facts import COLUMNS as _READING_FACT_COLUMNS
+_READING_EXTRA_COLUMNS = {k: list(v) for k, v in _READING_EXTRA_COLUMNS.items()}
+for _key, _columns in _READING_FACT_COLUMNS.items():
+    _READING_EXTRA_COLUMNS.setdefault(_key, []).extend(_columns)
+for _sheet_key, _extra_columns in _READING_EXTRA_COLUMNS.items():
+    for _column in _extra_columns:
+        if _column not in EXCEL_HEADERS[SHEET_KEY_TO_NAME[_sheet_key]]:
+            EXCEL_HEADERS[SHEET_KEY_TO_NAME[_sheet_key]].append(_column)
 
 # PDF 페이지 배치 처리 크기.
 # 너무 크면 출력 JSON이 길어져 파싱 실패가 늘 수 있어 안정성 위주로 둔다.
@@ -402,6 +620,9 @@ PRIOR_PLAN_HEADING_PATTERNS = _env_pattern_list(
         r"이전\s*계획.{0,6}평가",
     ],
 )
+# 다음 장 제목을 찾지 못했을 때 기존계획 구간을 문서 끝까지 확장하지 않는 안전 상한.
+# 상한을 넘으면 탐지를 무효화하고 오탐 경고를 만들지 않는다.
+PRIOR_PLAN_MAX_PAGES = _env_int("PRIOR_PLAN_MAX_PAGES", 60)
 # 시트별 라우팅 후보 페이지 상한. 기본값은 없음.
 # 테스트/최적화가 필요할 때만 DOCUMENT_ROUTE_MAX_PAGES_* 환경변수로 명시적으로 샘플링한다.
 _DOCUMENT_ROUTE_DEFAULT_MAX_PAGES: dict[str, int | None] = {}
@@ -479,6 +700,13 @@ ROUTE_STRONG_UBIQUITY_RATIO = _env_float("ROUTE_STRONG_UBIQUITY_RATIO", 0.6)
 # 순수하게 벽시계 시간만 줄인다(품질·토큰 변화 없음).
 # Gemini API/로컬 에이전트 동시성 한도를 고려해 보수적 기본값을 둔다.
 PARALLEL_PROCESSING_ENABLED = _env_bool("PARALLEL_PROCESSING_ENABLED", True)
+# 같은 시트 계약·페이지 집합·주입 프롬프트·payload인 텍스트 작업은 enqueue 전에 제거한다.
+# 서로 다른 시트나 복구 청크는 fingerprint가 달라 합쳐지지 않는다.
+TEXT_QUEUE_DEDUP_ENABLED = _env_bool("TEXT_QUEUE_DEDUP_ENABLED", True)
+# Separate experimental axes. Audit is non-mutating until input retention is reviewed.
+TEXT_ROUTING_MODE = os.environ.get("TEXT_ROUTING_MODE", "audit").strip().lower()
+TEXT_INPUT_MODE = os.environ.get("TEXT_INPUT_MODE", "audit").strip().lower()
+TEXT_CLUSTER_MEMBER_RETRIES = _env_int("TEXT_CLUSTER_MEMBER_RETRIES", 1)
 # 텍스트 추출(extractor/gap_fill) 동시 호출 수.
 TEXT_WORKERS = _env_int("TEXT_WORKERS", 4)
 # 이미지 vision 동시 호출 수. vision은 호출당 페이로드가 커 보수적으로 둔다.
@@ -487,6 +715,9 @@ VISION_WORKERS = _env_int("VISION_WORKERS", 2)
 LLM_CACHE_ENABLED = _env_bool("LLM_CACHE_ENABLED", True)
 LLM_CACHE_DIR = os.environ.get("LLM_CACHE_DIR", ".cache/llm_responses").strip()
 LLM_CACHE_VERSION = os.environ.get("LLM_CACHE_VERSION", "carbon-report-llm-cache-v1").strip()
+# 병렬 작업에서 동일한 요청이 동시에 캐시 미스가 나도 실제 LLM 호출은 한 번만 수행한다.
+# 디스크 캐시를 끈 무캐시 실행에서도 동시에 겹친 요청만 공유하며 순차 요청은 재호출한다.
+LLM_SINGLEFLIGHT_ENABLED = _env_bool("LLM_SINGLEFLIGHT_ENABLED", True)
 
 # 이미지 분석 최대 개수. 기본값은 없음(=triage 통과 후보 전부 분석).
 # 테스트/디버그 때만 MAX_IMAGES=30처럼 명시적으로 제한한다.
@@ -503,6 +734,34 @@ IMAGE_TRIAGE_KEEP_RENDERED_CONTEXT = True
 IMAGE_CHART_TABLE_EXTRACTION = True
 # 전수 이미지 분석 시 여러 이미지를 한 번의 로컬 에이전트 호출로 묶는다.
 IMAGE_ANALYSIS_BATCH_SIZE = _env_int("IMAGE_ANALYSIS_BATCH_SIZE", 8)
+# off: 기존 경로 / audit: 판정 기록만 / exclude: 확인된 목차만 Vision 호출 전 제외.
+# 텍스트 배정·본문·실제 표 데이터는 변경하지 않는다.
+VISION_TOC_MODE = os.environ.get("VISION_TOC_MODE", "exclude").strip().lower()
+# 비전 배치도 텍스트 배치와 같은 실행 원장에 저장하고, 실패 시 이미지 단위로 분할한다.
+VISION_CHECKPOINT_ENABLED = _env_bool("VISION_CHECKPOINT_ENABLED", True)
+VISION_SPLIT_ON_FAILURE = _env_bool("VISION_SPLIT_ON_FAILURE", True)
+VISION_RECOVERY_MAX_SPLIT_DEPTH = _env_int("VISION_RECOVERY_MAX_SPLIT_DEPTH", 6)
+# 루트 호출도 1회로 계산한다. 기본 7회는 최대 분할 깊이 6과 같은 상한이다.
+VISION_RECOVERY_MAX_OBJECT_ATTEMPTS = _env_int(
+    "VISION_RECOVERY_MAX_OBJECT_ATTEMPTS", 7
+)
+# 강한 캡션·수치·단위 신호가 있는데도 비데이터로 판정된 객체만 전용 프롬프트로
+# 근거 ID당 한 번 재확인한다. 0은 실행 전체 객체 수 상한 없음이다.
+VISION_NEGATIVE_REVALIDATION_ENABLED = _env_bool(
+    "VISION_NEGATIVE_REVALIDATION_ENABLED", True
+)
+VISION_NEGATIVE_REVALIDATION_MAX_OBJECTS = _env_int(
+    "VISION_NEGATIVE_REVALIDATION_MAX_OBJECTS", 0
+)
+# 재개 실행에서 성공 체크포인트 전체를 버리지 않고, 지정한 근거 객체나
+# 페이지가 포함된 Vision 배치만 다시 판독한다. 새 결과는 같은 배치의 기존
+# 비대상 결과와 병합되어 체크포인트에 다시 저장된다.
+VISION_RETRY_EVIDENCE_IDS = _env_list("VISION_RETRY_EVIDENCE_IDS", [])
+VISION_RETRY_PAGES = {
+    page
+    for value in _env_list("VISION_RETRY_PAGES", [])
+    if str(value).strip().isdigit() and (page := int(value)) > 0
+}
 # 그래프 판독값을 본 시트에 자동 병합할 최소 신뢰도.
 # low는 별도 판독결과 시트에만 남기고 본 데이터에는 병합하지 않는다.
 IMAGE_CHART_MERGE_MIN_CONFIDENCE = "medium"
@@ -519,8 +778,48 @@ IMAGE_CHART_REFERENCE_KEYWORDS = [
     "COP", "IPCC", "UN", "EU", "OECD", "사례", "동향", "목차",
     "우리나라", "국가 온실가스", "국가 감축목표", "중앙정부", "NDC",
 ]
-# True이면 참고자료/해외사례/목차성 페이지 이미지를 Vision 호출 전에 제외한다.
-IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT = True
+# 참고자료도 먼저 판독해 감사 가능한 관찰값을 남기고, 본문 시트 자동 병합만 차단한다.
+# False로 바꾸고 아래 레거시 제외를 켜면 P3 이전의 호출 전 필터 동작을 재현할 수 있다.
+IMAGE_REFERENCE_ANALYZE_THEN_BLOCK = _env_bool("IMAGE_REFERENCE_ANALYZE_THEN_BLOCK", True)
+# P3 이전 비교 실험용 레거시 설정. ocr_required 객체에는 적용되지 않는다.
+IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT = _env_bool(
+    "IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT", False
+)
+
+# ──────────────────────────────────────────────────────────────────────
+# 문서 객체 기반 선택적 OCR/VLM
+# ──────────────────────────────────────────────────────────────────────
+# PyMuPDF가 충분히 읽은 표·텍스트는 재호출하지 않고, 누락·부분·복잡 객체와
+# 데이터 차트만 보완한다. 백엔드는 vlm(기존 이미지 에이전트),
+# unlimited_ocr(사전 생성 Markdown/JSONL 디렉터리), none 중 하나다.
+SELECTIVE_OCR_ENABLED = _env_bool("SELECTIVE_OCR_ENABLED", True)
+# Opt-in bounded reading of uncertain images. Zero budgets mean no extra calls.
+VISION_REVIEW_ENABLED = _env_bool("VISION_REVIEW_ENABLED", False)
+VISION_REVIEW_MAX_OBJECTS = _env_int("VISION_REVIEW_MAX_OBJECTS", 16)
+VISION_REVIEW_MAX_PER_PAGE = _env_int("VISION_REVIEW_MAX_PER_PAGE", 1)
+VISION_REVIEW_MAX_CALLS = _env_int("VISION_REVIEW_MAX_CALLS", 16)
+VISION_REVIEW_MAX_SECONDS = _env_float("VISION_REVIEW_MAX_SECONDS", 600)
+VISION_REVIEW_CALL_TIMEOUT = _env_float("VISION_REVIEW_CALL_TIMEOUT", 120)
+VISION_EXPECTED_CANDIDATE_SHA256 = os.environ.get("VISION_EXPECTED_CANDIDATE_SHA256", "").strip()
+# 동일 표·차트의 native/캡션/OCR/VLM 표현을 Triage 전에 하나의 물리 객체로
+# 통합한다. 원래 객체 ID는 alias로 보존하고 서로 다른 패널은 합치지 않는다.
+PHYSICAL_OBJECT_MERGE_ENABLED = _env_bool("PHYSICAL_OBJECT_MERGE_ENABLED", True)
+OCR_BACKEND = os.environ.get("OCR_BACKEND", "vlm").strip().lower() or "vlm"
+OCR_RESULTS_DIR = os.environ.get("OCR_RESULTS_DIR", "").strip()
+OCR_NATIVE_CONFIDENCE_THRESHOLD = _env_float("OCR_NATIVE_CONFIDENCE_THRESHOLD", 0.78)
+OCR_COMPLEX_TABLE_ROWS = _env_int("OCR_COMPLEX_TABLE_ROWS", 45)
+OCR_COMPLEX_TABLE_COLUMNS = _env_int("OCR_COMPLEX_TABLE_COLUMNS", 12)
+OCR_RENDER_DPI = _env_int("OCR_RENDER_DPI", 200)
+# 한 실행 안에서 같은 페이지·좌표를 요구하는 물리 객체는 동일 PNG를 재사용한다.
+# 후보·프롬프트·판독 순서는 바뀌지 않고 PDF rasterization 비용만 제거한다.
+OCR_RENDER_CACHE_ENABLED = _env_bool("OCR_RENDER_CACHE_ENABLED", True)
+# 캡션만 검출된 객체는 페이지 전체 대신 인접 이미지·표·벡터 영역을 먼저 복원한다.
+OCR_SPATIAL_RECONSTRUCTION_ENABLED = _env_bool("OCR_SPATIAL_RECONSTRUCTION_ENABLED", True)
+OCR_FULL_PAGE_CONTEXT_ENABLED = _env_bool("OCR_FULL_PAGE_CONTEXT_ENABLED", True)
+OCR_MULTI_PANEL_GAP = _env_int("OCR_MULTI_PANEL_GAP", 24)
+OCR_CAPTION_REGION_MAX_HEIGHT_RATIO = _env_float(
+    "OCR_CAPTION_REGION_MAX_HEIGHT_RATIO", 0.45
+)
 
 # 1차 추출 후 빈칸이 큰 행만 좁은 문맥으로 다시 보완
 GAP_FILL_ENABLED = _env_bool("GAP_FILL_ENABLED", True)
@@ -582,20 +881,15 @@ MAX_RETRIES = 3
 # ──────────────────────────────────────────────────────────────────────
 # 할당량(quota/세션 한도) 회복 대기-재개 설정
 # ──────────────────────────────────────────────────────────────────────
-# True이면 codex/claude 로컬 에이전트가 quota 메시지 없이 반복 타임아웃될 때
-# throttling으로 추정해 짧게 대기 후 재시도한다. 명시적 quota/session-limit 오류는
-# 배치 원장과 상위 단계 정책이 처리하도록 즉시 전파한다.
+# 명시적인 quota/session-limit 오류에만 회복 대기를 적용한다. 일반 타임아웃은
+# LOCAL_AGENT_TIMEOUT_RETRIES만큼만 재시도한 뒤 배치 분할/실패 원장으로 넘긴다.
 LLM_QUOTA_WAIT_ENABLED = _env_bool("LLM_QUOTA_WAIT_ENABLED", True)
-# 반복 타임아웃 추정 시 재시도 폴링 간격(초).
-# 10분 폴링은 기본 실행에서 과도한 정지를 만들었으므로 기본 2분으로 줄이고 env로 조정한다.
+# 명시적 quota 회복을 확인할 폴링 간격(초).
 LLM_QUOTA_WAIT_POLL_SECONDS = _env_int("LLM_QUOTA_WAIT_POLL_SECONDS", 120)
 # 누적 대기 상한(초). 6시간은 밤샘 완주용으로만 env에서 선택하고 기본은 30분으로 제한한다.
 LLM_QUOTA_WAIT_MAX_SECONDS = _env_int("LLM_QUOTA_WAIT_MAX_SECONDS", 1800)
 # 대기 중 "아직 살아 있음"을 알리는 하트비트 로그 간격(초). 기본 5분.
 LLM_QUOTA_WAIT_HEARTBEAT_SECONDS = _env_int("LLM_QUOTA_WAIT_HEARTBEAT_SECONDS", 300)
-# codex/claude 명시적 quota와 연속 타임아웃은 짧게 대기 후 재개하고, 상한 초과 시
-# 해당 배치 실패로 격리한다(LLM_QUOTA_WAIT_ENABLED=True일 때).
-LLM_TIMEOUT_AS_QUOTA_THRESHOLD = _env_int("LLM_TIMEOUT_AS_QUOTA_THRESHOLD", 2)
 
 # 이미지 최대 크기 (픽셀, 긴 변 기준)
 MAX_IMAGE_SIZE = 1568

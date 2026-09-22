@@ -22,6 +22,7 @@ import base64
 import importlib
 import json
 import logging
+import os
 import random
 import re
 import shlex
@@ -30,14 +31,40 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Sequence
 
 import config
-from utils.llm_cache import LLMCacheRequest, cached_response
+from utils.llm_cache import LLMCacheRequest, cached_response, cached_response_if_present
+from utils.local_process import run_local_command
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_limited_vision = ContextVar("limited_vision", default=None)
+
+
+@contextmanager
+def limited_vision_call(timeout_seconds: float):
+    """Per-thread single CLI request: no JSON retry, quota wait or model fallback."""
+    token = _limited_vision.set({"deadline": time.monotonic() + timeout_seconds, "requests": 0, "commands": 0})
+    try:
+        yield
+    finally:
+        _limited_vision.reset(token)
+
+
+def _claim_limited_vision_request(stage):
+    limit = _limited_vision.get()
+    if limit is None:
+        return False
+    if _resolve_provider(stage) not in {"codex", "claude"}:
+        raise LLMCallError("제한적 판독의 단일 호출/시간 보장은 현재 codex·claude CLI만 지원합니다")
+    if limit["requests"] or time.monotonic() >= limit["deadline"]:
+        raise LLMTimeoutError("제한적 Vision 호출 예산 소진")
+    limit["requests"] += 1
+    return True
 
 
 class LLMCallError(RuntimeError):
@@ -46,6 +73,14 @@ class LLMCallError(RuntimeError):
 
 class LLMQuotaExceededError(LLMCallError):
     """계정 quota, 세션 한도, rate limit처럼 즉시 회복되지 않는 실패."""
+
+
+class LLMTimeoutError(LLMCallError):
+    """로컬 에이전트가 제한 시간 안에 응답하지 못한 실패."""
+
+
+class LLMCapacityError(LLMCallError):
+    """선택한 모델이 일시적인 수용량 한도에 도달한 실패."""
 
 
 _QUOTA_ERROR_MARKERS = (
@@ -60,6 +95,14 @@ _QUOTA_ERROR_MARKERS = (
     "429",
     "한도",
     "할당량",
+)
+
+
+_CAPACITY_ERROR_MARKERS = (
+    "selected model is at capacity",
+    "model is at capacity",
+    "model capacity is temporarily unavailable",
+    "model overloaded",
 )
 
 
@@ -90,21 +133,49 @@ _OPENAI_QUOTA_ERROR_MARKERS = (
 _LLM_STATS_LOCK = threading.Lock()
 _LLM_STATS = {
     "calls": {},
+    "call_seconds": {},
+    "max_call_seconds": {},
+    "input_chars": {},
+    "image_count": {},
+    "image_base64_chars": {},
     "failures": 0,
     "retries": 0,
     "quota_wait_seconds": 0.0,
     "timeouts": 0,
+    "capacity_errors": 0,
+    "capacity_circuit_opened": 0,
+    "capacity_circuit_rejected": 0,
+    "capacity_fallback_calls": 0,
+    "capacity_fallback_successes": 0,
+    "capacity_fallback_failures": 0,
+    "capacity_fallbacks": {},
 }
+
+_CAPACITY_CIRCUIT_LOCK = threading.Lock()
+_CAPACITY_CIRCUITS: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 
 def reset_llm_stats() -> None:
     """현재 실행의 LLM 호출/대기 통계를 초기화한다."""
     with _LLM_STATS_LOCK:
         _LLM_STATS["calls"] = {}
+        _LLM_STATS["call_seconds"] = {}
+        _LLM_STATS["max_call_seconds"] = {}
+        _LLM_STATS["input_chars"] = {}
+        _LLM_STATS["image_count"] = {}
+        _LLM_STATS["image_base64_chars"] = {}
         _LLM_STATS["failures"] = 0
         _LLM_STATS["retries"] = 0
         _LLM_STATS["quota_wait_seconds"] = 0.0
         _LLM_STATS["timeouts"] = 0
+        _LLM_STATS["capacity_errors"] = 0
+        _LLM_STATS["capacity_circuit_opened"] = 0
+        _LLM_STATS["capacity_circuit_rejected"] = 0
+        _LLM_STATS["capacity_fallback_calls"] = 0
+        _LLM_STATS["capacity_fallback_successes"] = 0
+        _LLM_STATS["capacity_fallback_failures"] = 0
+        _LLM_STATS["capacity_fallbacks"] = {}
+    _reset_capacity_circuits()
 
 
 def get_llm_stats() -> dict[str, Any]:
@@ -113,11 +184,29 @@ def get_llm_stats() -> dict[str, Any]:
         calls = dict(_LLM_STATS["calls"])
         return {
             "calls": calls,
+            "call_seconds": {
+                key: round(float(value), 3)
+                for key, value in _LLM_STATS["call_seconds"].items()
+            },
+            "max_call_seconds": {
+                key: round(float(value), 3)
+                for key, value in _LLM_STATS["max_call_seconds"].items()
+            },
+            "input_chars": dict(_LLM_STATS["input_chars"]),
+            "image_count": dict(_LLM_STATS["image_count"]),
+            "image_base64_chars": dict(_LLM_STATS["image_base64_chars"]),
             "total_calls": sum(calls.values()),
             "failures": int(_LLM_STATS["failures"]),
             "retries": int(_LLM_STATS["retries"]),
             "quota_wait_seconds": float(_LLM_STATS["quota_wait_seconds"]),
             "timeouts": int(_LLM_STATS["timeouts"]),
+            "capacity_errors": int(_LLM_STATS["capacity_errors"]),
+            "capacity_circuit_opened": int(_LLM_STATS["capacity_circuit_opened"]),
+            "capacity_circuit_rejected": int(_LLM_STATS["capacity_circuit_rejected"]),
+            "capacity_fallback_calls": int(_LLM_STATS["capacity_fallback_calls"]),
+            "capacity_fallback_successes": int(_LLM_STATS["capacity_fallback_successes"]),
+            "capacity_fallback_failures": int(_LLM_STATS["capacity_fallback_failures"]),
+            "capacity_fallbacks": dict(_LLM_STATS["capacity_fallbacks"]),
         }
 
 
@@ -131,17 +220,63 @@ def _add_wait_seconds(seconds: float) -> None:
         _LLM_STATS["quota_wait_seconds"] = float(_LLM_STATS["quota_wait_seconds"]) + seconds
 
 
-def _record_call(kind: str, provider: str, producer) -> str:
+def _record_capacity_fallback(stage: str | None, primary: str, fallback: str) -> None:
+    key = f"{stage or 'default'}:{primary or 'default'}->{fallback or 'default'}"
+    with _LLM_STATS_LOCK:
+        values = dict(_LLM_STATS["capacity_fallbacks"])
+        values[key] = int(values.get(key, 0)) + 1
+        _LLM_STATS["capacity_fallbacks"] = values
+
+
+def _record_call(
+    kind: str,
+    provider: str,
+    producer,
+    *,
+    request: LLMCacheRequest | None = None,
+    stage: str | None = None,
+) -> str:
+    detail_key = ":".join((
+        kind,
+        provider,
+        str(stage or "default"),
+        str(request.model if request is not None else "default"),
+    ))
+    input_chars = 0
+    image_count = 0
+    image_chars = 0
+    if request is not None:
+        input_chars = len(request.system) + len(request.prompt)
+        image_count = len(request.images_b64)
+        image_chars = sum(len(image) for image in request.images_b64)
     with _LLM_STATS_LOCK:
         calls = dict(_LLM_STATS["calls"])
         key = f"{kind}:{provider}"
         calls[key] = calls.get(key, 0) + 1
         _LLM_STATS["calls"] = calls
+        for metric, amount in (
+            ("input_chars", input_chars),
+            ("image_count", image_count),
+            ("image_base64_chars", image_chars),
+        ):
+            values = dict(_LLM_STATS[metric])
+            values[detail_key] = int(values.get(detail_key, 0)) + int(amount)
+            _LLM_STATS[metric] = values
+    started = time.perf_counter()
     try:
         return producer()
     except (LLMCallError, OSError, RuntimeError, subprocess.SubprocessError):
         _inc_stat("failures")
         raise
+    finally:
+        elapsed = time.perf_counter() - started
+        with _LLM_STATS_LOCK:
+            seconds = dict(_LLM_STATS["call_seconds"])
+            maximum = dict(_LLM_STATS["max_call_seconds"])
+            seconds[detail_key] = float(seconds.get(detail_key, 0.0)) + elapsed
+            maximum[detail_key] = max(float(maximum.get(detail_key, 0.0)), elapsed)
+            _LLM_STATS["call_seconds"] = seconds
+            _LLM_STATS["max_call_seconds"] = maximum
 
 _JSON_ONLY_INSTRUCTION = """
 당신은 지자체 탄소중립 계획 문서에서 구조화 데이터를 추출하는 로컬 에이전트입니다.
@@ -155,7 +290,9 @@ _JSON_ONLY_INSTRUCTION = """
 
 def _split_command(command: str) -> list[str]:
     """환경변수에 들어간 실행 명령을 안전하게 토큰화한다."""
-    tokens = shlex.split(command or "")
+    tokens = shlex.split(command or "", posix=os.name != "nt")
+    if os.name == "nt":
+        tokens = [token[1:-1] if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"} else token for token in tokens]
     if not tokens:
         raise RuntimeError("로컬 에이전트 실행 명령이 비어 있습니다.")
     return tokens
@@ -249,6 +386,11 @@ def _is_quota_error_message(message: str) -> bool:
     return any(marker in normalized for marker in _QUOTA_ERROR_MARKERS)
 
 
+def _is_capacity_error_message(message: str) -> bool:
+    normalized = message.casefold()
+    return any(marker in normalized for marker in _CAPACITY_ERROR_MARKERS)
+
+
 def _is_transient_error_message(message: str) -> bool:
     normalized = message.casefold()
     return any(marker in normalized for marker in _TRANSIENT_ERROR_MARKERS)
@@ -261,6 +403,102 @@ def _is_openai_quota_error_message(message: str) -> bool:
 
 def _stage_model(stage: str | None) -> str:
     return _stage_config_value("STAGE_MODELS", stage)
+
+
+def _stage_fallback_model(stage: str | None) -> str:
+    if not getattr(config, "LLM_CAPACITY_FALLBACK_ENABLED", True):
+        return ""
+    return _stage_config_value("STAGE_FALLBACK_MODELS", stage) or str(
+        getattr(config, "LLM_CAPACITY_FALLBACK_MODEL", "") or ""
+    ).strip()
+
+
+def _reset_capacity_circuits() -> None:
+    with _CAPACITY_CIRCUIT_LOCK:
+        _CAPACITY_CIRCUITS.clear()
+
+
+def _capacity_key(provider: str, model: str, stage: str | None) -> tuple[str, str, str]:
+    return provider, model or "default", stage or "default"
+
+
+def _capacity_select_model(
+    provider: str,
+    primary_model: str,
+    stage: str | None,
+) -> tuple[str, bool]:
+    """열린 회로에서는 fallback을 선택하고, 없으면 추가 호출을 즉시 차단한다."""
+    if not getattr(config, "LLM_CAPACITY_CIRCUIT_ENABLED", True):
+        return primary_model, False
+
+    key = _capacity_key(provider, primary_model, stage)
+    now = time.monotonic()
+    with _CAPACITY_CIRCUIT_LOCK:
+        state = _CAPACITY_CIRCUITS.get(key)
+        if not state:
+            return primary_model, False
+        open_until = float(state.get("open_until", 0.0))
+        if open_until <= now:
+            # 반개방 상태에서는 한 호출만 원 모델을 시험하고 나머지는 우회/차단한다.
+            if not state.get("probe_in_flight"):
+                state["probe_in_flight"] = True
+                return primary_model, True
+        fallback = _stage_fallback_model(stage)
+        if fallback and fallback != primary_model:
+            _inc_stat("capacity_fallback_calls")
+            _record_capacity_fallback(stage, primary_model, fallback)
+            return fallback, False
+        remaining = max(0, int(open_until - now + 0.999))
+
+    _inc_stat("capacity_circuit_rejected")
+    raise LLMCapacityError(
+        f"{provider} 모델 {primary_model or 'default'} capacity 회로가 열려 있습니다"
+        f" (약 {remaining}초 후 재시도)"
+    )
+
+
+def _capacity_record_failure(provider: str, model: str, stage: str | None) -> None:
+    _inc_stat("capacity_errors")
+    if not getattr(config, "LLM_CAPACITY_CIRCUIT_ENABLED", True):
+        return
+    threshold = max(1, int(getattr(config, "LLM_CAPACITY_FAILURE_THRESHOLD", 1)))
+    cooldown = max(1, int(getattr(config, "LLM_CAPACITY_COOLDOWN_SECONDS", 120)))
+    key = _capacity_key(provider, model, stage)
+    opened = False
+    with _CAPACITY_CIRCUIT_LOCK:
+        state = _CAPACITY_CIRCUITS.setdefault(
+            key,
+            {"failures": 0, "open_until": 0.0, "probe_in_flight": False},
+        )
+        state["failures"] = int(state.get("failures", 0)) + 1
+        state["probe_in_flight"] = False
+        if state["failures"] >= threshold:
+            state["open_until"] = time.monotonic() + cooldown
+            opened = True
+    if opened:
+        _inc_stat("capacity_circuit_opened")
+        logger.warning(
+            "%s 모델 %s capacity 회로 개방: %s초 동안 원 모델 호출 차단",
+            provider,
+            model or "default",
+            cooldown,
+        )
+
+
+def _capacity_record_success(provider: str, model: str, stage: str | None) -> None:
+    if not getattr(config, "LLM_CAPACITY_CIRCUIT_ENABLED", True):
+        return
+    key = _capacity_key(provider, model, stage)
+    with _CAPACITY_CIRCUIT_LOCK:
+        _CAPACITY_CIRCUITS.pop(key, None)
+
+
+def _capacity_release_probe(provider: str, model: str, stage: str | None) -> None:
+    key = _capacity_key(provider, model, stage)
+    with _CAPACITY_CIRCUIT_LOCK:
+        state = _CAPACITY_CIRCUITS.get(key)
+        if state:
+            state["probe_in_flight"] = False
 
 
 def _gemini_default_model(stage: str | None) -> str:
@@ -281,14 +519,18 @@ def _codex_default_model(stage: str | None) -> str:
     """codex 백엔드의 스테이지별 기본 모델.
 
     캐시 키(_model_identity)와 실제 --model 인자가 항상 같은 값을 쓰도록, codex 기본
-    모델 결정은 이 함수만 거친다. vision 단계의 gpt-5.6-luna 기본값 근거는
-    config.CODEX_VISION_MODEL 주석 참조.
+    모델 결정은 이 함수만 거친다. vision 단계는 CODEX_VISION_MODEL,
+    나머지 텍스트 단계는 CODEX_TEXT_MODEL을 사용한다.
     """
     if stage == "vision":
         vision_model = str(getattr(config, "CODEX_VISION_MODEL", "") or "").strip()
         if vision_model:
             return vision_model
-    return str(getattr(config, "LOCAL_AGENT_MODEL", "") or "")
+        return str(getattr(config, "LOCAL_AGENT_MODEL", "") or "").strip()
+    explicit_model = str(getattr(config, "LOCAL_AGENT_MODEL", "") or "").strip()
+    if explicit_model:
+        return explicit_model
+    return str(getattr(config, "CODEX_TEXT_MODEL", "") or "").strip()
 
 
 def _model_identity(provider: str, stage: str | None = None) -> str:
@@ -312,18 +554,15 @@ def _model_identity(provider: str, stage: str | None = None) -> str:
 
 def _run_command(command: Sequence[str], prompt: str, *, cwd: Path, timeout: int) -> str:
     """로컬 CLI를 실행하고 stdout을 반환한다."""
+    limit = _limited_vision.get()
+    if limit is not None:
+        remaining = limit["deadline"] - time.monotonic()
+        if limit["commands"] or remaining <= 0:
+            raise LLMTimeoutError("제한적 Vision CLI 실행 예산 소진")
+        limit["commands"] += 1
+        timeout = min(timeout, remaining)
     logger.debug("로컬 에이전트 실행: %s", " ".join(shlex.quote(part) for part in command))
-    completed = subprocess.run(
-        list(command),
-        input=prompt,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        cwd=str(cwd),
-        timeout=timeout,
-        check=False,
-    )
+    completed = run_local_command(list(command), prompt, cwd=cwd, timeout=timeout)
     if completed.returncode != 0:
         message = (
             "로컬 에이전트 실행 실패 "
@@ -331,6 +570,8 @@ def _run_command(command: Sequence[str], prompt: str, *, cwd: Path, timeout: int
             f"STDERR:\n{_tail(completed.stderr)}\n"
             f"STDOUT:\n{_tail(completed.stdout)}"
         )
+        if _is_capacity_error_message(message):
+            raise LLMCapacityError(message)
         if _is_quota_error_message(message):
             raise LLMQuotaExceededError(message)
         raise LLMCallError(message)
@@ -425,6 +666,8 @@ def _run_claude(
     command += _claude_minimal_flags(paths)
     try:
         return _run_command(command, prompt, cwd=cwd, timeout=timeout)
+    except LLMCapacityError:
+        raise
     except LLMQuotaExceededError:
         raise
     except LLMCallError:
@@ -532,49 +775,47 @@ def _sleep_with_heartbeat(total_seconds: float, label: str) -> None:
 
 
 def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
+    if _limited_vision.get() is not None:
+        max_retries = 1
     attempt = 0
     quota_waited = 0.0
-    consecutive_timeouts = 0
-    timeout_threshold = int(getattr(config, "LLM_TIMEOUT_AS_QUOTA_THRESHOLD", 2))
+    timeout_retries = max(0, int(getattr(config, "LOCAL_AGENT_TIMEOUT_RETRIES", 1)))
+    timeout_max_attempts = min(max(1, int(max_retries)), timeout_retries + 1)
     while True:
         attempt += 1
         try:
-            result = fn()
-            consecutive_timeouts = 0
-            return result
+            return fn()
         except subprocess.TimeoutExpired as exc:
-            consecutive_timeouts += 1
             _inc_stat("timeouts")
-            wait_enabled = getattr(config, "LLM_QUOTA_WAIT_ENABLED", True)
-            # 연속 타임아웃이 임계값 이상이면 throttling으로 보고 quota처럼 대기-재개한다.
-            if wait_enabled and consecutive_timeouts >= timeout_threshold:
-                poll = int(getattr(config, "LLM_QUOTA_WAIT_POLL_SECONDS", 600))
-                cap = int(getattr(config, "LLM_QUOTA_WAIT_MAX_SECONDS", 21600))
-                if quota_waited + poll > cap:
-                    logger.error(
-                        "%s 반복 타임아웃 대기 누적 %s 가 상한 %s 초과. 중단합니다.",
-                        label, _fmt_duration(quota_waited), _fmt_duration(cap),
-                    )
-                    raise LLMCallError(f"{label} 반복 타임아웃(throttling 추정) 상한 초과") from exc
-                quota_waited += poll
-                _inc_stat("retries")
-                attempt -= 1  # throttling 대기는 일반 재시도 예산을 소모하지 않는다.
-                logger.warning(
-                    "%s 연속 %s회 타임아웃 → throttling 추정. %s 후 자동 재개(누적 대기 %s).",
-                    label, consecutive_timeouts, _fmt_duration(poll), _fmt_duration(quota_waited),
+            if attempt >= timeout_max_attempts:
+                logger.error(
+                    "%s 타임아웃 상한 도달(%s회). 상위 배치 분할/실패 격리로 넘깁니다.",
+                    label,
+                    timeout_max_attempts,
                 )
-                _sleep_with_heartbeat(poll, label)
-            elif attempt >= max_retries:
-                logger.error("%s 타임아웃 최대 재시도 초과: %s", label, exc)
-                raise LLMCallError(f"{label} 타임아웃 최대 재시도 초과") from exc
-            else:
-                wait = min(5 * attempt, 30)
-                logger.warning("%s 타임아웃. %s초 후 재시도 (%s/%s)", label, wait, attempt, max_retries)
-                _inc_stat("retries")
+                raise LLMTimeoutError(
+                    f"{label} 타임아웃 상한 도달({timeout_max_attempts}회)"
+                ) from exc
+            wait = max(
+                0,
+                int(getattr(config, "LOCAL_AGENT_TIMEOUT_RETRY_DELAY_SECONDS", 5)),
+            )
+            logger.warning(
+                "%s 타임아웃. %s초 후 제한 재시도 (%s/%s)",
+                label,
+                wait,
+                attempt,
+                timeout_max_attempts,
+            )
+            _inc_stat("retries")
+            if wait:
                 time.sleep(wait)
+        except LLMCapacityError:
+            # 같은 모델에 대한 즉시 재시도는 과부하를 악화한다. 호출 상위의 회로
+            # 차단기가 fallback 전환 또는 부분 실패 격리를 결정한다.
+            raise
         except LLMQuotaExceededError as exc:
-            consecutive_timeouts = 0
-            if not getattr(config, "LLM_QUOTA_WAIT_ENABLED", True):
+            if _limited_vision.get() is not None or not getattr(config, "LLM_QUOTA_WAIT_ENABLED", True):
                 raise
             parsed = _parse_quota_reset_seconds(str(exc))
             poll = int(getattr(config, "LLM_QUOTA_WAIT_POLL_SECONDS", 120))
@@ -595,7 +836,6 @@ def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
             )
             _sleep_with_heartbeat(wait, label)
         except (LLMCallError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            consecutive_timeouts = 0  # 비-타임아웃 오류는 연속 타임아웃 카운트를 끊는다.
             if attempt >= max_retries:
                 logger.error("%s 최대 재시도 초과: %s", label, exc)
                 raise LLMCallError(f"{label} 최대 재시도 초과") from exc
@@ -603,6 +843,112 @@ def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
             logger.warning("%s 오류: %s. %s초 후 재시도 (%s/%s)", label, exc, wait, attempt, max_retries)
             _inc_stat("retries")
             time.sleep(wait)
+
+
+def _local_model_identity(provider: str, model: str) -> str:
+    if provider == "codex":
+        return ":".join([str(getattr(config, "CODEX_COMMAND", "codex")), model])
+    if provider == "claude":
+        return ":".join([str(getattr(config, "CLAUDE_COMMAND", "claude")), model])
+    return model
+
+
+def _call_local_with_capacity(
+    *,
+    kind: str,
+    provider: str,
+    stage: str | None,
+    primary_model: str,
+    prompt: str,
+    system: str,
+    max_retries: int,
+    images_b64: Sequence[str] = (),
+) -> str:
+    """모델별 capacity 회로와 캐시 키를 일치시키며 로컬 에이전트를 호출한다."""
+    tried_models: set[str] = set()
+    fallback_model = _stage_fallback_model(stage)
+    primary_request = LLMCacheRequest(
+        call_kind=kind,
+        provider=provider,
+        model=_local_model_identity(provider, primary_model),
+        system=system,
+        prompt=prompt,
+        images_b64=tuple(images_b64),
+    )
+    cached_primary = cached_response_if_present(primary_request)
+    if cached_primary is not None:
+        return cached_primary
+    if _limited_vision.get() is not None:
+        # Bounded probes use exactly the requested model, never capacity fallback.
+        return cached_response(primary_request, lambda: _record_call(
+            kind, provider, lambda: _retry_local_call(
+                lambda: _call_local_agent(prompt, system, images_b64=images_b64,
+                                         provider=provider, model=primary_model or None),
+                max_retries=1, label=f"{provider} bounded {kind}"),
+            request=primary_request, stage=stage))
+    while True:
+        selected_model, is_probe = _capacity_select_model(provider, primary_model, stage)
+        if selected_model in tried_models:
+            raise LLMCapacityError(
+                f"{provider} capacity fallback 후보를 모두 시도했습니다: "
+                f"{', '.join(sorted(tried_models))}"
+            )
+        tried_models.add(selected_model)
+        is_fallback = bool(selected_model != primary_model)
+        request = LLMCacheRequest(
+            call_kind=kind,
+            provider=provider,
+            model=_local_model_identity(provider, selected_model),
+            system=system,
+            prompt=prompt,
+            images_b64=tuple(images_b64),
+        )
+
+        try:
+            response = cached_response(
+                request,
+                lambda: _record_call(
+                    kind,
+                    provider,
+                    lambda: _retry_local_call(
+                        lambda: _call_local_agent(
+                            prompt,
+                            system,
+                            images_b64=images_b64,
+                            provider=provider,
+                            model=selected_model or None,
+                        ),
+                        max_retries=max_retries,
+                        label=(
+                            f"{provider} {kind} fallback({selected_model})"
+                            if is_fallback
+                            else f"{provider} {kind}"
+                        ),
+                    ),
+                    request=request,
+                    stage=stage,
+                ),
+            )
+        except LLMCapacityError:
+            _capacity_record_failure(provider, selected_model, stage)
+            if is_fallback:
+                _inc_stat("capacity_fallback_failures")
+                raise
+            if fallback_model and fallback_model != primary_model:
+                continue
+            raise
+        except Exception:
+            if is_probe:
+                _capacity_release_probe(provider, primary_model, stage)
+            if is_fallback:
+                _inc_stat("capacity_fallback_failures")
+            raise
+
+        if is_fallback:
+            _inc_stat("capacity_fallback_successes")
+        else:
+            _capacity_record_success(provider, primary_model, stage)
+        return response
 
 
 def call_text(
@@ -629,7 +975,10 @@ def call_text(
 
         return cached_response(
             request,
-            lambda: _record_call("text", provider, produce_gemini_text),
+            lambda: _record_call(
+                "text", provider, produce_gemini_text,
+                request=request, stage=stage,
+            ),
         )
 
     if provider == "openai":
@@ -644,20 +993,25 @@ def call_text(
                     max_retries=max_retries,
                     model=stage_model or None,
                 ),
+                request=request,
+                stage=stage,
             ),
         )
 
-    return cached_response(
-        request,
-        lambda: _record_call(
-            "text",
-            provider,
-            lambda: _retry_local_call(
-                lambda: _call_local_agent(prompt, system, provider=provider, model=stage_model or None),
-                max_retries=max_retries,
-                label=provider,
-            ),
-        ),
+    local_model = stage_model
+    if provider == "codex" and not local_model:
+        local_model = _codex_default_model(stage)
+    if provider == "claude" and not local_model:
+        local_model = str(getattr(config, "LOCAL_AGENT_MODEL", "") or "").strip()
+
+    return _call_local_with_capacity(
+        kind="text",
+        provider=provider,
+        stage=stage,
+        primary_model=local_model,
+        prompt=prompt,
+        system=system,
+        max_retries=max_retries,
     )
 
 
@@ -669,6 +1023,8 @@ def call_vision(
     stage: str | None = None,
 ) -> str:
     """이미지 + 텍스트 프롬프트를 단계별 백엔드 오버라이드까지 반영해 전달한다."""
+    if _claim_limited_vision_request(stage):
+        max_retries = 1
     provider = _resolve_provider(stage)
     stage_model = _stage_model(stage)
     request = LLMCacheRequest(
@@ -687,7 +1043,10 @@ def call_vision(
 
         return cached_response(
             request,
-            lambda: _record_call("vision", provider, produce_gemini_vision),
+            lambda: _record_call(
+                "vision", provider, produce_gemini_vision,
+                request=request, stage=stage,
+            ),
         )
 
     if provider == "openai":
@@ -703,26 +1062,25 @@ def call_vision(
                     max_retries=max_retries,
                     model=stage_model or None,
                 ),
+                request=request,
+                stage=stage,
             ),
         )
 
-    return cached_response(
-        request,
-        lambda: _record_call(
-            "vision",
-            provider,
-            lambda: _retry_local_call(
-                lambda: _call_local_agent(
-                    prompt,
-                    system,
-                    image_b64=image_b64,
-                    provider=provider,
-                    model=(stage_model or (_codex_default_model(stage) if provider == "codex" else "")) or None,
-                ),
-                max_retries=max_retries,
-                label=f"{provider} vision",
-            ),
-        ),
+    local_model = stage_model or (
+        _codex_default_model(stage)
+        if provider == "codex"
+        else str(getattr(config, "LOCAL_AGENT_MODEL", "") or "").strip()
+    )
+    return _call_local_with_capacity(
+        kind="vision",
+        provider=provider,
+        stage=stage,
+        primary_model=local_model,
+        prompt=prompt,
+        system=system,
+        max_retries=max_retries,
+        images_b64=(image_b64,),
     )
 
 
@@ -738,6 +1096,9 @@ def call_vision_batch(
         return "{}"
     if len(images_b64) == 1:
         return call_vision(images_b64[0], prompt, system=system, max_retries=max_retries, stage=stage)
+
+    if _claim_limited_vision_request(stage):
+        max_retries = 1
 
     provider = _resolve_provider(stage)
     stage_model = _stage_model(stage)
@@ -757,7 +1118,10 @@ def call_vision_batch(
 
         return cached_response(
             request,
-            lambda: _record_call("vision_batch", provider, produce_gemini_vision_batch),
+            lambda: _record_call(
+                "vision_batch", provider, produce_gemini_vision_batch,
+                request=request, stage=stage,
+            ),
         )
 
     if provider == "openai":
@@ -773,26 +1137,25 @@ def call_vision_batch(
                     max_retries=max_retries,
                     model=stage_model or None,
                 ),
+                request=request,
+                stage=stage,
             ),
         )
 
-    return cached_response(
-        request,
-        lambda: _record_call(
-            "vision_batch",
-            provider,
-            lambda: _retry_local_call(
-                lambda: _call_local_agent(
-                    prompt,
-                    system,
-                    images_b64=images_b64,
-                    provider=provider,
-                    model=(stage_model or (_codex_default_model(stage) if provider == "codex" else "")) or None,
-                ),
-                max_retries=max_retries,
-                label=f"{provider} vision batch",
-            ),
-        ),
+    local_model = stage_model or (
+        _codex_default_model(stage)
+        if provider == "codex"
+        else str(getattr(config, "LOCAL_AGENT_MODEL", "") or "").strip()
+    )
+    return _call_local_with_capacity(
+        kind="vision_batch",
+        provider=provider,
+        stage=stage,
+        primary_model=local_model,
+        prompt=prompt,
+        system=system,
+        max_retries=max_retries,
+        images_b64=images_b64,
     )
 
 
@@ -1066,7 +1429,7 @@ def _call_gemini_text(prompt: str, system: str = "", max_retries: int = config.M
     contents = [types.Content(role="user", parts=[types.Part(text=full_text)])]
     api_config = types.GenerateContentConfig(
         max_output_tokens=config.MAX_TOKENS,
-        temperature=0.1,
+        temperature=float(getattr(config, "LLM_TEMPERATURE", 0.0)),
         response_mime_type="application/json",
     )
     client = _gemini_client()
@@ -1115,7 +1478,7 @@ def _call_gemini_vision(
     ]
     api_config = types.GenerateContentConfig(
         max_output_tokens=config.MAX_TOKENS,
-        temperature=0.1,
+        temperature=float(getattr(config, "LLM_TEMPERATURE", 0.0)),
         response_mime_type="application/json",
     )
     client = _gemini_client()
@@ -1164,7 +1527,7 @@ def _call_gemini_vision_batch(
     ]
     api_config = types.GenerateContentConfig(
         max_output_tokens=config.MAX_TOKENS,
-        temperature=0.1,
+        temperature=float(getattr(config, "LLM_TEMPERATURE", 0.0)),
         response_mime_type="application/json",
     )
     client = _gemini_client()
@@ -1315,6 +1678,8 @@ def call_vision_json(
     parsed = parse_json(raw)
     if _json_parse_ok(raw, parsed):
         return parsed, True
+    if _limited_vision.get() is not None:
+        return parsed, False
     retry_raw = call_vision(image_b64, f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries, stage=stage)
     retry_parsed = parse_json(retry_raw)
     return retry_parsed, _json_parse_ok(retry_raw, retry_parsed)
@@ -1332,6 +1697,8 @@ def call_vision_batch_json(
     parsed = parse_json(raw)
     if _json_parse_ok(raw, parsed):
         return parsed, True
+    if _limited_vision.get() is not None:
+        return parsed, False
     retry_raw = call_vision_batch(images_b64, f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries, stage=stage)
     retry_parsed = parse_json(retry_raw)
     return retry_parsed, _json_parse_ok(retry_raw, retry_parsed)

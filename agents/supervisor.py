@@ -16,10 +16,26 @@ from pathlib import Path
 import config
 from utils.pdf_reader import extract_pdf, PDFContent, PageContent
 from utils.hwp_reader import extract_hwp, is_hwp_file
-from utils import llm_cache, llm_client
+from utils import llm_cache, llm_client, parallel
+from utils.pipeline_artifacts import PipelineArtifacts
+from utils.run_state import RunState, sha256_json
+from utils.visual_merge_ab import write_visual_merge_snapshot
+from utils.semantic_routing import SemanticRoutingReport, validate_and_reclassify
+from utils.source_verifier import (
+    QualityAssessment,
+    SourceObjectInventoryReport,
+    SourceVerificationReport,
+    assess_quality,
+    extraction_outcome,
+    format_ratio,
+    build_source_object_inventory,
+    create_marked_pdf,
+    verify_final_data,
+)
 from agents.guideline_agent import GuidelineAgent
 from agents.extractor_agent import ExtractorAgent
 from agents.image_agent import ImageAgent
+from utils.vision_review import ReviewBudget
 from agents.organizer_agent import OrganizerAgent, detect_prior_plan_pages
 from agents.gap_fill_agent import GapFillAgent
 from agents.hybrid_review_agent import HybridReviewAgent, reconcile_reflected_merge_log
@@ -34,6 +50,7 @@ QUALITY_SYSTEM = """당신은 지자체 탄소중립 기본계획 데이터 품�
 _TIMING_ORDER = [
     "문서 파싱",
     "가이드라인 로드",
+    "실행 산출물 구성",
     "텍스트 추출",
     "이미지 분석",
     "정리·정제",
@@ -41,7 +58,11 @@ _TIMING_ORDER = [
     "시트 단위 보조검수·병합",
     "보조 모델 검수",
     "보조 후보 판정·병합",
+    "시트 의미 검증",
+    "원문 대조",
+    "원문 객체 인벤토리",
     "엑셀 작성",
+    "마킹 PDF",
     "LLM 최종 검수",
 ]
 
@@ -101,53 +122,59 @@ def _execution_info(input_path: Path, started_at: datetime) -> dict[str, str]:
     }
 
 
-def _quality_score(final_data: dict) -> tuple[float, list[str]]:
-    issues = []
-    score = 100.0
+def _ledger_quality_metrics(
+    records: list,
+    run_state: RunState | None = None,
+) -> dict[str, int]:
+    # 분할 자식은 복구 수단이지 별도의 원본 작업이 아니다. 품질 분모에는 최초
+    # sheet/cluster 루트 배치만 넣어 재시도할수록 점수가 내려가는 현상을 막는다.
+    if run_state is not None:
+        root_summary = run_state.summary(kinds={"sheet", "cluster"})
+        if root_summary["expected"]:
+            return {
+                "extraction_batches_total": root_summary["expected"],
+                "extraction_batches_ok": root_summary["ok"],
+                "extraction_batches_failed": root_summary["failed"],
+                "extraction_batches_missing": root_summary["missing"],
+            }
 
-    municipality = final_data.get("municipality_name", "알 수 없음")
-    if not municipality or municipality == "알 수 없음":
-        issues.append("지자체명 미확인")
-        score -= 20
+    def status_of(record) -> str:
+        if isinstance(record, dict):
+            return str(record.get("status", ""))
+        return str(getattr(record, "status", ""))
 
-    # 핵심 시트 데이터 존재 확인
-    emissions = final_data.get("emissions_regional", []) + final_data.get("emissions_management", [])
-    if not emissions:
-        issues.append("온실가스 배출 데이터 없음 (중요)")
-        score -= 25
+    statuses = [status_of(record) for record in records]
+    return {
+        "extraction_batches_total": len(statuses),
+        "extraction_batches_ok": sum(status == "ok" for status in statuses),
+        "extraction_batches_call_fail": sum(status == "call_fail" for status in statuses),
+        "extraction_batches_parse_fail": sum(status == "parse_fail" for status in statuses),
+    }
 
-    targets = final_data.get("reduction_targets", [])
-    if not targets:
-        issues.append("감축목표 데이터 없음")
-        score -= 15
 
-    projects = final_data.get("mitigation_projects", [])
-    if not projects:
-        issues.append("감축사업 목록 없음")
-        score -= 10
+def _deduplicate_validation_rows(rows: list) -> list[dict]:
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for source in rows:
+        if not isinstance(source, dict):
+            continue
+        row = dict(source)
+        identity = sha256_json(row)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(row)
+    return unique
 
-    forecast = final_data.get("emissions_forecast", [])
-    if not forecast:
-        issues.append("배출전망 데이터 없음")
-        score -= 5
 
-    regional = final_data.get("regional_conditions", [])
-    if not regional:
-        issues.append("지역여건 데이터 없음")
-        score -= 5
-
-    vision = final_data.get("vision_strategy", [])
-    if not vision:
-        issues.append("비전·전략 없음")
-        score -= 5
-
-    # 채움률 확인
-    total_rows = sum(len(v) for v in final_data.values() if isinstance(v, list))
-    if total_rows < 10:
-        issues.append(f"전체 추출 행 수 매우 적음 ({total_rows}행)")
-        score -= 15
-
-    return max(0.0, score), issues
+def _quality_score(
+    final_data: dict,
+    verification: SourceVerificationReport | None = None,
+    source_inventory: SourceObjectInventoryReport | None = None,
+) -> tuple[float, list[str]]:
+    """호환용 래퍼. 실제 점수는 결정론적 품질 지표에서 계산한다."""
+    assessment = assess_quality(final_data, verification, source_inventory)
+    return assessment.score, assessment.issues
 
 
 def _document_text_chars(pdf_content: PDFContent) -> int:
@@ -157,11 +184,20 @@ def _document_text_chars(pdf_content: PDFContent) -> int:
 class Supervisor:
     """에이전트 5: 감독·검수 에이전트"""
 
-    QUALITY_THRESHOLD = 40.0
+    QUALITY_THRESHOLD = 70.0
 
     def __init__(self):
         self._reports: list[str] = []
         self._timings: dict[str, float] = {}
+        self._quality_assessment_for_review: QualityAssessment | None = None
+        self._active_run_state: RunState | None = None
+        self._artifact_stats: dict = {}
+        self._vision_render_stats: dict = {}
+        self.last_run_outcome = {}
+
+    def mark_interrupted(self, reason: str = "") -> None:
+        if self._active_run_state is not None:
+            self._active_run_state.mark_interrupted(reason)
 
     def _log(self, msg: str):
         print(msg)
@@ -169,6 +205,27 @@ class Supervisor:
 
     def _add_timing(self, label: str, elapsed: float):
         self._timings[label] = self._timings.get(label, 0.0) + elapsed
+
+    def _add_vision_render_stats(self, metrics: dict) -> None:
+        for key in (
+            "render_requests",
+            "render_unique",
+            "render_reused",
+            "render_seconds",
+            "render_png_bytes",
+            "review_required_objects",
+            "review_required_visual_objects",
+            "explicit_non_data_objects",
+            "empty_native_text_objects",
+            "toc_confirmed_pages",
+            "toc_would_exclude_objects",
+            "toc_excluded_objects",
+            "toc_excluded_ocr_objects",
+            "toc_excluded_fallback_images",
+        ):
+            value = metrics.get(key)
+            if isinstance(value, (int, float)):
+                self._vision_render_stats[key] = self._vision_render_stats.get(key, 0) + value
 
     def _append_text_layer_warning(self, final_data: dict) -> None:
         report = final_data.setdefault("validation_report", [])
@@ -199,6 +256,30 @@ class Supervisor:
             self._log(f"  - 기타: {_fmt_seconds(other_elapsed)}")
         self._log(f"  - 전체: {_fmt_seconds(total_elapsed)}")
 
+        if self._artifact_stats:
+            self._log(
+                "  - 실행 산출물: "
+                f"DocumentObject {self._artifact_stats.get('document_object_count', 0):,}개, "
+                f"가이드라인 프롬프트 {self._artifact_stats.get('guideline_prompt_count', 0):,}개/"
+                f"{self._artifact_stats.get('guideline_prompt_chars', 0):,}자"
+            )
+        if self._vision_render_stats:
+            self._log(
+                "  - Vision 객체 렌더: "
+                f"요청 {int(self._vision_render_stats.get('render_requests', 0)):,}, "
+                f"실제 {int(self._vision_render_stats.get('render_unique', 0)):,}, "
+                f"재사용 {int(self._vision_render_stats.get('render_reused', 0)):,}, "
+                f"누적 {_fmt_seconds(float(self._vision_render_stats.get('render_seconds', 0.0)))}"
+            )
+        queue_stats = parallel.get_parallel_stats()
+        for label, values in queue_stats.items():
+            self._log(
+                f"  - 작업 큐[{label}]: 제출 {values.get('submitted', 0)}, "
+                f"시작 {values.get('started', 0)}, 완료 {values.get('completed', 0)}, "
+                f"대기 누적 {_fmt_seconds(float(values.get('queue_wait_seconds', 0.0)))}, "
+                f"최대 {_fmt_seconds(float(values.get('max_queue_wait_seconds', 0.0)))}"
+            )
+
         stats = llm_cache.get_cache_stats()
         if stats:
             self._log(
@@ -206,7 +287,10 @@ class Supervisor:
                 f"hit {stats.get('hit', 0)}, "
                 f"miss {stats.get('miss', 0)}, "
                 f"write {stats.get('write', 0)}, "
-                f"disabled {stats.get('disabled', 0)}"
+                f"reject {stats.get('rejected', 0)}, "
+                f"disabled {stats.get('disabled', 0)}, "
+                f"동시중복 합침 {stats.get('coalesced', 0)} "
+                f"(대기 누적 {_fmt_seconds(float(stats.get('singleflight_wait_seconds', 0.0)))})"
             )
         llm_stats = llm_client.get_llm_stats()
         if llm_stats:
@@ -219,15 +303,50 @@ class Supervisor:
                 f"타임아웃 {llm_stats.get('timeouts', 0)}), "
                 f"quota 대기 누적 {_fmt_seconds(float(wait_seconds))}"
             )
+            if llm_stats.get("capacity_errors", 0) or llm_stats.get("capacity_circuit_rejected", 0):
+                self._log(
+                    "  - 모델 과부하: "
+                    f"감지 {llm_stats.get('capacity_errors', 0)}, "
+                    f"회로 개방 {llm_stats.get('capacity_circuit_opened', 0)}, "
+                    f"차단 {llm_stats.get('capacity_circuit_rejected', 0)}, "
+                    f"fallback {llm_stats.get('capacity_fallback_successes', 0)}/"
+                    f"{llm_stats.get('capacity_fallback_calls', 0)} 성공"
+                )
+            call_seconds = sum(
+                float(value) for value in llm_stats.get("call_seconds", {}).values()
+            )
+            input_chars = sum(
+                int(value) for value in llm_stats.get("input_chars", {}).values()
+            )
+            image_count = sum(
+                int(value) for value in llm_stats.get("image_count", {}).values()
+            )
+            self._log(
+                "  - LLM 실호출 누적: "
+                f"{_fmt_seconds(call_seconds)}, 입력 {input_chars:,}자, 이미지 {image_count:,}개"
+            )
 
     def _llm_quality_review(self, final_data: dict) -> dict:
+        assessment = self._quality_assessment_for_review or assess_quality(final_data)
         municipality = final_data.get("municipality_name", "?")
-        sheet_counts = {k: len(v) for k, v in final_data.items() if isinstance(v, list) and v}
+        internal_keys = getattr(config, "INTERNAL_OBJECT_KEYS", set())
+        sheet_counts = {
+            k: len(v) for k, v in final_data.items()
+            if isinstance(v, list) and v and k not in internal_keys
+        }
         prompt = f"""다음은 '{municipality}' 탄소중립 계획 추출 결과 요약입니다:
 - 시트별 행 수: {json.dumps(sheet_counts, ensure_ascii=False)}
 - 총 추출 행: {sum(sheet_counts.values())}
+- 결정론적 품질 점수: {assessment.score:.1f}/100
+- 결정론적 품질 지표: {json.dumps(assessment.metrics, ensure_ascii=False)}
+- 결정론적 이슈: {json.dumps(assessment.issues, ensure_ascii=False)}
 
-이 추출 결과의 완성도를 평가하고 JSON으로 반환하세요:
+이 점수는 행별 원문 근거, 원문 객체 완전성, 필수 필드 채움률, 출처페이지,
+정합성, 핵심 시트 존재를 코드로 계산한 결과입니다. 다만 셀 정확도는 명시적인
+고정 골든셋 평가를 실행해야만 산출됩니다. 행 수나 배치 성공률만 보고 완전하거나
+누락이 없다고 판단하지 마세요.
+
+위 근거를 해석해 JSON으로 반환하세요. 결정론적 점수를 임의로 대체하지 마세요:
 {{
   "assessment": "평가 의견 (2~3문장)",
   "quality_level": "우수|보통|미흡",
@@ -239,11 +358,10 @@ class Supervisor:
             raise
         except llm_client.LLMCallError as exc:
             logger.warning("LLM 최종 품질 검수 실패. 규칙 기반 점수만 사용: %s", exc)
-            score, issues = _quality_score(final_data)
             return {
-                "assessment": f"LLM 검수 호출이 실패하여 규칙 기반 품질 점수({score:.1f}/100)만 기록했습니다.",
-                "quality_level": "보통" if score >= self.QUALITY_THRESHOLD else "미흡",
-                "key_issues": issues,
+                "assessment": f"LLM 검수 호출이 실패하여 결정론적 품질 점수({assessment.score:.1f}/100)만 기록했습니다.",
+                "quality_level": "우수" if assessment.score >= 85 else "보통" if assessment.score >= 70 else "미흡",
+                "key_issues": assessment.issues,
             }
         return llm_client.parse_json(resp)
 
@@ -253,6 +371,8 @@ class Supervisor:
         pages: list[PageContent],
         full_text: str,
         extraction_prompts: dict[str, str],
+        run_state: RunState | None = None,
+        document_objects: tuple | None = None,
     ) -> tuple[dict, ExtractorAgent, list[dict], list[dict]]:
         """
         시트별 추출·정제·검수 폐루프.
@@ -260,7 +380,13 @@ class Supervisor:
         이미지 분석과 빈칸 보완은 이 폐루프 이후 실행되므로 보조검수가 본 기준본과
         최종본은 다를 수 있다. 최종 organize 검증 패스가 최종본 기준 정합성을 다시 점검한다.
         """
-        extractor = ExtractorAgent()
+        # 기존 테스트·확장 코드가 무인자 팩토리를 주입할 수 있으므로 새 상태가
+        # 실제로 있을 때만 생성자 인자를 전달한다.
+        extractor = (
+            ExtractorAgent(run_state=run_state, document_objects=document_objects)
+            if run_state is not None or document_objects is not None
+            else ExtractorAgent()
+        )
         organizer = OrganizerAgent()
         hybrid_agent = HybridReviewAgent() if getattr(config, "HYBRID_REVIEW_ENABLED", False) else None
         municipality = extractor._extract_municipality_name(full_text)
@@ -344,6 +470,7 @@ class Supervisor:
                     sheet_merge_log,
                 )
 
+        raw_data["reading_pipeline_audit"] = list(getattr(organizer, "reading_pipeline_audit", []))
         return raw_data, extractor, review_candidates, merge_log
 
     def run(
@@ -368,8 +495,11 @@ class Supervisor:
         run_started_at = datetime.now(timezone.utc).astimezone()
         execution_info = _execution_info(input_path, run_started_at)
         self._timings = {}
+        self._artifact_stats = {}
+        self._vision_render_stats = {}
         llm_cache.reset_cache_stats()
         llm_client.reset_llm_stats()
+        parallel.reset_parallel_stats()
 
         self._log("=" * 60)
         self._log("[감독관] 파이프라인 시작 (가이드라인 기반 16개 시트)")
@@ -402,13 +532,61 @@ class Supervisor:
         t0 = time.time()
         guideline_agent = GuidelineAgent(hwp_path=hwp_path)
         extraction_prompts = guideline_agent.get_all_prompts()
+        guideline_report = guideline_agent.report()
         elapsed = time.time() - t0
         self._add_timing("가이드라인 로드", elapsed)
-        self._log(guideline_agent.report())
+        self._log(guideline_report)
         self._log(f"[감독관] STEP 1 완료: {elapsed:.1f}초")
 
+        t0 = time.time()
+        artifacts = PipelineArtifacts.create(
+            pdf_content,
+            extraction_prompts,
+            guideline_report=guideline_report,
+        )
+        pdf_content = artifacts.document
+        extraction_prompts = artifacts.extraction_prompts
+        elapsed = time.time() - t0
+        self._artifact_stats = dict(artifacts.stats)
+        self._add_timing("실행 산출물 구성", elapsed)
+        self._log(
+            "[감독관] 실행 산출물 구성 완료: "
+            f"DocumentObject {len(artifacts.document_objects):,}개, "
+            f"프롬프트 {len(extraction_prompts)}개 ({elapsed:.1f}초)"
+        )
+
+        run_state: RunState | None = None
+        if getattr(config, "RUN_STATE_ENABLED", True):
+            run_state = RunState.create(
+                input_path=input_path,
+                guideline_path=hwp_path,
+                extraction_prompts=extraction_prompts,
+                execution_info=execution_info,
+                output_path=output_path,
+                resume=bool(getattr(config, "EXTRACTION_RESUME", False)),
+                retry_failed_only=bool(getattr(config, "EXTRACTION_RETRY_FAILED_ONLY", False)),
+            )
+            self._active_run_state = run_state
+            execution_info["run_id"] = run_state.run_id
+            execution_info["run_state_dir"] = str(run_state.root)
+            mode = (
+                "실패 배치만 재실행"
+                if run_state.retry_failed_only
+                else "체크포인트 재개"
+                if run_state.resume
+                else "새 실행"
+            )
+            self._log(f"[감독관] 실행 상태: {mode} ({run_state.run_id})")
+
+        review_budget = ReviewBudget(run_state)
+        vision_preflights = []
+        text_audits = []
         # STEP 2~3: 추출·정제 (품질 미달 시 재시도)
         final_data = None
+        source_verification: SourceVerificationReport | None = None
+        source_object_inventory: SourceObjectInventoryReport | None = None
+        semantic_routing: SemanticRoutingReport | None = None
+        quality_assessment: QualityAssessment | None = None
         for attempt in range(1, max_pipeline_retries + 1):
             self._log(f"\n[감독관] STEP 2~3: 추출·정제 시도 {attempt}/{max_pipeline_retries}")
 
@@ -421,13 +599,21 @@ class Supervisor:
                         pages=pdf_content.pages,
                         full_text=pdf_content.full_text,
                         extraction_prompts=extraction_prompts,
+                        run_state=run_state,
+                        document_objects=artifacts.document_objects,
                     )
                 except llm_client.LLMQuotaExceededError as exc:
-                    extractor = ExtractorAgent()
+                    extractor = ExtractorAgent(
+                        run_state=run_state,
+                        document_objects=artifacts.document_objects,
+                    )
                     raw_data = extractor.partial_results()
                     logger.warning("시트별 폐루프 추출 quota/한도 문제로 부분 결과로 계속 진행: %s", exc)
             else:
-                extractor = ExtractorAgent()
+                extractor = ExtractorAgent(
+                    run_state=run_state,
+                    document_objects=artifacts.document_objects,
+                )
                 try:
                     raw_data = extractor.extract(
                         pages=pdf_content.pages,
@@ -441,6 +627,16 @@ class Supervisor:
             self._add_timing("텍스트 추출", elapsed)
             self._log(extractor.report())
             self._log(extractor.ledger_summary())
+            if hasattr(extractor, "optimization_audit"):
+                text_audits.append(extractor.optimization_audit())
+            if run_state is not None:
+                state_summary = run_state.summary()
+                self._log(
+                    "[감독관] 영속 배치 상태: "
+                    f"예정 {state_summary['expected']}, 성공 {state_summary['ok']}, "
+                    f"실패/부분 {state_summary['failed']}, 미실행 {state_summary['missing']}, "
+                    f"충돌 {state_summary['conflicts']}"
+                )
             self._log(f"[감독관] 텍스트 추출 완료: {elapsed:.1f}초")
 
             ledger_records = list(extractor.ledger)
@@ -448,16 +644,20 @@ class Supervisor:
             raw_data["execution_info"] = execution_info
 
             if include_images:
-                image_agent = ImageAgent()
+                image_agent = ImageAgent(run_state=run_state, review_budget=review_budget)
                 t0 = time.time()
                 try:
                     raw_data = image_agent.extract(
                         pages=pdf_content.pages,
                         text_results=raw_data,
                         municipality=municipality,
+                        document=pdf_content,
+                        document_objects=artifacts.clone_document_objects(),
                     )
                 except llm_client.LLMQuotaExceededError as exc:
                     logger.warning("이미지 분석 quota/한도 문제로 기존 텍스트 결과로 계속 진행: %s", exc)
+                self._add_vision_render_stats(image_agent.metrics())
+                vision_preflights.append(image_agent.preflight)
                 elapsed = time.time() - t0
                 self._add_timing("이미지 분석", elapsed)
                 self._log(image_agent.report())
@@ -466,6 +666,16 @@ class Supervisor:
                 self._log("[에이전트2b 이미지분석] 비활성화 (--no-images)")
 
             raw_data["execution_info"] = execution_info
+            if getattr(config, "VISUAL_MERGE_SNAPSHOT_ENABLED", True):
+                snapshot_path = output_path.with_name(
+                    f"{output_path.stem}_visual_merge_input.json.gz"
+                )
+                try:
+                    write_visual_merge_snapshot(snapshot_path, raw_data)
+                except (OSError, TypeError, ValueError) as exc:
+                    logger.warning("시각 병합 A/B 스냅샷 저장 실패: %s", exc)
+                else:
+                    self._log(f"[감독관] 시각 병합 A/B 스냅샷: {snapshot_path}")
             organizer = OrganizerAgent()
             t0 = time.time()
             final_data = organizer.organize(
@@ -604,18 +814,139 @@ class Supervisor:
                             logger.warning("보조 후보 판정 quota/한도 문제로 건너뜀: %s", exc)
                         elapsed = time.time() - t0
                         self._add_timing("보조 후보 판정·병합", elapsed)
-                        if merge_log:
-                            reconcile_reflected_merge_log(final_data, merge_log)
-                            final_data.setdefault("hybrid_merge_log", []).extend(merge_log)
-                        self._log(hybrid_agent.adjudication_report())
-                        self._log(f"[감독관] 보조 후보 판정·병합 완료: {elapsed:.1f}초")
+                    if merge_log:
+                        reconcile_reflected_merge_log(final_data, merge_log)
+                        final_data.setdefault("hybrid_merge_log", []).extend(merge_log)
+                    self._log(hybrid_agent.adjudication_report())
+                    self._log(f"[감독관] 보조 후보 판정·병합 완료: {elapsed:.1f}초")
 
-            score, issues = _quality_score(final_data)
+            # STEP 3d-2: 원문 표 캡션·섹션을 이용해 행이 올바른 시트에
+            # 배치됐는지 검증한다. 자동 이동은 미래연도 현황→전망 오배치로 제한한다.
+            if getattr(config, "SEMANTIC_ROUTING_ENABLED", True):
+                self._log("\n[감독관] STEP 3d-2: 표 캡션·섹션 기반 시트 의미 검증...")
+                t0 = time.time()
+                semantic_routing = validate_and_reclassify(
+                    final_data,
+                    pdf_content,
+                    auto_reclassify=bool(
+                        getattr(config, "SEMANTIC_ROUTING_AUTO_RECLASSIFY", True)
+                    ),
+                    document_objects=artifacts.document_objects,
+                )
+                municipality = final_data.get("municipality_name", "알 수 없음")
+                validation_report = final_data.setdefault("validation_report", [])
+                if isinstance(validation_report, list):
+                    validation_report.extend(
+                        semantic_routing.validation_issues(municipality)
+                    )
+                elapsed = time.time() - t0
+                self._add_timing("시트 의미 검증", elapsed)
+                self._log(
+                    f"[감독관] 시트 의미 검증 완료: "
+                    f"{semantic_routing.summary_text()} ({elapsed:.1f}초)"
+                )
+            else:
+                semantic_routing = None
+                self._log("[감독관] 시트 의미 검증 비활성화")
+
+            # STEP 3e: 최종 행을 원문과 결정론적으로 대조한다. 기존 외전 검수 도구의
+            # 검색어·출처페이지 우선·전체문서 fallback 원리를 인메모리 데이터에 적용한다.
+            if getattr(config, "SOURCE_VERIFICATION_ENABLED", True):
+                self._log("\n[감독관] STEP 3e: 원문 근거 대조 실행...")
+                t0 = time.time()
+                source_verification = verify_final_data(
+                    final_data,
+                    pdf_content,
+                    page_radius=max(0, int(getattr(config, "SOURCE_VERIFICATION_PAGE_RADIUS", 1))),
+                    max_terms=max(1, int(getattr(config, "SOURCE_VERIFICATION_MAX_TERMS", 12))),
+                    global_search=bool(getattr(config, "SOURCE_VERIFICATION_GLOBAL_SEARCH", True)),
+                )
+                municipality = final_data.get("municipality_name", "알 수 없음")
+                final_data["source_verification"] = source_verification.excel_rows(municipality)
+                validation_report = final_data.setdefault("validation_report", [])
+                if isinstance(validation_report, list):
+                    validation_report.extend(source_verification.validation_issues(municipality))
+                elapsed = time.time() - t0
+                self._add_timing("원문 대조", elapsed)
+                self._log(f"[감독관] 원문 대조 완료: {source_verification.summary_text()} ({elapsed:.1f}초)")
+            else:
+                source_verification = None
+                final_data["source_verification"] = []
+                self._log("[감독관] 원문 대조 비활성화")
+
+            # STEP 3f: 추출된 행을 출발점으로 삼는 원문대조와 반대 방향으로,
+            # 원문의 표·그래프 전체를 분모로 삼아 누락 객체를 계산한다.
+            if getattr(config, "SOURCE_OBJECT_INVENTORY_ENABLED", True):
+                self._log("\n[감독관] STEP 3f: 원문 표·그래프 객체 인벤토리 연결...")
+                t0 = time.time()
+                source_object_inventory = build_source_object_inventory(
+                    final_data,
+                    pdf_content,
+                    document_objects=artifacts.document_objects,
+                )
+                municipality = final_data.get("municipality_name", "알 수 없음")
+                final_data["source_object_inventory"] = source_object_inventory.excel_rows(municipality)
+                validation_report = final_data.setdefault("validation_report", [])
+                if isinstance(validation_report, list):
+                    validation_report.extend(source_object_inventory.validation_issues(municipality))
+                elapsed = time.time() - t0
+                self._add_timing("원문 객체 인벤토리", elapsed)
+                self._log(
+                    f"[감독관] 원문 객체 연결 완료: "
+                    f"{source_object_inventory.summary_text()} ({elapsed:.1f}초)"
+                )
+            else:
+                source_object_inventory = None
+                final_data["source_object_inventory"] = []
+                self._log("[감독관] 원문 객체 인벤토리 비활성화")
+
+            validation_rows = final_data.get("validation_report", [])
+            if isinstance(validation_rows, list):
+                final_data["validation_report"] = _deduplicate_validation_rows(validation_rows)
+
+            pipeline_metrics = _ledger_quality_metrics(ledger_records, run_state)
+            pipeline_metrics.update({
+                "text_tasks_enqueued": int(getattr(extractor, "enqueued_tasks", 0)),
+                "text_tasks_deduplicated": int(getattr(extractor, "deduplicated_tasks", 0)),
+            })
+            if semantic_routing is not None:
+                pipeline_metrics.update(semantic_routing.metrics())
+            if source_object_inventory is not None:
+                pipeline_metrics.update({
+                    "automatic_source_object_coverage": (
+                        round(source_object_inventory.coverage_ratio, 4)
+                        if source_object_inventory.coverage_ratio is not None else None
+                    ),
+                    "object_routing_error_rate": round(
+                        source_object_inventory.routing_error_rate, 4
+                    ),
+                })
+            final_data["pipeline_metrics"] = pipeline_metrics
+            quality_assessment = assess_quality(
+                final_data,
+                source_verification,
+                source_object_inventory,
+            )
+            score, issues = quality_assessment.score, quality_assessment.issues
             self._log(f"\n[감독관] 품질 점수: {score:.1f}/100")
+            components = quality_assessment.metrics.get("components", {})
+            if components:
+                self._log(
+                    "[감독관] 점수 구성: "
+                    + ", ".join(f"{name} {value:.1f}" for name, value in components.items())
+                )
             if issues:
                 self._log(f"[감독관] 이슈: {', '.join(issues)}")
+            self._log(
+                "[감독관] 독립 지표: "
+                "셀 정확도·객체 재현율=고정 평가(--evaluate) 시 산출, "
+                f"자동 객체 커버리지="
+                f"{format_ratio(quality_assessment.metrics.get('automatic_source_object_coverage'))}, "
+                f"라우팅 오류율={quality_assessment.metrics.get('routing_error_rate', 0):.1%}"
+            )
 
-            if score >= self.QUALITY_THRESHOLD:
+            quality_threshold = float(getattr(config, "QUALITY_THRESHOLD", self.QUALITY_THRESHOLD))
+            if score >= quality_threshold:
                 self._log("[감독관] 품질 기준 통과")
                 break
             elif attempt < max_pipeline_retries:
@@ -628,26 +959,78 @@ class Supervisor:
         excel_agent = ExcelAgent()
         t0 = time.time()
         excel_data = organizer.get_excel_ready()
-        if final_data and final_data.get("hybrid_review_candidates"):
-            excel_data["hybrid_review_candidates"] = final_data["hybrid_review_candidates"]
-        if final_data and final_data.get("hybrid_merge_log"):
-            excel_data["hybrid_merge_log"] = final_data["hybrid_merge_log"]
+        for supplemental_key in (
+            "hybrid_review_candidates", "hybrid_merge_log", "validation_report",
+            "source_verification", "source_object_inventory",
+        ):
+            if final_data and isinstance(final_data.get(supplemental_key), list):
+                excel_data[supplemental_key] = final_data[supplemental_key]
         result_path = excel_agent.write(excel_data, output_path)
         elapsed = time.time() - t0
         self._add_timing("엑셀 작성", elapsed)
         self._log(excel_agent.report())
         self._log(f"[감독관] 엑셀 작성 완료: {elapsed:.1f}초")
 
+        # Persist original held rows even when run-state recording is disabled.
+        from utils.reading_pipeline import audit_summary
+        reading_audit = (final_data or {}).get("reading_pipeline_audit", [])
+        reading_report_path = result_path.with_name(f"{result_path.stem}_reading_pipeline.json")
+        try:
+            reading_report_path.write_text(json.dumps({
+                **audit_summary(reading_audit),
+                "enabled": bool(getattr(config, "READING_PIPELINE_ENABLED", True)),
+                "accuracy_evaluated": False, "records": reading_audit,
+                "visual_context_records": (final_data or {}).get("visual_context_audit", []),
+            }, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+            self._log(f"[감독관] A/B 연결 기록: {reading_report_path}")
+        except OSError as exc:
+            # A locked audit file must not turn an already saved workbook into
+            # a failed extraction. Make the missing audit explicit to the user.
+            logger.warning("A/B 연결 기록 저장 실패. Excel은 유지합니다: %s", exc)
+            self._log(f"[감독관] 경고: A/B 연결 기록 저장 실패 ({exc})")
+
+        # 외전 검수 도구와 같은 좌표 마킹 산출물. 점수 계산과 분리해 실패해도 Excel은 보존한다.
+        if (
+            source_verification is not None
+            and getattr(config, "SOURCE_VERIFICATION_MARK_PDF", True)
+            and input_path.suffix.casefold() == ".pdf"
+        ):
+            t0 = time.time()
+            marked_path = result_path.with_name(f"마킹_{result_path.stem}.pdf")
+            try:
+                saved_marked_path, mark_count = create_marked_pdf(
+                    input_path,
+                    source_verification,
+                    marked_path,
+                    max_marks=max(0, int(getattr(config, "SOURCE_VERIFICATION_MAX_MARKS", 10000))),
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                logger.warning("원문 마킹 PDF 생성 실패. Excel 결과는 유지합니다: %s", exc)
+                saved_marked_path, mark_count = None, 0
+            elapsed = time.time() - t0
+            self._add_timing("마킹 PDF", elapsed)
+            if saved_marked_path is not None:
+                self._log(f"[감독관] 원문 마킹 PDF: {saved_marked_path} ({mark_count}개, {elapsed:.1f}초)")
+            else:
+                self._log(f"[감독관] 원문 마킹 PDF 생략: 표시 가능한 좌표 없음 ({elapsed:.1f}초)")
+
         # LLM 최종 검수
         self._log("\n[감독관] LLM 최종 품질 검수 중...")
         t0 = time.time()
         try:
+            if quality_assessment is None:
+                quality_assessment = assess_quality(
+                    final_data,
+                    source_verification,
+                    source_object_inventory,
+                )
+            self._quality_assessment_for_review = quality_assessment
             review = self._llm_quality_review(final_data)
-        except llm_client.LLMQuotaExceededError as exc:
+        except (llm_client.LLMQuotaExceededError, llm_client.LLMCapacityError) as exc:
             elapsed = time.time() - t0
             self._add_timing("LLM 최종 검수", elapsed)
-            logger.warning("저장 후 LLM 최종 검수 quota/한도 문제로 생략: %s", exc)
-            self._log(f"한도 초과로 최종 검수는 생략했습니다. 결과 파일은 저장되어 있습니다: {result_path}")
+            logger.warning("저장 후 LLM 최종 검수 capacity/quota 문제로 생략: %s", exc)
+            self._log(f"모델 과부하 또는 한도 초과로 최종 검수는 생략했습니다. 결과 파일은 저장되어 있습니다: {result_path}")
         else:
             elapsed = time.time() - t0
             self._add_timing("LLM 최종 검수", elapsed)
@@ -660,7 +1043,64 @@ class Supervisor:
         self._log("\n" + "=" * 60)
         self._log("[감독관] 파이프라인 완료")
         self._log(f"  출력 파일: {result_path}")
-        self._log(f"  최종 품질 점수: {_quality_score(final_data)[0]:.1f}/100")
+        if quality_assessment is None:
+            quality_assessment = assess_quality(
+                final_data,
+                source_verification,
+                source_object_inventory,
+            )
+        self._log(f"  최종 품질 점수: {quality_assessment.score:.1f}/100")
+        self.last_run_outcome = extraction_outcome(
+            quality_assessment.metrics,
+            run_state.completion_status() if run_state is not None else "complete",
+        )
+        outcome_path = result_path.with_name(f"{result_path.stem}_run_outcome.json")
+        outcome_path.write_text(json.dumps(self.last_run_outcome, ensure_ascii=False, indent=2), encoding="utf-8")
+        text_audit_path = result_path.with_name(f"{result_path.stem}_text_audit.json")
+        text_audit_path.write_text(json.dumps({
+            "attempts": text_audits,
+            "final_rows_by_sheet": {k: len(final_data.get(k, [])) for k in config.EXTRACTION_SHEETS},
+            "attribution": "Final counts include downstream filtering/merging and possibly Vision; not per-call accuracy.",
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        if vision_preflights:
+            preflight_path = result_path.with_name(f"{result_path.stem}_vision_preflight.json")
+            preflight_path.write_text(json.dumps({"attempts": vision_preflights, "review_budget": review_budget.snapshot()}, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._log(f"  결과 저장 여부: 성공 / 추출 상태: {self.last_run_outcome['status']} / 종료 코드: {self.last_run_outcome['exit_code']}")
+        if run_state is not None:
+            manifest_path = run_state.finalize(
+                output_path=result_path,
+                semantic_result_hash=sha256_json({
+                    key: value
+                    for key, value in final_data.items()
+                    if (
+                        (isinstance(value, list) and key not in getattr(config, "INTERNAL_OBJECT_KEYS", set()))
+                        or key in {"municipality_name", "pipeline_metrics"}
+                    )
+                }),
+                extra={
+                    **self.last_run_outcome,
+                    "review_budget": review_budget.snapshot(),
+                    "quality_score": quality_assessment.score,
+                    "text_audit_path": str(text_audit_path),
+                    "quality_metrics": quality_assessment.metrics,
+                    "timings_seconds": {key: round(value, 3) for key, value in self._timings.items()},
+                    "llm_cache_stats": llm_cache.get_cache_stats(),
+                    "llm_call_stats": llm_client.get_llm_stats(),
+                    "parallel_queue_stats": parallel.get_parallel_stats(),
+                    "pipeline_artifact_stats": dict(self._artifact_stats),
+                    "vision_render_stats": {
+                        key: round(float(value), 3) if key.endswith("_seconds") else int(value)
+                        for key, value in self._vision_render_stats.items()
+                    },
+                },
+            )
+            state_summary = run_state.summary()
+            self._log(
+                f"  배치 실행 상태: {run_state.completion_status()} "
+                f"(성공 {state_summary['ok']}/{state_summary['expected']}, "
+                f"미복구 {state_summary['failed'] + state_summary['missing']})"
+            )
+            self._log(f"  실행 매니페스트: {manifest_path}")
         self._log_timing_summary(time.time() - pipeline_start)
         self._log("=" * 60)
 

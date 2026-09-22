@@ -9,6 +9,7 @@ from typing import Final
 
 from scripts.vision_benchmark_core import CommandStats, JsonObject, JsonValue, TEXT_MODEL, TEXT_PROVIDER
 from scripts.vision_benchmark_workbook import CandidateSampleInput, SampleRow, build_sample_sheet
+from utils.pipeline_result import load_outcome
 
 ROOT: Final = Path(__file__).resolve().parents[1]
 
@@ -98,6 +99,7 @@ def _result_payload(result: CandidateReportInput, baseline: float) -> JsonObject
 
 def _run_payload(result: CandidateReportInput) -> JsonObject:
     return {
+        "extraction_outcome": load_outcome(result.output_xlsx),
         "exit_code": result.run.exit_code,
         "elapsed_seconds": result.run.elapsed_seconds,
         "cache_hit": result.run.cache_hit,

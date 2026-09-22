@@ -17,6 +17,7 @@ class LLMClientTests(unittest.TestCase):
                 "CODEX_COMMAND",
                 "CLAUDE_COMMAND",
                 "LOCAL_AGENT_MODEL",
+                "CODEX_TEXT_MODEL",
                 "CODEX_VISION_MODEL",
                 "LOCAL_AGENT_TIMEOUT",
                 "GEMINI_API_KEY",
@@ -255,6 +256,11 @@ class LLMClientTests(unittest.TestCase):
             llm_client.config.CODEX_COMMAND = self._fake_codex_command(Path(tmp))
             llm_client.config.LOCAL_AGENT_TIMEOUT = 5
             llm_client.config.LOCAL_AGENT_MODEL = ""
+            llm_client.config.CODEX_VISION_MODEL = "gpt-5.6-luna"
+            llm_client.config.STAGE_MODELS = {
+                **llm_client.config.STAGE_MODELS,
+                "vision": "",
+            }
 
             image_b64 = base64.b64encode(b"not really a png").decode("ascii")
             raw = llm_client.call_vision(image_b64, '{"image": true}', max_retries=1, stage="vision")
@@ -276,17 +282,18 @@ class LLMClientTests(unittest.TestCase):
 
         self.assertEqual(parsed["model"], "gpt-테스트모델")
 
-    def test_codex_텍스트호출은_vision_기본모델의_영향을_받지_않는다(self):
+    def test_codex_텍스트호출은_텍스트_기본모델을_지정한다(self):
         with tempfile.TemporaryDirectory() as tmp:
             llm_client.config.LLM_PROVIDER = "codex"
             llm_client.config.CODEX_COMMAND = self._fake_codex_command(Path(tmp))
             llm_client.config.LOCAL_AGENT_TIMEOUT = 5
             llm_client.config.LOCAL_AGENT_MODEL = ""
+            llm_client.config.CODEX_TEXT_MODEL = "gpt-5.6-luna"
 
             raw = llm_client.call_text('{"answer": true}', system="system", max_retries=1, stage="extraction")
             parsed = llm_client.parse_json(raw)
 
-        self.assertEqual(parsed["model"], "")
+        self.assertEqual(parsed["model"], "gpt-5.6-luna")
 
 
     def test_call_text_reuses_identical_successful_response_from_cache(self):
@@ -395,29 +402,12 @@ class LLMClientTests(unittest.TestCase):
         self.assertEqual(calls, {"run": 1, "sleep": 0})
 
     def test_run_command_decodes_subprocess_output_with_utf8_replacement(self):
-        captured = {}
-
-        class Completed:
-            returncode = 0
-            stdout = '{"ok": true}'
-            stderr = ""
-
-        original_run = llm_client.subprocess.run
-
-        def fake_run(command, **kwargs):
-            captured.update(kwargs)
-            return Completed()
-
-        try:
-            llm_client.subprocess.run = fake_run
-
-            result = llm_client._run_command(["fake"], "프롬프트", cwd=Path("."), timeout=5)
-        finally:
-            llm_client.subprocess.run = original_run
-
-        self.assertEqual(result, '{"ok": true}')
-        self.assertEqual(captured["encoding"], "utf-8")
-        self.assertEqual(captured["errors"], "replace")
+        with tempfile.TemporaryDirectory() as directory:
+            result = llm_client._run_command(
+                [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read() + b'\\xff')"],
+                "프롬프트", cwd=Path(directory), timeout=10,
+            )
+        self.assertEqual(result, "프롬프트\ufffd")
 
     def test_gemini_vision_batch_uses_batch_call(self):
         calls = []

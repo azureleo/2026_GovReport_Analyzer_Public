@@ -28,12 +28,13 @@ from openpyxl import Workbook, load_workbook
 
 import config
 from agents.image_agent import (  # 기존 동작을 바꾸지 않고 감사 입력으로만 재사용한다.
+    _apply_reference_context_policy,
     _coverage_reduce_images,
-    _has_reference_context,
     _is_relevant_image,
     _triage_image,
 )
 from utils.pdf_reader import PageContent, extract_pdf
+from utils.object_evidence_match import descriptor, match_object_evidence
 
 INVENTORY_HEADERS = ["요소ID", "페이지", "요소유형", "제목", "데이터포함", "기대추출", "관련시트", "비고"]
 AUTO_HEADERS = [
@@ -41,7 +42,10 @@ AUTO_HEADERS = [
     "자동_풀렌더여부", "자동_관련성통과", "자동_트리아지통과및사유",
 ]
 VALID_ELEMENT_TYPES = {"그래프", "이미지표", "이미지", "지도·사진", "장식"}
-STATUS_ORDER = ["이미지_미추출", "triage_탈락", "참고자료_제외", "vision_유실", "동일페이지_부분기록", "기록됨"]
+STATUS_ORDER = [
+    "이미지_미추출", "triage_탈락", "참고자료_제외", "vision_유실",
+    "근거불충분", "복수객체_검토필요", "기록됨",
+]
 DRAFT_NOTICE = (
     "주의: 이 초안은 PDF 파서와 이미지 triage가 본 후보만 나열합니다. "
     "파이프라인이 통째로 놓친 요소는 초안에 없으므로 사람이 원문 PDF를 넘기며 누락 요소를 행으로 추가해야 최종 인벤토리가 됩니다."
@@ -68,6 +72,9 @@ class InventoryItem:
     expected: bool
     related_sheet: str
     note: str
+    evidence_id: str = ""
+    object_id: str = ""
+    key_values: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +86,9 @@ class VisualRecord:
     data_included: str
     digitizing_needed: str
     related_sheet: str
+    summary: str = ""
+    evidence_id: str = ""
+    object_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +102,7 @@ class PageEvidence:
     top_reasons: tuple[str, ...]
     drawing_count: int
     triage_scores: tuple[int, ...] = ()
+    reference_flagged_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +113,8 @@ class ElementAudit:
     triage_reasons: tuple[str, ...]
     drawing_count: int
     matched_records: tuple[VisualRecord, ...]
+    match_stage: str = ""
+    match_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +219,9 @@ def load_inventory(path: Path) -> list[InventoryItem]:
             expected=_yn(row.get("기대추출"), "기대추출", row_num),
             related_sheet=_cell_text(row.get("관련시트")),
             note=_cell_text(row.get("비고")),
+            evidence_id=_cell_text(row.get("근거ID")),
+            object_id=_cell_text(row.get("객체ID")),
+            key_values=_cell_text(row.get("핵심값")),
         ))
     return items
 
@@ -223,6 +239,13 @@ def load_visual_records(path: Path) -> list[VisualRecord]:
             data_included=_cell_text(row.get("데이터포함여부")),
             digitizing_needed=_cell_text(row.get("디지타이징필요")),
             related_sheet=_cell_text(row.get("관련시트")),
+            summary=" | ".join(filter(None, (
+                _cell_text(row.get("추출값요약")),
+                _cell_text(row.get("원문값")),
+                _cell_text(row.get("원문단위")),
+            ))),
+            evidence_id=_cell_text(row.get("근거ID")),
+            object_id=_cell_text(row.get("근거객체ID")),
         ))
     return records
 
@@ -261,20 +284,20 @@ def _triage_page_evidence(pdf_path: Path, municipality: str) -> dict[int, PageEv
     raw_counts = Counter(page.page_number for page, _ in raw_images)
     reduced_counts = Counter(page.page_number for page, _ in reduced_images)
     passed_counts: Counter[int] = Counter()
+    reference_flagged_counts: Counter[int] = Counter()
     reference_counts: Counter[int] = Counter()
     scores: dict[int, list[int]] = defaultdict(list)
     reasons: dict[int, list[str]] = defaultdict(list)
     for page, image in reduced_images:
         item = _triage_image(page, image)
         score = int(item["score"])
+        is_reference, was_filtered = _apply_reference_context_policy(
+            page, image, item, municipality
+        )
+        reference_flagged_counts[page.page_number] += int(is_reference)
+        reference_counts[page.page_number] += int(was_filtered)
         passed = bool(item["passed"])
         reason_list = [str(reason) for reason in item["reasons"]]
-        if getattr(config, "IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT", True):
-            is_reference, ref_hits = _has_reference_context(page, image, municipality)
-            if is_reference:
-                passed = False
-                reason_list.append("reference_context:" + ",".join(ref_hits[:4]))
-                reference_counts[page.page_number] += 1
         if passed:
             passed_counts[page.page_number] += 1
         scores[page.page_number].append(score)
@@ -293,6 +316,7 @@ def _triage_page_evidence(pdf_path: Path, municipality: str) -> dict[int, PageEv
             top_reasons=_limited_reasons_with_reference(tuple(reasons.get(page.page_number, [])), 6),
             drawing_count=drawings.get(page.page_number, 0),
             triage_scores=page_scores,
+            reference_flagged_count=reference_flagged_counts[page.page_number],
         )
     return evidence
 
@@ -311,18 +335,51 @@ def classify_inventory(
     records: Sequence[VisualRecord],
 ) -> list[ElementAudit]:
     records_by_page = _records_by_page(records)
-    seen_expected: Counter[int] = Counter()
+    record_by_key = {record.visual_id: record for record in records}
+    record_descriptors = [
+        descriptor(
+            key=record.visual_id,
+            page=record.page,
+            evidence_ids=record.evidence_id,
+            object_ids=record.object_id,
+            number="",
+            caption=record.caption,
+            content=" | ".join(filter(None, (record.caption, record.summary))),
+        )
+        for record in records
+    ]
+    evidence_to_records: dict[str, set[str]] = defaultdict(set)
+    for record in records:
+        if record.evidence_id:
+            evidence_to_records[record.evidence_id].add(record.visual_id)
+    ambiguous_evidence_ids = {
+        evidence_id
+        for evidence_id, visual_ids in evidence_to_records.items()
+        if len(visual_ids) > 1
+    }
     results: list[ElementAudit] = []
     for item in items:
         page = pages.get(item.page, PageEvidence(item.page, 0, 0, 0, 0, None, (), 0))
         page_records = tuple(records_by_page.get(item.page, []))
+        match = match_object_evidence(
+            descriptor(
+                key=item.element_id,
+                page=item.page,
+                evidence_ids=item.evidence_id,
+                object_ids=item.object_id,
+                number="",
+                caption=item.title,
+                content=item.key_values or item.title,
+            ),
+            record_descriptors,
+            ambiguous_evidence_ids=ambiguous_evidence_ids,
+        )
+        matched = tuple(
+            record_by_key[key] for key in match.matched_keys if key in record_by_key
+        )
         if not item.expected:
             status = "기대제외"
-            matched = page_records
         else:
-            index = seen_expected[item.page]
-            seen_expected[item.page] += 1
-            matched = page_records
             if page.image_count == 0 or page.reduced_image_count == 0:
                 status = "이미지_미추출"
             elif page.triage_passed_count == 0 and page.reference_filtered_count > 0:
@@ -331,11 +388,24 @@ def classify_inventory(
                 status = "triage_탈락"
             elif not page_records:
                 status = "vision_유실"
-            elif index < len(page_records):
+            elif match.confirmed:
                 status = "기록됨"
+            elif match.status == "partial":
+                status = "근거불충분"
+            elif match.status == "ambiguous":
+                status = "복수객체_검토필요"
             else:
-                status = "동일페이지_부분기록"
-        results.append(ElementAudit(item, status, page.top_score, page.top_reasons, page.drawing_count, matched))
+                status = "vision_유실"
+        results.append(ElementAudit(
+            item,
+            status,
+            page.top_score,
+            page.top_reasons,
+            page.drawing_count,
+            matched,
+            match_stage=match.status,
+            match_reason=match.reason,
+        ))
     return results
 
 
@@ -452,12 +522,17 @@ def _summary_lines(audits: Sequence[ElementAudit]) -> list[str]:
     expected = [audit for audit in audits if audit.item.expected]
     recorded = sum(1 for audit in expected if audit.status == "기록됨")
     recall = recorded / len(expected) if expected else 0.0
+    metrics = _p5_metrics(audits)
     counts = _status_counts(audits)
     status_text = ", ".join(f"{status} {counts.get(status, 0)}" for status in STATUS_ORDER)
     return [
         f"- 기대추출 요소 수: {len(expected)}",
         f"- 기록됨 수: {recorded}",
         f"- 리콜: {recall:.3f}",
+        f"- Triage 누락률: {metrics['triage_miss_rate']:.3f} "
+        f"({metrics['triage_missed_objects']}/{metrics['triage_evaluable_objects']})",
+        f"- 판독 재현율: {metrics['vision_recall']:.3f}",
+        f"- 근거 미결정률: {metrics['evidence_unresolved_rate']:.3f}",
         f"- 상태 분포: {status_text}",
     ]
 
@@ -479,8 +554,8 @@ def _display_reasons(reasons: Sequence[str]) -> str:
 
 def _detail_lines(audits: Sequence[ElementAudit]) -> list[str]:
     lines = [
-        "| 요소ID | 페이지 | 유형 | 상태 | triage 점수·사유 | 벡터 drawing 수 | 16시트 매칭 |",
-        "|---|---:|---|---|---|---:|---|",
+        "| 요소ID | 페이지 | 유형 | 상태 | 근거매칭 | triage 점수·사유 | 벡터 drawing 수 | 16시트 매칭 |",
+        "|---|---:|---|---|---|---|---:|---|",
     ]
     for audit in audits:
         if not audit.item.expected:
@@ -491,7 +566,9 @@ def _detail_lines(audits: Sequence[ElementAudit]) -> list[str]:
         score = "" if audit.triage_score is None else str(audit.triage_score)
         reasons = _display_reasons(audit.triage_reasons)
         lines.append(
-            f"| {audit.item.element_id} | {audit.item.page} | {audit.item.element_type} | {audit.status} | {score} {reasons} | {audit.drawing_count} | {records} |"
+            f"| {audit.item.element_id} | {audit.item.page} | {audit.item.element_type} | {audit.status} | "
+            f"{audit.match_stage}: {audit.match_reason} | {score} {reasons} | "
+            f"{audit.drawing_count} | {records} |"
         )
     return lines
 
@@ -512,18 +589,65 @@ def _sensitivity_lines(sensitivity: SensitivityReport) -> list[str]:
 
 
 def _false_positive_stats(audits: Sequence[ElementAudit], records: Sequence[VisualRecord]) -> dict[str, int]:
-    records_by_page = _records_by_page(records)
     excluded = [audit for audit in audits if not audit.item.expected]
-    over = sum(1 for audit in excluded if records_by_page.get(audit.item.page))
-    return {"excluded_rows": len(excluded), "excluded_recorded_pages": over}
+    over = sum(bool(audit.matched_records) for audit in excluded)
+    return {
+        "excluded_rows": len(excluded),
+        "excluded_recorded_pages": over,
+        "excluded_matched_objects": over,
+    }
 
 
 def _false_positive_line(audits: Sequence[ElementAudit], records: Sequence[VisualRecord]) -> str:
     stats = _false_positive_stats(audits, records)
     return (
         f"- 기대추출=N 요소 {stats['excluded_rows']}개 중 "
-        f"16시트에 같은 페이지가 기록된 수: {stats['excluded_recorded_pages']}"
+        f"근거가 실제 일치한 수: {stats['excluded_matched_objects']}"
     )
+
+
+def _p5_metrics(audits: Sequence[ElementAudit]) -> dict[str, float | int]:
+    expected = [audit for audit in audits if audit.item.expected]
+    excluded = [audit for audit in audits if not audit.item.expected]
+    triage_evaluable = [
+        audit for audit in expected
+        if audit.status not in {"이미지_미추출"}
+    ]
+    triage_missed = [
+        audit for audit in triage_evaluable
+        if audit.status in {"triage_탈락", "참고자료_제외"}
+    ]
+    vision_evaluable = [
+        audit for audit in expected
+        if audit.status not in {"이미지_미추출", "triage_탈락", "참고자료_제외"}
+    ]
+    recorded = sum(audit.status == "기록됨" for audit in expected)
+    vision_recorded = sum(audit.status == "기록됨" for audit in vision_evaluable)
+    unresolved = sum(
+        audit.status in {"근거불충분", "복수객체_검토필요"}
+        for audit in expected
+    )
+    true_negative = sum(not audit.matched_records for audit in excluded)
+    return {
+        "fixed_denominator": True,
+        "expected_objects": len(expected),
+        "recorded_objects": recorded,
+        "object_recall": recorded / len(expected) if expected else 0.0,
+        "triage_evaluable_objects": len(triage_evaluable),
+        "triage_missed_objects": len(triage_missed),
+        "triage_miss_rate": (
+            len(triage_missed) / len(triage_evaluable) if triage_evaluable else 0.0
+        ),
+        "vision_evaluable_objects": len(vision_evaluable),
+        "vision_recorded_objects": vision_recorded,
+        "vision_recall": (
+            vision_recorded / len(vision_evaluable) if vision_evaluable else 0.0
+        ),
+        "evidence_unresolved_objects": unresolved,
+        "evidence_unresolved_rate": unresolved / len(expected) if expected else 0.0,
+        "negative_objects": len(excluded),
+        "negative_specificity": true_negative / len(excluded) if excluded else 0.0,
+    }
 
 
 def _type_breakdown_payload(audits: Sequence[ElementAudit]) -> dict[str, JsonValue]:
@@ -563,6 +687,7 @@ def _report_json(
     records: Sequence[VisualRecord],
 ) -> dict[str, JsonValue]:
     counts = _status_counts(audits)
+    p5_metrics = _p5_metrics(audits)
     return {
         "source_pdf": str(paths.source_pdf),
         "inventory": str(paths.inventory),
@@ -570,6 +695,7 @@ def _report_json(
         "inventory_rows": len(audits),
         "expected_rows": sum(1 for audit in audits if audit.item.expected),
         "recorded_rows": sum(1 for audit in audits if audit.item.expected and audit.status == "기록됨"),
+        "metrics": p5_metrics,
         "status_counts": {status: counts.get(status, 0) for status in STATUS_ORDER},
         "sensitivity": _sensitivity_payload(sensitivity),
         "type_breakdown": _type_breakdown_payload(audits),
@@ -581,6 +707,9 @@ def _report_json(
                 "페이지": audit.item.page,
                 "요소유형": audit.item.element_type,
                 "상태": audit.status,
+                "근거매칭단계": audit.match_stage,
+                "근거매칭사유": audit.match_reason,
+                "일치시각자료ID": [record.visual_id for record in audit.matched_records],
                 "triage_score": audit.triage_score,
                 "drawing_count": audit.drawing_count,
             }

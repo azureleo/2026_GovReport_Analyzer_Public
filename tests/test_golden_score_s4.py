@@ -4,8 +4,44 @@ from pathlib import Path
 
 import openpyxl
 
+import config
+from scripts.golden_score_contract import 계약헤더, 레거시계약헤더
 from scripts.score_against_golden import score_workbooks
 from tests.test_score_against_golden import _계약열, _워크북, _점수
+
+
+def test_근거_id는_골든셋_내용_계약에서_제외한다() -> None:
+    assert "근거ID" in config.EXCEL_HEADERS["03_배출현황_지역"]
+    assert "근거ID" not in 계약헤더("03_배출현황_지역")
+
+
+def test_확장전_골든계약은_레거시로_평가한다(tmp_path: Path) -> None:
+    output = _워크북(
+        tmp_path / "출력.xlsx",
+        {"06_감축목표": [{"목표수준": "총괄", "목표범위": "관리권한", "부문": "합계", "기준연도": 2018, "목표연도": 2030, "목표배출량": 80}]},
+    )
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "06_감축목표"
+    headers = [
+        *레거시계약헤더("06_감축목표"),
+        "골든_출처유형", "골든_출처페이지", "골든_채점제외", "골든_비고",
+    ]
+    ws.append(headers)
+    row = {
+        "목표수준": "총괄", "목표범위": "관리권한", "부문": "합계",
+        "기준연도": 2018, "목표연도": 2030, "목표배출량": 80,
+        "골든_출처유형": "텍스트표", "골든_출처페이지": "1",
+    }
+    ws.append([row.get(header) for header in headers])
+    golden = tmp_path / "레거시_골든.xlsx"
+    wb.save(golden)
+
+    result = score_workbooks(output, golden, report_dir=tmp_path / "리포트", label="레거시")
+
+    assert result["형식오류"] == []
+    assert result["시트별"]["06_감축목표"]["매칭수"] == 1
+    assert any("레거시 계약 열" in warning for warning in result["형식경고"])
 
 
 def test_값일치율은_양쪽_값이_있는_쌍만_분모로_쓴다(tmp_path: Path) -> None:

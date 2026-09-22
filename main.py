@@ -171,9 +171,31 @@ def main():
         help="이미지 분석 후보 상한. 미지정/0이면 triage 통과 후보 전부 분석",
     )
     parser.add_argument(
+        "--ocr-backend",
+        choices=["vlm", "unlimited_ocr", "none"],
+        default=None,
+        help="저신뢰 객체 보완 백엔드 (기본값: vlm)",
+    )
+    parser.add_argument(
+        "--ocr-results-dir",
+        default=None,
+        help="Unlimited-OCR가 생성한 Markdown/JSONL 결과 디렉터리",
+    )
+    parser.add_argument(
+        "--no-selective-ocr",
+        action="store_true",
+        help="객체 신뢰도 기반 선택적 OCR을 끄고 기존 이미지 triage만 사용",
+    )
+    parser.add_argument(
         "--full-scan",
         action="store_true",
         help="시트별 키워드 라우팅/상한에 의존하지 않고 전체 페이지를 추출 후보로 사용",
+    )
+    parser.add_argument(
+        "--target-context-mode",
+        choices=["context", "legacy", "off"],
+        default=None,
+        help="06_감축목표 재태깅 방식: context(권장), legacy(v7-1), off",
     )
     parser.add_argument(
         "--hybrid-review",
@@ -223,6 +245,54 @@ def main():
         action="store_true",
         help="Pro가 accept/fix_then_merge + high로 판정하고 규칙 검사를 통과한 후보를 본 시트에 자동 병합",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="동일 입력·프롬프트·모델의 성공 배치를 복원하고 미완료/실패 배치부터 재개",
+    )
+    parser.add_argument(
+        "--retry-failed-only",
+        action="store_true",
+        help="기존 성공 체크포인트는 복원하고 실패·부분 배치만 다시 실행 (--resume 포함)",
+    )
+    parser.add_argument(
+        "--retry-vision-evidence",
+        action="append",
+        default=None,
+        metavar="EVIDENCE_ID",
+        help="성공 체크포인트 중 지정한 근거 ID의 Vision 판독만 강제 재실행 (반복 지정 가능)",
+    )
+    parser.add_argument(
+        "--retry-vision-pages",
+        default=None,
+        metavar="PAGES",
+        help="지정 페이지의 저신뢰 시각 객체만 강제 재실행 (예: 71,89,131)",
+    )
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="추출 완료 후 고정 골든셋·시각 인벤토리·라우팅 독립 평가 실행",
+    )
+    parser.add_argument(
+        "--evaluation-manifest",
+        default=None,
+        help="평가 데이터셋 매니페스트 경로",
+    )
+    parser.add_argument(
+        "--evaluation-dataset",
+        default=None,
+        help="평가 데이터셋 ID. 생략하면 원문 SHA256으로 선택",
+    )
+    parser.add_argument(
+        "--allow-draft-evaluation",
+        action="store_true",
+        help="사람 확정 전 초벌 골든셋을 테스트 목적으로 허용",
+    )
+    parser.add_argument(
+        "--evaluate-holdout",
+        action="store_true",
+        help="개발 튜닝과 분리된 홀드아웃 평가를 명시적으로 허용",
+    )
 
     args = parser.parse_args()
 
@@ -244,9 +314,17 @@ def main():
         os.environ["LOCAL_AGENT_TIMEOUT"] = str(args.agent_timeout)
     if args.max_images is not None:
         os.environ["MAX_IMAGES"] = str(args.max_images)
+    if args.ocr_backend:
+        os.environ["OCR_BACKEND"] = args.ocr_backend
+    if args.ocr_results_dir:
+        os.environ["OCR_RESULTS_DIR"] = args.ocr_results_dir
+    if args.no_selective_ocr:
+        os.environ["SELECTIVE_OCR_ENABLED"] = "0"
     if args.full_scan:
         os.environ["FULL_DOCUMENT_SCAN"] = "1"
         os.environ.setdefault("MAX_IMAGES", "0")
+    if args.target_context_mode:
+        os.environ["REDUCTION_TARGET_CONTEXT_MODE"] = args.target_context_mode
     if args.hybrid_review:
         os.environ["HYBRID_REVIEW_ENABLED"] = "1"
     if args.sheet_closed_loop:
@@ -265,6 +343,22 @@ def main():
         os.environ["HYBRID_ADJUDICATION_ENABLED"] = "0"
     if args.hybrid_auto_merge:
         os.environ["HYBRID_AUTO_MERGE_ENABLED"] = "1"
+    if args.resume or args.retry_failed_only:
+        os.environ["EXTRACTION_RESUME"] = "1"
+    if args.retry_failed_only:
+        os.environ["EXTRACTION_RETRY_FAILED_ONLY"] = "1"
+    if args.retry_vision_evidence:
+        evidence_ids = [
+            item.strip()
+            for value in args.retry_vision_evidence
+            for item in str(value or "").split(",")
+            if item.strip()
+        ]
+        os.environ["VISION_RETRY_EVIDENCE_IDS"] = ",".join(dict.fromkeys(evidence_ids))
+        os.environ["EXTRACTION_RESUME"] = "1"
+    if args.retry_vision_pages:
+        os.environ["VISION_RETRY_PAGES"] = args.retry_vision_pages
+        os.environ["EXTRACTION_RESUME"] = "1"
 
     # API 키 설정
     if args.api_key:
@@ -275,6 +369,43 @@ def main():
             os.environ["GEMINI_API_KEY"] = args.api_key
 
     import config
+
+    # 테스트처럼 config가 이미 import된 프로세스에서도 CLI 플래그를 즉시 반영한다.
+    if args.resume or args.retry_failed_only:
+        config.EXTRACTION_RESUME = True
+    if args.retry_failed_only:
+        config.EXTRACTION_RETRY_FAILED_ONLY = True
+    if args.retry_vision_evidence:
+        config.VISION_RETRY_EVIDENCE_IDS = list(dict.fromkeys(
+            item.strip()
+            for value in args.retry_vision_evidence
+            for item in str(value or "").split(",")
+            if item.strip()
+        ))
+        config.EXTRACTION_RESUME = True
+    if args.retry_vision_pages:
+        config.VISION_RETRY_PAGES = {
+            int(item.strip())
+            for item in str(args.retry_vision_pages).split(",")
+            if item.strip().isdigit() and int(item.strip()) > 0
+        }
+        config.EXTRACTION_RESUME = True
+    if args.ocr_backend:
+        config.OCR_BACKEND = args.ocr_backend
+    if args.ocr_results_dir:
+        config.OCR_RESULTS_DIR = args.ocr_results_dir
+    if args.no_selective_ocr:
+        config.SELECTIVE_OCR_ENABLED = False
+    if args.target_context_mode:
+        config.REDUCTION_TARGET_CONTEXT_MODE = args.target_context_mode
+
+    if (
+        config.SELECTIVE_OCR_ENABLED
+        and config.OCR_BACKEND in {"unlimited_ocr", "uocr", "markdown"}
+        and not config.OCR_RESULTS_DIR
+    ):
+        print("[오류] Unlimited-OCR 백엔드에는 --ocr-results-dir가 필요합니다.")
+        return 1
 
     provider_aliases = {
         "gemini-api": "gemini",
@@ -360,10 +491,28 @@ def main():
         print(f"  모델: {config.MODEL}")
     elif provider == "openai":
         print(f"  모델: {config.OPENAI_MODEL}")
+    elif provider == "codex":
+        effective_model = (
+            config.STAGE_MODELS.get("extraction")
+            or config.LOCAL_AGENT_MODEL
+            or config.CODEX_TEXT_MODEL
+        )
+        print(f"  모델: {effective_model or 'Codex CLI 기본값'}")
     elif config.LOCAL_AGENT_MODEL:
         print(f"  모델: {config.LOCAL_AGENT_MODEL}")
     else:
         print("  모델: 백엔드 기본값")
+    if provider in {"codex", "claude"}:
+        print(
+            f"  로컬 호출 타임아웃: {config.LOCAL_AGENT_TIMEOUT}초 "
+            f"(추가 재시도 {config.LOCAL_AGENT_TIMEOUT_RETRIES}회)"
+        )
+        print(
+            "  타임아웃 배치 자동 분할: "
+            f"{'활성' if config.EXTRACTION_SPLIT_ON_TIMEOUT else '비활성'} "
+            f"(깊이 {config.EXTRACTION_TIMEOUT_MAX_SPLIT_DEPTH}, "
+            f"배치별 {config.EXTRACTION_TIMEOUT_RECOVERY_BUDGET_SECONDS}초 상한)"
+        )
     print(f"  이미지 분석: {'비활성' if args.no_images else '활성'}")
     if args.no_images:
         print("  이미지 상한: 해당 없음")
@@ -371,8 +520,64 @@ def main():
         image_limit = "없음" if config.MAX_IMAGES is None else str(config.MAX_IMAGES)
         print(f"  이미지 상한: {image_limit}")
         print(f"  이미지 배치 크기: {config.IMAGE_ANALYSIS_BATCH_SIZE}")
+        print(
+            "  선택적 OCR/VLM: "
+            f"{'활성' if config.SELECTIVE_OCR_ENABLED else '비활성'}"
+        )
+        if config.SELECTIVE_OCR_ENABLED:
+            print(f"  OCR 백엔드: {config.OCR_BACKEND}")
+            print(f"  원본 신뢰도 임계값: {config.OCR_NATIVE_CONFIDENCE_THRESHOLD:g}")
+            if config.OCR_BACKEND in {"unlimited_ocr", "uocr", "markdown"}:
+                print(f"  OCR 결과 디렉터리: {config.OCR_RESULTS_DIR or '미지정'}")
     print(f"  LLM 캐시: {'활성' if config.LLM_CACHE_ENABLED else '비활성'}")
+    print(f"  A/B 판독 연결 규칙: {'활성' if config.READING_PIPELINE_ENABLED else '비활성'} (추가 모델 호출 없음)")
+    if config.RUN_STATE_ENABLED:
+        resume_mode = (
+            "실패 배치만 재실행"
+            if config.EXTRACTION_RETRY_FAILED_ONLY
+            else "중단 지점부터 재개"
+            if config.EXTRACTION_RESUME
+            else "새 실행"
+        )
+        print(f"  영속 배치 복구: 활성 ({resume_mode})")
+    else:
+        print("  영속 배치 복구: 비활성")
+    print(
+        "  텍스트 사전 분할: "
+        f"{config.EXTRACTION_MAX_BATCH_CHARS:,}자 "
+        f"(복구 {config.EXTRACTION_RECOVERY_MAX_BATCH_CHARS:,}자, "
+        f"표 {config.EXTRACTION_TABLE_ROWS_PER_BATCH}행)"
+    )
+    if not args.no_images:
+        print(
+            "  Vision 체크포인트: "
+            f"{'활성' if config.VISION_CHECKPOINT_ENABLED else '비활성'}"
+        )
+        print(
+            f"  근거 부족 제한적 판독: {'활성' if config.VISION_REVIEW_ENABLED else '비활성'} "
+            f"(최대 {config.VISION_REVIEW_MAX_OBJECTS}객체 / {config.VISION_REVIEW_MAX_CALLS}회 / "
+            f"추가 누적 {config.VISION_REVIEW_MAX_SECONDS:g}초)"
+        )
     print(f"  라우팅 샤프닝: {'활성' if config.ROUTE_DROP_UBIQUITOUS_WEAK else '비활성'}")
+    print(f"  결정론적 원문 대조: {'활성' if config.SOURCE_VERIFICATION_ENABLED else '비활성'}")
+    print(
+        "  원문 객체 인벤토리: "
+        f"{'활성' if config.SOURCE_OBJECT_INVENTORY_ENABLED else '비활성'}"
+    )
+    print(
+        "  시트 의미 검증: "
+        f"{'활성' if config.SEMANTIC_ROUTING_ENABLED else '비활성'}"
+        + (
+            " (안전 범위 자동 재분류)"
+            if config.SEMANTIC_ROUTING_ENABLED
+            and config.SEMANTIC_ROUTING_AUTO_RECLASSIFY
+            else ""
+        )
+    )
+    print(f"  감축목표 문맥 분류: {config.REDUCTION_TARGET_CONTEXT_MODE}")
+    if config.SOURCE_VERIFICATION_ENABLED:
+        print(f"  원문 마킹 PDF: {'생성' if config.SOURCE_VERIFICATION_MARK_PDF else '생략'}")
+        print(f"  품질 통과 기준: {config.QUALITY_THRESHOLD:g}/100")
     print(f"  시트별 폐루프: {'활성' if config.SHEET_CLOSED_LOOP_ENABLED else '비활성'}")
     print(f"  보조 모델 검수: {'활성' if config.HYBRID_REVIEW_ENABLED else '비활성'}")
     if config.HYBRID_REVIEW_ENABLED:
@@ -417,12 +622,44 @@ def main():
             max_pipeline_retries=args.retries,
             include_images=not args.no_images,
         )
-        print(f"\n완료! 결과 파일: {result_path}")
-        return 0
+        outcome = supervisor.last_run_outcome
+        print(f"\n결과 파일 저장: {result_path}")
+        print(f"추출 상태: {outcome.get('status', 'unknown')} (저장 성공과 정확도 판정은 별개입니다)")
+        if args.evaluate:
+            from utils.benchmark_evaluation import (
+                EvaluationContractError,
+                evaluate_benchmark,
+            )
+
+            manifest_path = args.evaluation_manifest or config.EVALUATION_MANIFEST_PATH
+            print("\n[평가] 고정 골든셋·객체·라우팅 독립 평가 실행...")
+            try:
+                evaluation = evaluate_benchmark(
+                    result_path,
+                    input_path,
+                    manifest_path=manifest_path,
+                    dataset_id=args.evaluation_dataset,
+                    allow_draft=args.allow_draft_evaluation,
+                    allow_holdout=args.evaluate_holdout,
+                )
+            except EvaluationContractError as exc:
+                print(f"[평가 오류] {exc}")
+                return 2
+            metrics = evaluation.metrics
+            print(
+                "[평가] 완료: "
+                f"셀 정확도={metrics.get('cell_accuracy')}, "
+                f"객체 재현율={metrics.get('object_recall')}, "
+                f"라우팅 오류율={metrics.get('routing_error_rate')}"
+            )
+            print(f"[평가] 리포트: {evaluation.report_markdown}")
+        return int(outcome.get("exit_code", 0))
     except KeyboardInterrupt:
+        supervisor.mark_interrupted("사용자 중단")
         print("\n[중단] 사용자에 의해 중단되었습니다.")
         return 1
     except Exception as e:
+        supervisor.mark_interrupted(str(e))
         print(f"\n[오류] 파이프라인 실행 중 오류 발생: {e}")
         if args.verbose:
             import traceback

@@ -116,7 +116,10 @@ def _reuse_stats(log_path: Path) -> CommandStats:
 def _pipeline_command(config: BenchmarkConfig, xlsx_path: Path) -> list[str]:
     if config.cache_only:
         return [sys.executable, str(_cache_guard_script(config.output_dir)), str(config.source), "--output", str(xlsx_path)]
-    return [*shlex.split(config.command), str(config.source), "--output", str(xlsx_path)]
+    tokens = shlex.split(config.command, posix=os.name != "nt")
+    if os.name == "nt":
+        tokens = [token[1:-1] if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"} else token for token in tokens]
+    return [*tokens, str(config.source), "--output", str(xlsx_path)]
 
 
 def _cache_guard_script(output_dir: Path) -> Path:

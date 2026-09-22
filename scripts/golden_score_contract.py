@@ -21,13 +21,36 @@ from agents.organizer_agent import (  # noqa: E402
     to_float,
 )
 
-무시열 = {"출처페이지", "데이터상태"}
-골든열 = ["골든_출처유형", "골든_출처페이지", "골든_채점제외", "골든_비고"]
+# 원문 보존 열은 추적용이다. 기존 골든셋의 내용 채점 분모를 바꾸지 않는다.
+무시열 = {"근거ID", "출처페이지", "데이터상태", "derivation_type", "부문원문", "관리부문원문"}
+골든열 = [
+    "골든_출처유형", "골든_출처페이지", "골든_채점제외", "골든_비고",
+    "골든_산출유형",
+]
+산출유형목록 = [
+    "reported", "explicit", "normalized", "calculated", "inferred", "external_lookup",
+]
+# 2026-08 스키마 확장 전 골든셋도 계속 평가할 수 있도록 허용하는 후방 호환 열.
+선택확장열 = {
+    "06_감축목표": {"기준배출량기준", "목표배출량기준", "감축률계산값"},
+    "10_정량감축량": {"감축량유형", "시간기준"},
+    "12_대응기반강화": {
+        "평가유형", "기후변수", "시나리오", "기준기간", "미래기간", "공간단위",
+        "부문", "리스크항목", "취약성지표", "값", "단위", "리스크등급",
+        "방법론", "자료출처", "연계적응과제",
+    },
+    "14_점검실적": {"예산액", "예산유형", "예산단위", "예산집행률"},
+}
 출처유형목록 = ["본문텍스트", "텍스트표", "이미지표", "그래프", "이미지"]
 텍스트유래 = {"본문텍스트", "텍스트표"}
 시각유래 = {"이미지표", "그래프", "이미지"}
 수치시트 = {"02_지역여건", "03_배출현황_지역", "04_배출현황_관리권한", "05_배출전망", "06_감축목표", "09_연차별이행계획", "10_정량감축량", "11_재정투자계획", "14_점검실적"}
-의미완화적용시트 = {"02_지역여건"}
+의미완화적용시트 = {
+    "01_계획개요",
+    "02_지역여건",
+    "07_비전전략",
+    "13_이행관리환류",
+}
 SEMANTIC_MATCH_MIN_JACCARD = 0.6
 CHAR_SIMILARITY_MIN_JACCARD = 0.30
 값필드 = {
@@ -35,13 +58,17 @@ CHAR_SIMILARITY_MIN_JACCARD = 0.30
     "03_배출현황_지역": ["배출량", "단위"],
     "04_배출현황_관리권한": ["배출량", "단위"],
     "05_배출전망": ["전망값", "단위"],
-    "06_감축목표": ["기준배출량", "배출전망", "목표감축량", "목표배출량", "감축률(%)"],
+    "06_감축목표": ["기준배출량", "배출전망", "목표감축량", "목표배출량", "감축률(%)", "감축률계산값"],
     "09_연차별이행계획": ["목표물량"],
-    "10_정량감축량": ["활동량", "예상감축량"],
+    "10_정량감축량": ["활동량", "예상감축량", "감축량유형", "시간기준"],
     "11_재정투자계획": ["예산액", "예산단위"],
-    "14_점검실적": ["달성여부"],
+    "12_대응기반강화": ["값", "단위", "리스크등급"],
+    "14_점검실적": ["예산액", "예산유형", "예산단위", "예산집행률", "달성여부"],
 }
-텍스트값필드 = {"단위", "예산단위", "달성여부"}
+텍스트값필드 = {
+    "단위", "예산단위", "달성여부", "감축량유형", "시간기준",
+    "기준배출량기준", "목표배출량기준", "예산유형", "리스크등급",
+}
 데이터시트 = [name for name in config.EXCEL_HEADERS if name[:2].isdigit() and int(name[:2]) <= 15]
 일차키 = {
     "01_계획개요": ["개요유형", "항목명"],
@@ -49,7 +76,13 @@ CHAR_SIMILARITY_MIN_JACCARD = 0.30
     "03_배출현황_지역": ["배출유형", "부문", "세부부문", "연도"],
     "04_배출현황_관리권한": ["관리부문", "세부부문", "직간접구분", "연도"],
     "05_배출전망": ["시나리오", "부문", "연도"],
-    "06_감축목표": ["목표수준", "목표범위", "부문", "목표연도"],
+    "06_감축목표": [
+        "목표수준",
+        "목표범위",
+        "부문",
+        "기준연도",
+        "목표연도",
+    ],
     "07_비전전략": ["전략수준", "전략명"],
     "08_감축사업목록": ["관리번호"],
     "09_연차별이행계획": ["관리번호", "연도"],
@@ -140,6 +173,21 @@ def 계약헤더(sheet_name: str) -> list[str]:
     return [header for header in config.EXCEL_HEADERS[sheet_name] if header not in 무시열]
 
 
+def 레거시계약헤더(sheet_name: str) -> list[str]:
+    optional = 선택확장열.get(sheet_name, set())
+    return [header for header in 계약헤더(sheet_name) if header not in optional]
+
+
+def 산출유형그룹(value: Any) -> str:
+    """골든·출력의 산출 유형을 평가용 공통 그룹으로 정규화한다."""
+    normalized = 문자열(value).casefold()
+    if normalized in {"", "reported", "explicit"}:
+        return "reported"
+    if normalized in {"normalized", "calculated", "inferred", "external_lookup"}:
+        return normalized
+    return "inferred"
+
+
 def 값있음(value: Any) -> bool:
     return value is not None and str(value).strip() != ""
 
@@ -169,9 +217,13 @@ def 키값(field_name: str, value: Any) -> str:
 
 def 키(row: 행, sheet_name: str, relaxed: bool) -> str | None:
     fields = 이차키.get(sheet_name) if relaxed else 일차키.get(sheet_name)
-    if sheet_name == "12_대응기반강화" and not relaxed:
-        task_id = 키값("과제ID", row.값.get("과제ID"))
-        fields = ["과제ID"] if task_id else ["대응기반영역", "과제명"]
+    if not relaxed:
+        if sheet_name == "08_감축사업목록":
+            project_id = 키값("관리번호", row.값.get("관리번호"))
+            fields = ["관리번호"] if project_id else ["부문", "사업명"]
+        elif sheet_name == "12_대응기반강화":
+            task_id = 키값("과제ID", row.값.get("과제ID"))
+            fields = ["과제ID"] if task_id else ["대응기반영역", "과제명"]
     if not fields:
         return None
     parts: list[str] = []

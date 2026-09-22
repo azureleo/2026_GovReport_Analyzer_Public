@@ -25,11 +25,13 @@ def test_전망과_감축목표_legacy_target_sheet를_신규_시트로_매핑�
 
 def test_차트표_프롬프트에_전망과_감축목표_분류_규칙을_명시한다() -> None:
     assert (
-        "vehicle, energy, ghg, forecast, target, strategy, summary 중 하나"
+        "regional_conditions, emissions_regional, emissions_management, emissions_forecast, "
+        "reduction_targets, vision_strategy, mitigation_projects, financial_plan, "
+        "foundation_measures, other 중 하나"
         in CHART_TABLE_SYSTEM
     )
     assert "배출·흡수 전망" in CHART_TABLE_SYSTEM
-    assert "기후 시나리오(SSP·RCP 등의 기온·강수 전망)는 forecast가 아니라 summary" in CHART_TABLE_SYSTEM
+    assert "기후 시나리오(SSP·RCP 등의 기온·강수 전망), 영향·취약성·리스크 자료는 foundation" in CHART_TABLE_SYSTEM
     assert "감축목표 차트" in CHART_TABLE_SYSTEM
     assert "배출전망(forecast)" in CHART_TABLE_SYSTEM
     assert "차트·캡션의 시나리오 표기 그대로(BAU|목표|전망 등), 없으면 생략" in CHART_TABLE_SYSTEM
@@ -65,7 +67,7 @@ def _배출전망_관찰값(scenario: str | None) -> dict:
     }
 
 
-def test_시나리오_공란_배출전망은_G3_대상시트_미지원으로_차단한다(monkeypatch) -> None:
+def test_시나리오_공란_배출전망은_G3_키누락으로_차단한다(monkeypatch) -> None:
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
 
     cleaned = OrganizerAgent().organize({
@@ -78,15 +80,19 @@ def test_시나리오_공란_배출전망은_G3_대상시트_미지원으로_차
         issue.get("영역") == "시각병합"
         and issue.get("항목") == "차단"
         and issue.get("대상시트키") == "emissions_forecast"
-        and "G3 대상 시트 미지원" in issue.get("문제내용", "")
+        and "G3 1차 키 누락(시나리오)" in issue.get("문제내용", "")
         for issue in cleaned["validation_report"]
     )
 
 
-@pytest.mark.parametrize("scenario", [None, "BAU"])
-def test_배출전망은_시나리오_유무와_무관하게_G3_대상시트_미지원으로_차단한다(
+@pytest.mark.parametrize(
+    ("scenario", "expected_status"),
+    [(None, "needs_review"), ("BAU", "duplicate")],
+)
+def test_배출전망은_시나리오가_있을_때만_기존행과_교차검증한다(
     monkeypatch,
     scenario: str | None,
+    expected_status: str,
 ) -> None:
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
     text_row = {
@@ -106,15 +112,19 @@ def test_배출전망은_시나리오_유무와_무관하게_G3_대상시트_미
 
     assert len(cleaned["emissions_forecast"]) == 1
     assert cleaned["emissions_forecast"][0]["데이터상태"] != "visual_only"
-    assert any(
-        issue.get("영역") == "시각병합"
-        and issue.get("항목") == "차단"
-        and "G3 대상 시트 미지원" in issue.get("문제내용", "")
-        for issue in cleaned["validation_report"]
-    )
+    assert cleaned["chart_observations"][0]["병합상태"] == expected_status
+    if scenario is None:
+        assert "G3 1차 키 누락(시나리오)" in cleaned["chart_observations"][0]["병합차단사유"]
+    else:
+        assert any(
+            issue.get("영역") == "시각병합"
+            and issue.get("항목") == "생략"
+            and "교차일치" in issue.get("문제내용", "")
+            for issue in cleaned["validation_report"]
+        )
 
 
-def test_시나리오_공란과_연도_누락이어도_G3_대상시트_미지원으로_차단한다(monkeypatch) -> None:
+def test_시나리오_공란과_연도_누락은_G3_키누락으로_차단한다(monkeypatch) -> None:
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
     observation = _배출전망_관찰값(None)
     observation.pop("연도")
@@ -129,6 +139,6 @@ def test_시나리오_공란과_연도_누락이어도_G3_대상시트_미지원
     assert any(
         issue.get("영역") == "시각병합"
         and issue.get("항목") == "차단"
-        and "G3 대상 시트 미지원" in issue.get("문제내용", "")
+        and "G3 1차 키 누락(시나리오, 연도)" in issue.get("문제내용", "")
         for issue in cleaned["validation_report"]
     )

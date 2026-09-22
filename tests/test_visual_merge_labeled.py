@@ -120,6 +120,117 @@ def test_시각_라벨병합은_게이트_미충족_사유를_행단위로_기�
     assert all(row["항목"] == "차단" for row in visual_issues)
 
 
+def test_G4_비완화시트는_명시_false여도_기존_참고판정을_유지한다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        config, "VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED", True, raising=False
+    )
+    observation = _관리권한_관찰값()
+    observation["참고자료여부"] = False
+    observation["자동병합정책"] = "standard"
+    observation["근거"] = json.dumps({
+        "관리부문": "건물",
+        "세부부문": "공공",
+        "직간접구분": "직접",
+        "설명": "국내외 사례 동향과 비교한 서울시 직접값",
+    }, ensure_ascii=False)
+
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    assert cleaned["emissions_management"] == []
+    assert cleaned["chart_observations"][0]["병합상태"] == "reject"
+
+
+def test_G4_지역여건_직접행은_긴_근거의_약한_키워드로_재차단하지_않는다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        config, "VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED", True, raising=False
+    )
+    observation = _시각_관찰값(
+        "regional_conditions",
+        {
+            "지표범주": "인문사회",
+            "지표명": "가구 수",
+            "항목": "서울시",
+            "연도": 2021,
+        },
+        value=4047,
+    )
+    observation.update({
+        "제목": "서울시 가구 수 추이",
+        "항목": "서울시",
+        "단위": "천가구",
+        "참고자료여부": False,
+        "자동병합정책": "standard",
+        "근거": json.dumps({
+            "지표범주": "인문사회",
+            "지표명": "가구 수",
+            "항목": "서울시",
+            "연도": 2021,
+            "설명": "국내외 사례 동향과 비교한 서울시 직접값",
+        }, ensure_ascii=False),
+    })
+
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    assert len(cleaned["regional_conditions"]) == 1
+    assert cleaned["chart_observations"][0]["병합상태"] == "accept"
+
+
+def test_G4_지역여건_전국행은_명시_false여도_차단한다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        config, "VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED", True, raising=False
+    )
+    observation = _시각_관찰값(
+        "regional_conditions",
+        {
+            "지표범주": "인문사회",
+            "지표명": "가구 수",
+            "항목": "전국",
+            "연도": 2021,
+        },
+        value=20400,
+    )
+    observation.update({
+        "제목": "전국 및 서울 가구 수 추이",
+        "항목": "전국",
+        "단위": "천가구",
+        "참고자료여부": False,
+        "자동병합정책": "standard",
+    })
+
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    assert cleaned["regional_conditions"] == []
+    assert cleaned["chart_observations"][0]["병합상태"] == "reject"
+
+
+def test_G4_레거시_플래그_부재는_객체_제목의_해외사례를_계속_차단한다(monkeypatch) -> None:
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        config, "VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED", True, raising=False
+    )
+    observation = _관리권한_관찰값(title="OECD 해외사례 관리권한 배출량")
+
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [observation],
+    })
+
+    assert cleaned["emissions_management"] == []
+    assert "G4 참고자료/사례 판정" in cleaned["chart_observations"][0]["병합차단사유"]
+
+
 def test_시각_라벨병합은_실스키마의_estimated_부재만으로_G1을_차단하지_않는다(monkeypatch) -> None:
     # Given: 실제 라벨 판독처럼 estimated가 없거나, 추정값이거나, 판독필드 자체가 없는 관찰값이면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
@@ -149,8 +260,42 @@ def test_시각_라벨병합은_실스키마의_estimated_부재만으로_G1을_
     assert "G1 판독필드 없음" in details
 
 
-@pytest.mark.parametrize("title", ["온실가스 흡수 전망", "온실가스 BAU 산정"])
-def test_시각_라벨병합은_03_전망성_제목을_05로_재지정한_뒤_G3에서_차단한다(monkeypatch, title: str) -> None:
+def test_시각_라벨병합은_종류추론_목표만_차단하고_현황은_기존대로_병합한다(monkeypatch) -> None:
+    # Given: 동일 스키마의 라벨 판독 중 목표와 현황 관찰값이 함께 들어오면
+    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
+    목표 = _관리권한_관찰값(value=200.0)
+    목표["종류추론"] = "목표"
+    현황 = _관리권한_관찰값(value=100.0)
+    현황["종류추론"] = "현황"
+
+    # When: organizer가 라벨 병합 게이트를 적용하면
+    cleaned = OrganizerAgent().organize({
+        "municipality_name": "서울특별시",
+        "chart_observations": [목표, 현황],
+    })
+
+    # Then: 목표 값은 차단 사유를 남기고 목표가 아닌 값만 병합한다.
+    assert [row["배출량"] for row in cleaned["emissions_management"]] == [100.0]
+    assert any(
+        issue.get("항목") == "차단"
+        and "G4 종류=목표 — 감축 경로표 값" in issue.get("문제내용", "")
+        for issue in cleaned["validation_report"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("title", "expected_count", "expected_status"),
+    [
+        ("온실가스 흡수 전망", 0, "needs_review"),
+        ("온실가스 BAU 산정", 1, "accept"),
+    ],
+)
+def test_시각_라벨병합은_03_전망성_제목을_05로_재지정해_시나리오_계약을_적용한다(
+    monkeypatch,
+    title: str,
+    expected_count: int,
+    expected_status: str,
+) -> None:
     # Given: 03 후보의 제목에 전망 키워드가 있고 시나리오 표기는 없으면
     monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
     observation = _시각_관찰값(
@@ -165,16 +310,20 @@ def test_시각_라벨병합은_03_전망성_제목을_05로_재지정한_뒤_G3
         "chart_observations": [observation],
     })
 
-    # Then: 03은 오염되지 않고 미지원 시트인 05 라벨 후보도 차단된다.
+    # Then: 03은 오염되지 않고, BAU를 식별한 후보만 05에 반영된다.
     assert cleaned["emissions_regional"] == []
-    assert cleaned["emissions_forecast"] == []
-    assert any(
-        issue.get("대상시트키") == "emissions_forecast"
-        and issue.get("항목") == "차단"
-        and "G3 대상 시트 미지원" in issue.get("문제내용", "")
-        and "대상시트 재지정(전망 키워드)" in issue.get("문제내용", "")
-        for issue in cleaned["validation_report"]
-    )
+    assert len(cleaned["emissions_forecast"]) == expected_count
+    assert observation["병합상태"] == expected_status
+    if expected_status == "needs_review":
+        assert "G3 1차 키 누락(시나리오)" in observation["병합차단사유"]
+    else:
+        assert cleaned["emissions_forecast"][0]["시나리오"] == "BAU"
+        assert any(
+            issue.get("대상시트키") == "emissions_forecast"
+            and issue.get("항목") == "병합"
+            and "대상시트 재지정(전망 키워드)" in issue.get("문제내용", "")
+            for issue in cleaned["validation_report"]
+        )
 
 
 def test_시각_라벨병합은_근거의_전망_문자열로_03을_재지정하지_않는다(monkeypatch) -> None:
@@ -569,8 +718,8 @@ def test_시각_라벨병합은_빈_세부부문을_기본값으로_채우지_�
         ("regional_conditions", {"지표범주": "교통", "지표명": "통행량", "연도": 2030}, "값", "02_지역여건", True),
         ("emissions_regional", {"배출유형": "직접배출", "부문": "건물", "세부부문": "공공", "연도": 2030}, "배출량", "03_배출현황_지역", True),
         ("emissions_management", {"관리부문": "건물", "세부부문": "공공", "직간접구분": "직접", "연도": 2030}, "배출량", "04_배출현황_관리권한", True),
-        ("emissions_forecast", {"시나리오": "BAU", "부문": "건물", "연도": 2030}, "전망값", "05_배출전망", False),
-        ("reduction_targets", {"목표수준": "부문", "목표범위": "지역전체", "부문": "건물", "목표연도": 2030}, "목표배출량", "06_감축목표", False),
+        ("emissions_forecast", {"시나리오": "BAU", "부문": "건물", "연도": 2030}, "전망값", "05_배출전망", True),
+        ("reduction_targets", {"목표수준": "부문", "목표범위": "지역전체", "부문": "건물", "목표연도": 2030}, "목표배출량", "06_감축목표", True),
         ("financial_plan", {"계획구분": "온실가스감축대책", "부문": "건물", "사업명": "효율화", "재원구분": "합계", "연도": 2030}, "예산액", "11_재정투자계획", True),
     ],
 )

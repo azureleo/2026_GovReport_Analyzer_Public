@@ -33,3 +33,20 @@ def test_write_excel_sanitizes_dict_list_control_chars_and_formula_text(tmp_path
     assert row[3].data_type == "s"
     assert row[4].value == 20260705
     assert row[5].value == '["시민", "기업"]'
+
+
+def test_write_excel_serializes_json_keys_canonically(tmp_path) -> None:
+    output_path = tmp_path / "canonical.xlsx"
+    data = {
+        "plan_overview": [{
+            "지자체명": "서울특별시",
+            "개요유형": {"z": 1, "a": {"d": 4, "b": 2}},
+            "항목명": "직렬화",
+            "항목값": "검증",
+        }],
+    }
+
+    workbook_path = excel_writer.write_excel(data, output_path)
+    workbook = load_workbook(workbook_path, data_only=False)
+
+    assert workbook["01_계획개요"].cell(2, 2).value == '{"a": {"b": 2, "d": 4}, "z": 1}'

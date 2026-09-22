@@ -12,7 +12,9 @@ config.PARALLEL_PROCESSING_ENABLED=False 이거나 workers<=1, 항목이 1개면
 from __future__ import annotations
 
 import concurrent.futures
-from typing import Callable, Sequence, TypeVar
+import threading
+import time
+from typing import Any, Callable, Sequence, TypeVar
 
 import config
 from utils.llm_client import LLMQuotaExceededError
@@ -21,11 +23,70 @@ T = TypeVar("T")
 R = TypeVar("R")
 
 
+_STATS_LOCK = threading.Lock()
+_PARALLEL_STATS: dict[str, dict[str, float | int]] = {}
+
+
+def reset_parallel_stats() -> None:
+    """현재 파이프라인 실행의 작업 큐 계측을 초기화한다."""
+    with _STATS_LOCK:
+        _PARALLEL_STATS.clear()
+
+
+def get_parallel_stats() -> dict[str, dict[str, float | int]]:
+    """단계별 제출·시작·완료 수와 큐 대기시간을 반환한다."""
+    with _STATS_LOCK:
+        return {
+            label: {
+                key: round(float(value), 3) if key.endswith("_seconds") else int(value)
+                for key, value in values.items()
+            }
+            for label, values in _PARALLEL_STATS.items()
+        }
+
+
+def _add_stat(label: str | None, key: str, amount: float | int = 1) -> None:
+    if not label:
+        return
+    with _STATS_LOCK:
+        stats = _PARALLEL_STATS.setdefault(label, {
+            "submitted": 0,
+            "started": 0,
+            "completed": 0,
+            "queue_wait_seconds": 0.0,
+            "max_queue_wait_seconds": 0.0,
+            "execution_seconds": 0.0,
+        })
+        if key == "max_queue_wait_seconds":
+            stats[key] = max(float(stats[key]), float(amount))
+        else:
+            stats[key] = float(stats[key]) + float(amount)
+
+
+def _run_timed(
+    fn: Callable[[T], R],
+    item: T,
+    submitted_at: float,
+    stats_label: str | None,
+) -> R:
+    started_at = time.perf_counter()
+    wait_seconds = max(0.0, started_at - submitted_at)
+    _add_stat(stats_label, "started")
+    _add_stat(stats_label, "queue_wait_seconds", wait_seconds)
+    _add_stat(stats_label, "max_queue_wait_seconds", wait_seconds)
+    try:
+        return fn(item)
+    finally:
+        _add_stat(stats_label, "execution_seconds", time.perf_counter() - started_at)
+        _add_stat(stats_label, "completed")
+
+
 def parallel_map(
     fn: Callable[[T], R],
     items: Sequence[T],
     *,
     workers: int,
+    stats_label: str | None = None,
 ) -> list[R]:
     """
     items의 각 원소에 fn을 적용한 결과를 입력 순서대로 반환한다.
@@ -39,12 +100,22 @@ def parallel_map(
         return []
     enabled = getattr(config, "PARALLEL_PROCESSING_ENABLED", True)
     if not enabled or workers <= 1 or n == 1:
-        return [fn(item) for item in items]
+        results: list[R] = []
+        for item in items:
+            submitted_at = time.perf_counter()
+            _add_stat(stats_label, "submitted")
+            results.append(_run_timed(fn, item, submitted_at, stats_label))
+        return results
 
     results: list[R] = [None] * n  # type: ignore[list-item]
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     try:
-        future_to_index = {executor.submit(fn, item): i for i, item in enumerate(items)}
+        future_to_index = {}
+        for i, item in enumerate(items):
+            submitted_at = time.perf_counter()
+            _add_stat(stats_label, "submitted")
+            future = executor.submit(_run_timed, fn, item, submitted_at, stats_label)
+            future_to_index[future] = i
         for future in concurrent.futures.as_completed(future_to_index):
             index = future_to_index[future]
             results[index] = future.result()  # 예외는 여기서 재발생
@@ -64,6 +135,7 @@ def parallel_map_collect(
     items: Sequence[T],
     *,
     workers: int,
+    stats_label: str | None = None,
 ) -> list[tuple[R | None, Exception | None]]:
     """
     items의 각 원소에 fn을 적용하되, 일반 예외는 항목별 실패로 수집한다.
@@ -80,8 +152,10 @@ def parallel_map_collect(
     if not enabled or workers <= 1 or n == 1:
         sequential: list[tuple[R | None, Exception | None]] = []
         for index, item in enumerate(items):
+            submitted_at = time.perf_counter()
+            _add_stat(stats_label, "submitted")
             try:
-                sequential.append((fn(item), None))
+                sequential.append((_run_timed(fn, item, submitted_at, stats_label), None))
             except LLMQuotaExceededError as exc:
                 sequential.append((None, exc))
                 skip = LLMQuotaExceededError("선행 배치 quota로 건너뜀")
@@ -93,7 +167,12 @@ def parallel_map_collect(
 
     results: list[tuple[R | None, Exception | None] | None] = [None] * n
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-    future_to_index = {executor.submit(fn, item): i for i, item in enumerate(items)}
+    future_to_index = {}
+    for i, item in enumerate(items):
+        submitted_at = time.perf_counter()
+        _add_stat(stats_label, "submitted")
+        future = executor.submit(_run_timed, fn, item, submitted_at, stats_label)
+        future_to_index[future] = i
     quota_error: LLMQuotaExceededError | None = None
     for future in concurrent.futures.as_completed(future_to_index):
         index = future_to_index[future]

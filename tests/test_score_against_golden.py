@@ -11,13 +11,17 @@ import pytest
 
 import config
 from agents import organizer_agent
+from scripts.golden_score_contract import 계약헤더
 from scripts.score_against_golden import score_workbooks
 
-골든열 = ["골든_출처유형", "골든_출처페이지", "골든_채점제외", "골든_비고"]
+골든열 = [
+    "골든_출처유형", "골든_출처페이지", "골든_채점제외", "골든_비고",
+    "골든_산출유형",
+]
 
 
 def _계약열(sheet_name: str) -> list[str]:
-    return [header for header in config.EXCEL_HEADERS[sheet_name] if header not in {"출처페이지", "데이터상태"}]
+    return 계약헤더(sheet_name)
 
 
 def _시트_쓰기(wb, sheet_name: str, rows: list[dict], *, golden: bool = False) -> None:
@@ -56,6 +60,47 @@ def test_organizer_공개_별칭은_기존_private_함수와_같은_객체다() 
     assert organizer_agent.normalize_direct_indirect_type is organizer_agent._normalize_direct_indirect_type
     assert organizer_agent.to_float is organizer_agent._to_float
     assert organizer_agent.normalize_provenance_pages is organizer_agent._normalize_provenance_pages
+
+
+def test_산출유형별_reported와_calculated를_분리_평가한다(tmp_path: Path) -> None:
+    result = _점수(
+        tmp_path,
+        {
+            "03_배출현황_지역": [
+                {
+                    "배출유형": "직접배출", "부문": "건물", "세부부문": "전기",
+                    "연도": 2020, "배출량": 100, "단위": "톤",
+                    "derivation_type": "explicit",
+                },
+                {
+                    "배출유형": "직접배출", "부문": "건물", "세부부문": "전기",
+                    "연도": 2021, "배출량": 90, "단위": "톤",
+                    "derivation_type": "calculated",
+                },
+            ]
+        },
+        {
+            "03_배출현황_지역": [
+                {
+                    "배출유형": "직접배출", "부문": "건물", "세부부문": "전기",
+                    "연도": 2020, "배출량": 100, "단위": "톤",
+                    "골든_출처유형": "텍스트표", "골든_출처페이지": "1",
+                    "골든_산출유형": "reported",
+                },
+                {
+                    "배출유형": "직접배출", "부문": "건물", "세부부문": "전기",
+                    "연도": 2021, "배출량": 90, "단위": "톤",
+                    "골든_출처유형": "텍스트표", "골든_출처페이지": "2",
+                    "골든_산출유형": "calculated",
+                },
+            ]
+        },
+    )
+
+    assert result["산출유형별_전체"]["reported"]["리콜"] == 1.0
+    assert result["산출유형별_전체"]["reported"]["산출유형일치율"] == 1.0
+    assert result["산출유형별_전체"]["calculated"]["리콜"] == 1.0
+    assert result["산출유형별_전체"]["calculated"]["값일치율"] == 1.0
 
 
 def test_시트03_엄격키_매칭으로_리콜과_정밀도를_계산한다(tmp_path: Path) -> None:
@@ -262,6 +307,156 @@ def test_S3_시트03_04는_세부부문이_같으면_기존_엄격매칭을_유�
     assert result["시트별"][sheet_name]["엄격매칭수"] == 1
 
 
+def test_V74_시트06은_목표수준이_같아도_기준연도와_값이_다르면_완화매칭을_차단한다(
+    tmp_path: Path,
+) -> None:
+    base = {"목표수준": "총괄", "목표범위": "지역전체", "부문": "합계", "목표연도": 2030}
+    result = _점수(
+        tmp_path,
+        {"06_감축목표": [base | {"기준연도": 2018, "목표배출량": 200}]},
+        {"06_감축목표": [base | {"기준연도": 2005, "목표배출량": 100, "골든_출처유형": "텍스트표"}]},
+    )
+
+    sheet = result["시트별"]["06_감축목표"]
+    assert sheet["엄격매칭수"] == 0
+    assert sheet["완화매칭수"] == 0
+    assert sheet["매칭수"] == 0
+
+
+def test_V74_시트06은_기준연도가_달라도_공통값이_같으면_완화매칭한다(tmp_path: Path) -> None:
+    base = {"목표수준": "총괄", "목표범위": "지역전체", "부문": "합계", "목표연도": 2030}
+    result = _점수(
+        tmp_path,
+        {"06_감축목표": [base | {"기준연도": 2018, "목표배출량": 100}]},
+        {"06_감축목표": [base | {"기준연도": 2005, "목표배출량": 100, "골든_출처유형": "텍스트표"}]},
+    )
+
+    sheet = result["시트별"]["06_감축목표"]
+    assert sheet["엄격매칭수"] == 0
+    assert sheet["완화매칭수"] == 1
+
+
+@pytest.mark.parametrize(("output_base_year", "golden_base_year"), [("", 2018), (2018, ""), ("", "")])
+def test_V74_시트06은_기준연도가_한쪽이나_양쪽_빈값이면_값가드를_발동하지_않는다(
+    tmp_path: Path, output_base_year: int | str, golden_base_year: int | str
+) -> None:
+    base = {"목표수준": "총괄", "목표범위": "지역전체", "부문": "합계", "목표연도": 2030}
+    result = _점수(
+        tmp_path,
+        {"06_감축목표": [base | {"기준연도": output_base_year, "목표배출량": 200}]},
+        {"06_감축목표": [base | {"기준연도": golden_base_year, "목표배출량": 100, "골든_출처유형": "텍스트표"}]},
+    )
+
+    sheet = result["시트별"]["06_감축목표"]
+    assert sheet["엄격매칭수"] == 0
+    assert sheet["완화매칭수"] == 1
+
+
+def test_V74_시트06은_기준연도가_양쪽_채움이고_같으면_엄격매칭한다(tmp_path: Path) -> None:
+    key = {
+        "목표수준": "총괄",
+        "목표범위": "지역전체",
+        "부문": "합계",
+        "기준연도": 2018,
+        "목표연도": 2030,
+    }
+    result = _점수(
+        tmp_path,
+        {"06_감축목표": [key | {"목표배출량": 200}]},
+        {"06_감축목표": [key | {"목표배출량": 100, "골든_출처유형": "텍스트표"}]},
+    )
+
+    sheet = result["시트별"]["06_감축목표"]
+    assert sheet["엄격매칭수"] == 1
+    assert sheet["완화매칭수"] == 0
+
+
+def test_V72_시트06_완화는_목표수준이_다르고_값도_다르면_제외한다(tmp_path: Path) -> None:
+    base = {"목표범위": "관리권한", "부문": "폐기물", "목표연도": 2030}
+    result = _점수(
+        tmp_path,
+        {"06_감축목표": [base | {"목표수준": "연차경로", "목표감축량": 4906, "감축률(%)": 20}]},
+        {"06_감축목표": [base | {"목표수준": "부문", "목표감축량": 338, "감축률(%)": 34.6, "골든_출처유형": "텍스트표"}]},
+    )
+
+    sheet = result["시트별"]["06_감축목표"]
+    assert sheet["매칭수"] == 0
+    assert sheet["완화매칭수"] == 0
+
+
+def test_V72_시트06_완화는_목표수준_표기가_달라도_공통값이_전부_같으면_매칭한다(
+    tmp_path: Path,
+) -> None:
+    base = {"목표범위": "관리권한", "부문": "폐기물", "목표연도": 2030}
+    result = _점수(
+        tmp_path,
+        {"06_감축목표": [base | {"목표수준": "부문별", "목표감축량": 338, "감축률(%)": 34.6}]},
+        {"06_감축목표": [base | {"목표수준": "부문", "목표감축량": 338, "감축률(%)": 34.6, "골든_출처유형": "텍스트표"}]},
+    )
+
+    assert result["시트별"]["06_감축목표"]["완화매칭수"] == 1
+
+
+def test_V72_시트06_완화는_목표수준이_같거나_한쪽이_비면_값과_무관하게_매칭한다(
+    tmp_path: Path,
+) -> None:
+    cases = [
+        ({"목표수준": "부문", "목표범위": "지역전체"}, {"목표수준": "부문", "목표범위": "관리권한"}),
+        ({"목표수준": "", "목표범위": "관리권한"}, {"목표수준": "연차경로", "목표범위": "관리권한"}),
+        ({"목표수준": "부문", "목표범위": "관리권한"}, {"목표수준": "", "목표범위": "관리권한"}),
+    ]
+    for output_key, golden_key in cases:
+        common_key = {"부문": "폐기물", "기준연도": 2018, "목표연도": 2030}
+        result = _점수(
+            tmp_path,
+            {"06_감축목표": [common_key | output_key | {"목표감축량": 4906}]},
+            {"06_감축목표": [common_key | golden_key | {"목표감축량": 338, "골든_출처유형": "텍스트표"}]},
+        )
+
+        assert result["시트별"]["06_감축목표"]["완화매칭수"] == 1
+
+
+def test_V72_시트06_완화는_목표수준이_다르고_공통값_필드가_없으면_제외한다(
+    tmp_path: Path,
+) -> None:
+    base = {"목표범위": "관리권한", "부문": "폐기물", "목표연도": 2030}
+    result = _점수(
+        tmp_path,
+        {"06_감축목표": [base | {"목표수준": "연차경로", "목표배출량": 338}]},
+        {"06_감축목표": [base | {"목표수준": "부문", "목표감축량": 338, "골든_출처유형": "텍스트표"}]},
+    )
+
+    assert result["시트별"]["06_감축목표"]["매칭수"] == 0
+
+
+def test_V72_시트06_완화는_목표수준이_다르면_공통값_필드가_전부_일치해야_한다(
+    tmp_path: Path,
+) -> None:
+    base = {"목표범위": "관리권한", "부문": "폐기물", "목표연도": 2030}
+    result = _점수(
+        tmp_path,
+        {"06_감축목표": [base | {"목표수준": "연차경로", "목표감축량": 338, "목표배출량": 200}]},
+        {"06_감축목표": [base | {"목표수준": "부문", "목표감축량": 338, "목표배출량": 100, "골든_출처유형": "텍스트표"}]},
+    )
+
+    assert result["시트별"]["06_감축목표"]["매칭수"] == 0
+
+
+def test_V72_시트06_가드는_시트03_04의_기존_완화_값가드를_바꾸지_않는다(tmp_path: Path) -> None:
+    cases = [
+        ("03_배출현황_지역", {"배출유형": "직접배출", "부문": "폐기물", "연도": 2020, "단위": "톤"}),
+        ("04_배출현황_관리권한", {"관리부문": "폐기물", "직간접구분": "직접", "연도": 2020, "단위": "톤"}),
+    ]
+    for sheet_name, base in cases:
+        result = _점수(
+            tmp_path,
+            {sheet_name: [base | {"세부부문": "매립", "배출량": 10.04}]},
+            {sheet_name: [base | {"세부부문": "총계", "배출량": 10, "골든_출처유형": "텍스트표"}]},
+        )
+
+        assert result["시트별"][sheet_name]["완화매칭수"] == 1
+
+
 def test_수치_허용오차와_불일치_상세를_구분한다(tmp_path: Path) -> None:
     result = _점수(
         tmp_path,
@@ -340,6 +535,13 @@ def test_출처유형_분해와_채점제외를_반영한다(tmp_path: Path) -> 
     assert result["출처유형별_전체"]["그래프"]["리콜"] == 0.5
     assert result["출처유형별_전체"]["시각 유래"]["리콜"] == 0.5
     assert result["출처유형별_수치시트"]["시각 유래"]["리콜"] == 0.5
+    assert result["시트별"]["03_배출현황_지역"]["출처유형별"]["시각 유래"] == {
+        "골든행수": 2,
+        "매칭수": 1,
+        "리콜": 0.5,
+        "값비교수": 2,
+        "값일치율": 1.0,
+    }
 
 
 def test_없는_골든시트와_형식오류시트를_명확히_보고한다(tmp_path: Path) -> None:

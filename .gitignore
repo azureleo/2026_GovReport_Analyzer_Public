@@ -1,6 +1,9 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.venv/
+venv/
 
 .env
 
@@ -28,6 +31,16 @@ excel_source_verification*.json
 !docs/references/가이드라인.hwp
 
 .cache/
+
+# 로컬 실행·평가 산출물
+output/
+tmp/
+.codex_analysis/
+*_run_manifest.json
+*_visual_merge_input.json.gz
+*_evaluation/
+마킹_*.pdf
+/출력 결과 모음집/
 
 # 골든셋·인벤토리는 측정 기준 자산이라 추적한다
 !data/golden/*.xlsx

@@ -98,18 +98,17 @@ def test_시트03_빈_배출유형_행은_동일_키_채움_행에_흡수된다(
     cleaned = OrganizerAgent().organize(raw)
 
     # Then: 빈 배출유형 행은 채워진 키 행에 흡수되고 보조 값은 병합된다.
-    assert cleaned["emissions_regional"] == [
-        {
-            "지자체명": "강원특별자치도",
-            "배출유형": "직접배출",
-            "부문": "에너지",
-            "세부부문": "연료연소",
-            "연도": 2020,
-            "배출량": 10.0,
-            "데이터상태": "reported",
-            "단위": "천톤",
-        }
-    ]
+    assert len(cleaned["emissions_regional"]) == 1
+    row = cleaned["emissions_regional"][0]
+    assert row["지자체명"] == "강원특별자치도"
+    assert row["배출유형"] == "직접배출"
+    assert row["부문"] == "에너지"
+    assert row["세부부문"] == "연료연소"
+    assert row["연도"] == 2020
+    assert row["배출량"] == 10.0
+    assert row["단위"] == "천톤"
+    assert row["데이터상태"] == "reported"
+    assert row["derivation_type"] == "explicit"
 
 
 def test_시트03_빈_배출유형_행도_수치_충돌이면_흡수하지_않는다() -> None:
@@ -149,7 +148,7 @@ def test_시트04_빈_직간접구분_행은_동일_키_채움_행에_흡수된�
     assert cleaned["emissions_management"][0]["단위"] == "천톤"
 
 
-def test_중복_값_충돌은_값_채움_필드가_많은_행을_결정론적으로_채택한다() -> None:
+def test_중복_값_충돌은_값_채움_수와_무관하게_두_원문값을_보존한다() -> None:
     # Given: 같은 dedup 키에서 수치가 충돌하고 뒤 행에 더 많은 원문 필드가 있으면
     raw = {
         "municipality_name": "서울특별시",
@@ -162,14 +161,14 @@ def test_중복_값_충돌은_값_채움_필드가_많은_행을_결정론적으
     # When: organizer가 중복 키 충돌을 정리하면
     cleaned = OrganizerAgent().organize(raw)
 
-    # Then: 값 채움 필드가 많은 뒤 행을 채택하되 충돌 상태와 검증리포트를 유지한다.
-    row = cleaned["emissions_regional"][0]
-    assert row["배출량"] == 20.0
-    assert row["데이터상태"] == "conflicting"
-    assert any("채택근거: 값 채움 필드 수 우선" in issue["문제내용"] for issue in cleaned["validation_report"])
+    # Then: 출처 유형이나 채움 수로 정답을 고르지 않고 두 값을 충돌 상태로 보존한다.
+    rows = cleaned["emissions_regional"]
+    assert {row["배출량"] for row in rows} == {10.0, 20.0}
+    assert all(row["데이터상태"] == "conflicting" for row in rows)
+    assert any("충돌값 자동선택 금지" in issue["문제내용"] for issue in cleaned["validation_report"])
 
 
-def test_중복_값_충돌은_동률이면_표_마커_출처_행을_채택한다() -> None:
+def test_중복_값_충돌은_표_마커가_있어도_두_원문값을_보존한다() -> None:
     # Given: 값 채움 수가 같고 뒤 행 출처페이지에 표 마커가 있으면
     raw = {
         "municipality_name": "서울특별시",
@@ -182,14 +181,14 @@ def test_중복_값_충돌은_동률이면_표_마커_출처_행을_채택한다
     # When: organizer가 중복 키 충돌을 정리하면
     cleaned = OrganizerAgent().organize(raw)
 
-    # Then: 표 마커가 있는 행을 채택하고 충돌 기록에 근거를 남긴다.
-    row = cleaned["emissions_regional"][0]
-    assert row["배출량"] == 20.0
-    assert row["출처페이지"] == "1,2"
-    assert any("채택근거: 표 마커 출처 우선" in issue["문제내용"] for issue in cleaned["validation_report"])
+    # Then: 표라는 이유로 우선하지 않고 값·페이지 근거를 각각 보존한다.
+    rows = cleaned["emissions_regional"]
+    assert {row["배출량"] for row in rows} == {10.0, 20.0}
+    assert {row["출처페이지"] for row in rows} == {"1", "2"}
+    assert any("충돌값 자동선택 금지" in issue["문제내용"] for issue in cleaned["validation_report"])
 
 
-def test_중복_값_충돌은_우선순위가_같으면_기존_first_wins를_유지한다() -> None:
+def test_중복_값_충돌은_입력순서와_무관하게_두_원문값을_보존한다() -> None:
     # Given: 값 채움 수와 표 마커 우선순위가 같은 충돌 행
     raw = {
         "municipality_name": "서울특별시",
@@ -202,10 +201,11 @@ def test_중복_값_충돌은_우선순위가_같으면_기존_first_wins를_유
     # When: organizer가 중복 키 충돌을 정리하면
     cleaned = OrganizerAgent().organize(raw)
 
-    # Then: 기존 first-wins 동작을 보존하고 충돌 기록에 근거를 남긴다.
-    row = cleaned["emissions_regional"][0]
-    assert row["배출량"] == 10.0
-    assert any("채택근거: 기존 순서 유지" in issue["문제내용"] for issue in cleaned["validation_report"])
+    # Then: first-wins를 적용하지 않고 두 값을 분리 보존한다.
+    rows = cleaned["emissions_regional"]
+    assert {row["배출량"] for row in rows} == {10.0, 20.0}
+    assert all(row["데이터상태"] == "conflicting" for row in rows)
+    assert any("충돌값 자동선택 금지" in issue["문제내용"] for issue in cleaned["validation_report"])
 
 
 def test_직간접구분_코드성_텍스트는_casefold로_정규화한다() -> None:
