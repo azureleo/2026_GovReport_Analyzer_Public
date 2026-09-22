@@ -2,7 +2,60 @@
 
 환경부 「지자체 탄소중립 녹색성장 기본계획 수립 및 추진상황 점검 가이드라인」(`carbon_guideline.md`)을 기준으로 지자체 탄소중립 계획서에서 구조화 데이터를 추출해 Excel로 정리하는 파이프라인입니다.
 
-이 프로젝트의 핵심 목표는 단순히 많이 뽑는 것이 아니라, **조용한 데이터 유실을 막고 사람이 검증할 수 있는 근거를 남기는 것**입니다. v4/v4.1이 안정성(부분 실패 허용, 배치 원장, quota 복구, 출처페이지)을 확보했다면, v5는 가이드라인 구조적 주입과 참조 사전으로 추출 충실도를 높이고, 행 단위 데이터상태·타깃 검수로 사람이 재확인할 지점을 파이프라인이 직접 지목하게 했습니다. v6는 **측정 체계**를 도입해 "얼마나 정확한가"를 골든셋 기준 숫자로 답할 수 있게 했고, 그 숫자를 근거로 vision 백엔드 선정과 차트 판독값의 본 시트 병합을 **"값 오병합 0" 정책**으로 열었습니다.
+이 프로젝트의 핵심 목표는 **데이터 유실을 추적하고 사람이 검증할 수 있는 근거를 남기는 것**입니다. 텍스트·표·시각자료 판독, 형식 호환과 의미 연결, 결정론적 정리, 실제 Excel 저장을 구분해 검증합니다. 판독에 성공했어도 문맥·단위·지역·기간이 불충분하면 업무 행 반영을 보류하고 원행과 사유를 기록합니다.
+
+> 이 저장소는 연구·개발 진행 상황을 공유하는 공개 스냅샷입니다. 배포 완료·정확도 보증 버전이 아니며, 전체 실행에서 확인한 개선과 회귀를 함께 기록합니다. 아래 상태는 **2026-09-22 확인 기준**입니다.
+
+## 공개 브랜치와 검증 범위
+
+| 브랜치 | 내용 | 상태 |
+|---|---|---|
+| `main` | 개발 브랜치 `codex/perf-v8-fast-path`의 9월 22일 코드·문서 스냅샷. A/B 판독 연결, Vision 안정화, 목차 제외, 텍스트 감사·최적화 포함 | 코드 스냅샷 `c8df887` 공개 확인. 소표본 및 서울 전체 평가 수행, 정확도 회귀 일부 잔존 |
+| `codex/v9-public-snapshot` | 개발 V9 커밋 `8350818`을 별도 공개하기 위한 스냅샷 브랜치 | 로컬 작업 폴더 준비 확인. 문서 작성 시점에는 원격 브랜치 공개 미확인, `main` 통합 미수행 |
+
+V9는 현재 `main`의 후속 연결 수정까지 모두 포함하는 상위 호환 버전이 아닙니다. 서로 다른 개발 경로이며, 브랜치를 공개하는 것과 `main`에 병합하는 것은 별개입니다. 브랜치별 코드·설정·골든셋·채점 계약을 고정하지 않은 점수와 실행 시간은 직접적인 개선 효과로 비교하지 않습니다.
+
+### V9에서 비교·선별 도입할 내용
+
+- v8-1 기반에 v7의 추출·검증·평가 자산을 선별 통합한 구현.
+- 다단 표 헤더 보존, 키 필드 보완, 추출 출처 기록과 같은 표의 중복·충돌 처리.
+- 의미 계약 검증·격리 원장 확대, Vision 후보·문맥 렌더·배치·전용 타임아웃 조정.
+- 백엔드별 텍스트 입력 상한과 표 셀 수 기반 배치 제한 지원. 지원 여부와 기본 활성 여부는 구분해야 합니다.
+- 골든 헤더 검증의 채점 축 분리와 기존 `benchmark_golden_*` 채점기 보존. 모든 채점기 의존성이 완전히 분리됐다는 뜻은 아닙니다.
+
+위 항목은 구현 비교 결과이며, 현재 `main`보다 정확하거나 빠르다는 검증 결과가 아닙니다. 공개 V9는 개발 저장소의 과거 이력을 직접 전송하지 않는 파일 스냅샷으로 준비하며, 공개 커밋 해시는 원본 개발 커밋과 달라집니다. V9의 상세 변경은 해당 브랜치의 코드·문서를 기준으로 확인해야 합니다.
+
+## 읽는 순서
+
+- 처음 실행: [설치](#설치) → [실행 방법](#실행-방법) → [실행 결과와 종료 코드](#실행-결과와-종료-코드)
+- 변경 내용: [일별 개선 기록](#daily-history) → [변경 이력 요약](#변경-이력-요약)
+- 판독 연결: [A 형식 호환](scripts/README_reading_compatibility_a.md), [B 의미 연결](scripts/README_reading_semantic_b.md), [기존 main.py 통합](scripts/README_reading_pipeline.md)
+- 호출 비용과 복구: [Vision 제한 판독](docs/vision_triage_followup_plan.md), [저장 응답 재사용](scripts/README_vision_recovery.md), [텍스트 최적화](docs/text_optimization.md)
+
+## 공개본의 포함 자료와 재현 한계
+
+| 구분 | 공개 `main`에 포함된 범위 |
+|---|---|
+| 실행 코드 | `main.py`, `config.py`, `agents/`, `utils/`, 가이드라인 Markdown, 의존성 정의 |
+| 연결·검증 도구 | `scripts/`, `tests/`, `data/reading_mapping_rules_v1.json`, 소표본 ID 목록 |
+| 참고·평가 계약 | 부록 CSV, 기존 `data/golden/`, `data/evaluation/benchmark_manifest.json` |
+| 문서 | 일별 기록, 구현 설명, 기존 감사·설계 문서. 날짜가 있는 결과는 당시 실험 범위에 한정 |
+
+다음 자료는 기본 공개 스냅샷에 포함하지 않습니다.
+
+- 실제 `.env`, API 키, CLI 로그인 정보, 개인 PC의 절대 경로 설정, 개발 저장소의 `.git` 이력.
+- 서울·경기·강원 원본 전체 PDF, 테스트용 발췌 PDF, 원시 모델 응답, 실행 Excel·마킹 PDF·로그·체크포인트.
+- `output/`, `outputs/`, `.cache/`, 가상환경과 임시 분석 폴더. 본문의 해당 경로는 **개발 환경의 산출물 식별자**이며 공개 다운로드 링크가 아닙니다.
+- `data/evaluation/visual_regression_p0_v1`의 표본 이미지·PDF·주석은 현재 공개 `main`에 없습니다. 이를 읽는 회귀 테스트는 자료를 별도로 준비해야 합니다.
+- 11쪽 Vision 복구 실험의 `data/vision_recovery_11pages*.json` 및 전용 평가 자료. 해당 실험 스크립트의 기본 예제를 그대로 실행할 수 있다는 의미는 아닙니다.
+
+원본·표본을 추가 공개할 때는 공개 권한을 확인하고 매니페스트의 SHA-256과 페이지 대응을 유지해야 합니다. 소표본 ID만으로 판독 입력을 복원할 수 없으며, 관련 실험에는 `raw_reading.json`, `metadata_links.json`, `backend_schema.json` 등 해당 안내문이 요구하는 입력이 필요합니다. 도구 코드의 공개와 과거 실험 전체의 즉시 재현 가능성을 구분합니다.
+
+### 현재 측정 결과의 해석
+
+최근 서울 전체 실행은 **3시간 14분 07초, 골든 셀 정확도 48.48%, 골든 행 재현율 65.57%, 골든 기준 행 정밀도 27.45%**였습니다. 8월 Luna 실행보다 약 24.9% 빨랐지만 셀 정확도는 54.79%에서 낮아졌습니다. 재정 문맥 연결·단위 등의 잔여 문제를 확인했으며, 시간 절반 이하 목표나 정확도 유지 목표를 달성했다고 주장하지 않습니다.
+
+이 수치는 서울 개발용 초벌 골든의 고정 열 계약에 대한 값입니다. 행 정밀도의 비매칭 출력 전체를 오답으로 볼 수 없고, 소표본 `138/138` 보존·자동 품질 점수·Excel 저장 성공도 전체 정확도와 다릅니다. 원문 PDF·모델 응답이 다른 실행, 후단만 재생한 실행, 검토를 거친 선택 재판독은 일별 기록에서 분리해 설명합니다.
 
 ## 현재 구현 요약
 
@@ -11,13 +64,21 @@
 - 선택 출력: `17_보조검수후보`, `18_보조병합로그`, `19_검증리포트`, `20_원문대조`, `21_원문객체인벤토리`
 - 데이터 시트에는 행 단위 `근거ID`·`출처페이지`·`데이터상태` 컬럼이 붙어 원문 대조와 우선 검토가 가능
 - 최종 행은 LLM 호출 없이 원문과 재대조되며, 대응 좌표를 표시한 마킹 PDF도 함께 생성
-- 기본 LLM 백엔드: Gemini API (단계별로 `STAGE_PROVIDER_*` 분리 가능)
+- 설정이 없을 때의 코드상 백엔드: Gemini API. 동봉 `.env.example`은 Codex를 지정하므로 복사 후의 실행 조건은 다름
 - 선택 백엔드: OpenAI API, Codex CLI, Claude Code CLI
 - 기본 정책: 정확도와 검증 가능성을 우선하고, 위험한 최적화는 opt-in으로만 사용
+- 운영 A/B 연결: `READING_PIPELINE_ENABLED=1`, 적용·보류 원행과 사유를 `*_reading_pipeline.json`에 기록
+- Vision 목차 제외는 기본 `exclude`, 텍스트 입력·배정은 기본 `audit`, 텍스트 묶음은 기본 비활성
+- 제한적 Vision 추가 판독은 기본 비활성. 호출·객체·시간 예산을 별도로 정하고 실험할 때만 활성화
+
+<a id="daily-history"></a>
 
 ## v8 성능·판독 연결 개선 기록 (2026-08-26 ~ 2026-09-22)
 
-현재 작업 브랜치는 `codex/perf-v8-fast-path`입니다. 아래는 이 브랜치의 작업 트리에서 진행한 구현·실험·평가 기록이며, 모두 커밋되거나 공개 브랜치에 반영됐다는 뜻은 아닙니다. `origin/feat/v9-integration`은 비교·선별 도입 대상이며 **현재 변경 사항에 전체 통합하지 않았습니다.** 이후에 나오는 8월 23일 스냅숏과 이전 기록은 당시 상태를 보존합니다.
+<details>
+<summary>일별 구현·실험·평가 기록 펼치기</summary>
+
+공개 `main`의 원본 개발 브랜치는 `codex/perf-v8-fast-path`입니다. 아래 기록에 해당하는 실행 코드·문서는 공개 커밋 `c8df887`에 반영됐지만, 개인 설정과 실험 산출물 전체를 공개한 것은 아닙니다. 개발 저장소의 `origin/feat/v9-integration`은 비교·선별 도입 대상이며 **현재 `main`에 전체 통합하지 않았습니다.** 이후에 나오는 8월 23일 스냅숏과 이전 기록은 당시 상태를 보존합니다.
 
 날짜는 기존 안내 문서와 실행 태그·평가 산출물에서 확인되는 작업일 기준입니다. 밤을 넘긴 전체 실행은 시작일과 평가일을 구분합니다. **구현 완료, 저장 무결성, 원문 정확도는 서로 다른 검증 단계**이며, 개발에 사용한 소표본의 보존율을 전체 문서 정확도로 해석하지 않습니다.
 
@@ -154,7 +215,14 @@
 
 상세 로컬 평가 기록은 `output/full_review_20260921_222556/서울_전체실행_비교평가.md`에 있습니다. `output/`의 실험 산출물은 저장소 배포에 포함되지 않을 수 있으므로, 재현·보고 시 입력/코드 해시와 해당 실행의 매니페스트·평가 계약을 함께 보존해야 합니다.
 
+</details>
+
 ## v8 객체 근거 파이프라인 스냅숏 (2026-08-23)
+
+<details>
+<summary>8월 23일 이전 구현·운영 기록 펼치기</summary>
+
+이하 v8·v6 설명의 기본값, 성능 수치, 브랜치명은 각 기록 당시 기준입니다. 현재 공개본의 실행 안내와 설정은 아래의 설치·실행·중요한 설정 항목을 우선합니다. 예시의 원본 PDF와 실행 산출물은 별도로 준비해야 합니다.
 
 이 스냅숏 당시 개발 브랜치는 `codex/v8-object-evidence-pipeline`입니다. `codex/v7-fidelity-integration`의 재개 실행·결정론적 검증 기반에서 분기해, Unlimited-OCR 실험에서 확인한 객체 우선 처리 원리를 특정 OCR 엔진에 종속되지 않는 운영 구조로 확장했습니다.
 
@@ -481,9 +549,11 @@ v6의 방향은 하나입니다. **측정 없이는 개선도 없다** — 추�
 3. 저리콜 서술형 시트(01/07/13)의 원인 분해 — 채점 한계 vs 추출 한계
 4. M3: 골든 없는 지자체의 검증 체계
 
-## 무거운 기능은 기본으로 켜지지 않습니다
+</details>
 
-아래 기능은 품질 회귀 가능성이 있어 기본값이 꺼져 있습니다.
+## 선택 기능과 호출 비용
+
+아래 기능은 비용 또는 품질 회귀 가능성이 있어 기본값이 꺼져 있습니다. 호출을 줄이는 최적화와 검수를 추가하는 기능을 구분해 적용합니다.
 
 | 설정 | 기본값 | 의미 |
 |---|---:|---|
@@ -491,8 +561,11 @@ v6의 방향은 하나입니다. **측정 없이는 개선도 없다** — 추�
 | `ROUTE_DROP_UBIQUITOUS_STRONG` | `False` | 문서 전반에 반복되는 strong 키워드까지 라우팅 점수에서 제외하는 실험적 최적화 |
 | `HYBRID_REVIEW_ENABLED` | `False` | 기본 추출 후 보조 모델로 누락/충돌 후보를 검수하는 선택 기능 |
 | `SHEET_CLOSED_LOOP_ENABLED` | `False` | 추출까지 시트 단위로 닫는 v5 폐루프 실행 경로 |
+| `VISION_REVIEW_ENABLED` | `False` | 근거 부족 시각 객체의 제한적 추가 판독. 일반 Vision 호출과 별도 예산 사용 |
 
 테스트 파일이 늘어난 것은 런타임을 무겁게 만들기 위해서가 아니라, 위 안정성 계약을 깨지 못하게 막기 위한 회귀 테스트입니다. 일반 실행 시 `tests/`는 실행되지 않습니다.
+
+기본 비활성 기능 외에도 일반 Vision, gap-fill, 배치 복구는 호출 비용을 만들 수 있습니다. 이 표는 짧은 실행 시간이나 호출 횟수 상한을 보장하는 설정 목록이 아닙니다.
 
 ## 처리 흐름
 
@@ -505,10 +578,12 @@ flowchart TD
     E --> F[배치 원장 기록]
     B --> G[텍스트·표·차트·이미지\nDocumentObject 인벤토리]
     G --> H[결정론적 객체 Triage\n저신뢰 객체만 OCR / VLM]
-    H --> R[근거 ID 기반\n중복 제거·보수적 병합]
+    H --> T[확정 목차 제외\n필요 시 예산 내 제한 판독]
+    T --> R[Vision 관찰·근거 ID\n중복 제거·보수적 병합]
     F --> I[정리·정제\nOrganizerAgent]
     R --> I
-    I --> J[검증리포트 생성]
+    I --> U[A 형식 호환·B 의미 연결\n충돌·보류 원행 감사]
+    U --> J[검증리포트 생성]
     J --> K[GapFill 보완]
     K --> L[선택: 보조 모델 검수\n타깃 검수: 경고·충돌 행]
     L --> Q[캡션·섹션 기반\n시트 의미 검증]
@@ -518,6 +593,8 @@ flowchart TD
     O --> P
     P --> N[Excel·마킹 PDF 작성]
 ```
+
+위 그림은 주요 데이터 흐름의 개요입니다. A/B 연결은 기존 Organizer 경로에서 호출하며, 단계마다 새 모델을 호출한다는 뜻은 아닙니다. 정확한 적용 범위와 제한은 [운영 연결 안내](scripts/README_reading_pipeline.md)를 확인하세요.
 
 ## 출력 Excel 시트
 
@@ -558,12 +635,26 @@ flowchart TD
 
 Python 3.10 이상을 권장합니다.
 
+새로 내려받는 경우:
+
+```powershell
+git clone https://github.com/azureleo/2026_GovReport_Analyzer_Public.git
+Set-Location -LiteralPath ".\2026_GovReport_Analyzer_Public"
+```
+
+이미 내려받았다면 해당 저장소 루트의 터미널에서 의존성을 설치합니다.
+
 ```powershell
 py -m pip install -r requirements.txt
+```
+
+PDF 파싱 자체에는 Node.js가 필수가 아닙니다. HWP/HWPX의 kordoc 파싱을 사용할 때는 Node.js 18 이상과 다음 설치가 필요합니다. 로컬 모델 CLI를 선택하면 그 CLI의 별도 설치·인증 요구 사항도 충족해야 합니다.
+
+```powershell
 npm install
 ```
 
-`requirements.txt`에는 기본 Gemini 백엔드 실행에 필요한 `google-genai`와 `google-api-core`가 모두 포함되어 있습니다. Gemini 실행 중 두 모듈 중 하나가 없다는 오류가 나오면 같은 명령으로 의존성을 다시 설치하세요.
+`requirements.txt`에는 Gemini/OpenAI 클라이언트, PDF·Excel 처리 및 pytest 의존성이 포함됩니다. 사용하는 Python과 패키지를 설치한 Python이 같은지 확인하세요.
 
 macOS/Linux에서는 `py` 대신 `python3`를 사용합니다.
 
@@ -572,13 +663,22 @@ python3 -m pip install -r requirements.txt
 python3 main.py "서울특별시_탄소중립계획.pdf" -o "서울_결과.xlsx"
 ```
 
-PDF만 처리한다면 Node.js는 필수가 아닙니다. HWP/HWPX 입력이나 kordoc 기반 파싱을 사용하려면 Node.js 18 이상과 `npm install`이 필요합니다.
+위 예시의 서울 PDF는 저장소에 포함되지 않습니다. 직접 준비한 파일 경로로 바꾸어 실행하세요.
 
-### API 키 설정
+### 환경파일과 백엔드 선택
 
-기본 백엔드는 Gemini입니다. `load_dotenv()`가 프로젝트 루트 `.env`를 읽으므로, 먼저 `.env.example`을 `.env`로 복사한 뒤 필요한 키만 채웁니다.
+실제 환경파일이 없을 때만 예시를 복사합니다. 기존 `.env`를 덮어쓰지 않습니다.
+
+```powershell
+if (-not (Test-Path -LiteralPath ".env")) {
+    Copy-Item -LiteralPath ".env.example" -Destination ".env"
+}
+```
+
+설정이 없을 때 `config.py`의 백엔드 기본값은 `gemini`지만, 동봉 `.env.example`에는 `LLM_PROVIDER=codex`가 들어 있습니다. 따라서 예시를 복사한 뒤에는 Codex가 선택됩니다. Gemini API를 사용하려면 로컬 `.env`에서 다음 항목을 설정합니다. 비어 있는 키는 본인의 실행 환경에서만 입력하고 커밋하지 마세요.
 
 ```env
+LLM_PROVIDER=gemini
 GEMINI_API_KEY=
 ```
 
@@ -597,13 +697,29 @@ codex --version
 claude --version
 ```
 
+두 CLI가 모두 필요한 것은 아닙니다. 선택한 백엔드만 준비하세요. `CODEX_COMMAND`/`CLAUDE_COMMAND`가 개인 절대 경로를 사용한다면 로컬 `.env`에만 두고 공유 문서·설정 예시에 복사하지 않습니다.
+
+**`.env.example`은 최근 실험의 완전한 재현 설정이 아닙니다.** 예를 들어 응답 캐시는 켜져 있고 제한적 Vision 추가 판독은 코드 기본값인 꺼짐을 사용합니다. 모델·추론 설정·캐시·복구 예산·동시성은 실제 실행의 매니페스트와 함께 기록해야 합니다. 이미 터미널에 지정한 환경변수와 `STAGE_PROVIDER_*`/`STAGE_MODEL_*`도 확인하세요. 모델 이름만 지정했다고 추론 강도가 자동으로 고정되지는 않습니다.
+
 ## 실행 방법
 
-### 기본 실행
+모든 명령은 저장소 루트에서 실행합니다. 아래 명령은 별도 표시가 없는 한 실제 모델을 호출하므로 사용량과 시간이 발생합니다. 먼저 작은 PDF로 연결을 확인하고, 실험마다 새로운 출력 이름을 사용하세요.
+
+### 기본 실행 — 별도로 준비한 입력 사용
 
 ```powershell
-py main.py "서울특별시_탄소중립계획.pdf" -o "서울_결과.xlsx"
+$inputPdf = ".\서울특별시_탄소중립계획.pdf"
+if (-not (Test-Path -LiteralPath $inputPdf)) {
+    throw "입력 PDF를 준비하고 실제 경로를 지정하세요: $inputPdf"
+}
+
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss_ffffff"
+New-Item -ItemType Directory -Path ".\output" -Force | Out-Null
+
+py main.py "$inputPdf" --output ".\output\서울_$stamp.xlsx" --retries 1
 ```
+
+백엔드·모델은 현재 로컬 설정을 사용합니다. `--retries 1`은 Supervisor의 실행 횟수를 제한하는 값이며, 개별 CLI/JSON 재시도·분할 복구·gap-fill을 모두 0회로 만드는 옵션이 아닙니다.
 
 ### 백엔드 선택
 
@@ -613,6 +729,35 @@ py main.py "서울특별시_탄소중립계획.pdf" --agent openai --agent-model
 py main.py "서울특별시_탄소중립계획.pdf" --agent codex -o "서울_결과.xlsx"
 py main.py "서울특별시_탄소중립계획.pdf" --agent claude -o "서울_결과.xlsx"
 ```
+
+위 네 명령은 선택 예시이며 한 번에 모두 실행할 필요는 없습니다. 단계별 오버라이드가 있으면 전역 `--agent`/`--agent-model`과 함께 실제 선택된 단계 모델을 확인해야 합니다.
+
+### 연결 수정 확인용 설정 예시
+
+다음은 로컬 `.env`에 적용할 수 있는 명시적 실험 설정의 일부입니다. 기존 같은 이름의 항목을 수정하며 중복 선언하지 않습니다. 공개 `.env.example`이나 코드를 자동으로 변경하는 내용은 아닙니다.
+
+```dotenv
+READING_PIPELINE_ENABLED=1
+TEXT_ROUTING_MODE=audit
+TEXT_INPUT_MODE=audit
+EXTRACTION_SHEET_CLUSTERING=0
+VISION_TOC_MODE=exclude
+
+# 기존 응답·체크포인트를 복원하지 않는 새 실행
+LLM_CACHE_ENABLED=0
+EXTRACTION_RESUME=0
+EXTRACTION_RETRY_FAILED_ONLY=0
+
+# 최근 연결 실험에서 사용한 1차 추출·Vision 모델
+STAGE_PROVIDER_EXTRACTION=codex
+STAGE_MODEL_EXTRACTION=gpt-5.6-luna
+STAGE_PROVIDER_VISION=codex
+STAGE_MODEL_VISION=gpt-5.6-luna
+```
+
+필요한 모델이 현재 자신의 실행 환경에서 제공되는지 확인해야 합니다. 위 블록에는 추론 강도, 추가 판독 예산, 모든 재시도·fallback 조건을 담지 않았으므로 과거 3시간 14분 실행의 완전한 재현 명세가 아닙니다. `VISION_REVIEW_ENABLED=1`로 제한 판독을 켤 때는 [객체·호출·시간 예산](docs/vision_triage_followup_plan.md)을 함께 정하세요. 텍스트 `audit`는 기록만 하며 최적화 후보를 실제 입력에서 제거하지 않습니다.
+
+현재 main.py의 A/B 규칙은 기존 실행에 연결되어 있으므로, 이 규칙을 사용하기 위해 별도 전체 PDF 실행기를 추가할 필요는 없습니다.
 
 ### 이미지 분석 제외
 
@@ -664,8 +809,8 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 | `--agent` | `gemini`, `openai`, `codex`, `claude`, `auto` 중 선택 |
 | `--agent-model` | 선택 백엔드 모델명 |
 | `--agent-timeout` | 로컬 에이전트 1회 호출 제한 시간(초) |
-| `-k`, `--api-key` | API 백엔드 키 |
-| `-r`, `--retries` | 품질 미달 시 전체 파이프라인 재시도 횟수 |
+| `-k`, `--api-key` | API 백엔드 키. 셸 기록 노출을 피하려면 실제 키는 로컬 환경파일/환경변수 사용 권장 |
+| `-r`, `--retries` | 최초 시도를 포함한 Supervisor 추출·정제 최대 시도 횟수. 개별 호출 재시도와 별개 |
 | `-v`, `--verbose` | 상세 로그 출력 |
 | `--no-images` | 이미지·그래프 분석 생략 |
 | `--max-images` | Vision 분석 이미지 수를 명시적으로 제한 |
@@ -684,15 +829,47 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 | `--no-hybrid-adjudication` | 후보 판정 생략 |
 | `--hybrid-auto-merge` | 안전 조건을 통과한 후보를 본 시트에 자동 병합 |
 
+## 실행 결과와 종료 코드
+
+| 산출물 | 용도 |
+|---|---|
+| `*.xlsx`, `마킹_*.pdf` | 최종 셀과 원문 근거 확인. 마킹은 설정·입력 형식에 따라 생성 |
+| `*_run_manifest.json` | 입력·코드·설정 지문, 단계별 시간·호출량 |
+| `*_run_outcome.json` | `file_saved`, `status`, 종료 코드 등 저장과 완료 상태 구분 |
+| `*_reading_pipeline.json` | 연결 적용·변경·보류 원행과 사유. 적용 건수는 최종 고유 저장 행 수와 다름 |
+| `*_vision_preflight.json` | 시각 후보·목차 판정·추가 판독 예산 감사 |
+| `*_text_audit.json` | 텍스트 입력·배정·호출 감사. 문자 수는 토큰 수가 아님 |
+| `*_visual_merge_input.json.gz` | 모델을 다시 호출하지 않는 후단 재생의 입력 스냅샷 |
+
+`main.py`의 종료 상태는 다음처럼 해석합니다.
+
+| 코드 | 의미 |
+|---|---|
+| `0` | 운영상 완료. 원문 정확도 100% 보장이 아님 |
+| `1` | 실행 오류 또는 중단 |
+| `2` | 실질 업무 행 없음 또는 평가 계약 오류 등. 결과 파일의 사유 확인 필요 |
+| `3` | 파일은 저장됐지만 보류·품질·미복구 등 검토 항목이 남음 |
+
+`verify_reading_excel_a.py`와 일부 응답 재생 도구의 종료 코드 `2`는 저장 후 차이/보류를 뜻합니다. 같은 숫자라도 모든 실행기의 의미가 같지는 않으므로 해당 안내문과 결과 JSON을 함께 확인하세요. `writer_passed=true` 역시 후단 데이터가 셀에 보존됐다는 뜻이지 PDF 사실 정확도 인증이 아닙니다.
+
 ## 중요한 설정
 
-`config.py` 또는 환경변수로 조정합니다.
+운영값은 로컬 `.env`·환경변수·지원되는 CLI 옵션으로 지정합니다. 아래 기본값은 **환경변수가 없을 때 공개 main의 `config.py` 값**이며, `.env.example`의 값 또는 과거 실험에서 사용한 값과 다를 수 있습니다. 모델·실험 조건을 바꾸려고 공유 코드의 기본값을 직접 수정할 필요는 없습니다.
 
 | 설정 | 기본값 | 설명 |
 |---|---:|---|
 | `LLM_PROVIDER` | `gemini` | 기본 LLM 백엔드 |
 | `GEMINI_VISION_MODEL` | `gemini-2.5-pro` | API 모드 vision(차트 판독) 기본 모델. 벤치마크 실측(0.976 vs flash-lite 0.707)으로 채택. 에이전트(codex/claude) 모드 vision에는 적용되지 않음 |
 | `CODEX_VISION_MODEL` | `gpt-5.6-luna` | 에이전트(codex) 모드 vision 기본 모델. 벤치마크 실측(리콜 0.963, 환각 0)으로 채택. 빈 값이면 CLI 기본 모델 |
+| `READING_PIPELINE_ENABLED` | `True` | 기존 Organizer에 A/B 형식·의미 연결 규칙 적용 및 원행 감사 |
+| `REFERENCE_ENRICHMENT_ENABLED` | `True` | 부록 CSV 조회 보완. 격리 Excel 검증기는 자체 프로세스에서만 끔 |
+| `TEXT_ROUTING_MODE` / `TEXT_INPUT_MODE` | `audit` | `off/audit/optimize`. 기본은 배정·입력을 변경하지 않는 기록 모드 |
+| `TEXT_CLUSTER_MEMBER_RETRIES` | `1` | 묶음에서 누락·실패한 시트만 단독 복구하는 상한 |
+| `VISION_TOC_MODE` | `exclude` | 확인된 목차 후보를 호출 전에 제외하고 근거를 기록 |
+| `VISION_REVIEW_ENABLED` | `False` | 근거 부족 시각 객체의 제한적 추가 판독 |
+| `VISION_REVIEW_MAX_OBJECTS` / `VISION_REVIEW_MAX_CALLS` | `16` / `16` | 추가 판독의 객체·예약 호출 상한. 일반 후보 전체의 상한이 아님 |
+| `VISION_REVIEW_MAX_PER_PAGE` | `1` | 추가 판독 페이지별 객체 상한 |
+| `VISION_REVIEW_MAX_SECONDS` / `VISION_REVIEW_CALL_TIMEOUT` | `600` / `120` | 추가 판독 누적 예산 / 개별 호출 제한(초). 예산 0은 추가 판독 금지 |
 | `VISUAL_MERGE_LABELED_ENABLED` | `True` | 라벨 기반 시각 판독값의 게이트 병합. 3지자체 실측(값 오병합 0)으로 기본 활성 |
 | `VISUAL_EVIDENCE_MERGE_ENABLED` | `True` | 객체 원장이 있는 실행에서 단일 `근거ID`와 단일 `extracted` 객체가 정확히 일치한 후보만 자동 병합 |
 | `GEMINI_REQUEST_TIMEOUT_SECONDS` | `180` | Gemini SDK 요청 1회 타임아웃. 초 단위 env 값을 SDK에는 ms로 전달 |
@@ -736,7 +913,7 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 | `SEMANTIC_ROUTING_AUTO_RECLASSIFY` | `True` | 안전한 미래연도 배출현황→전망 오배치만 자동 재분류 |
 | `SEMANTIC_ROUTING_ALLOWED_SCORE_DELTA` | `1.5` | 객체의 최고 후보와 함께 허용할 복수 시트 점수 차이 |
 | `SEMANTIC_ROUTING_MAX_ALLOWED_TARGETS` | `3` | 한 객체에 기록할 허용 시트 최대 수 |
-| `SEMANTIC_OVEREXTRACTION_GUARD_ENABLED` | `True` | `06·12`의 명백한 중복·무식별 행을 삭제 대신 내부 검토 원장으로 격리 |
+| `SEMANTIC_OVEREXTRACTION_GUARD_ENABLED` | `True` | 중복·무식별 행의 보수적 격리. 별도 예산 오배치 연결 검증 등과 구분 |
 | `EVALUATION_MANIFEST_PATH` | `data/evaluation/benchmark_manifest.json` | 고정 개발/홀드아웃 평가 계약 |
 | `QUALITY_THRESHOLD` | `70` | 근거성·필드·출처·정합성·핵심시트·추출성공률 기반 품질 통과 기준 |
 | `QUALITY_MAX_WITHOUT_SOURCE_INVENTORY` | `95` | 원문 전체 객체 인벤토리 미연결 상태의 점수 상한 |
@@ -768,16 +945,21 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 | `DATA_STATUS_ENABLED` | `True` | 데이터 시트에 `데이터상태` 컬럼 추가 |
 | `CODEBOOK_SHEET_ENABLED` | `True` | `90_코드북` 시트 생성 |
 
+동봉 `.env.example`은 Vision 복구 깊이/객체 시도 상한을 `2/3`으로 지정하지만 코드 기본값은 `6/7`입니다. 캐시 기본값 `True`도 무캐시 평가 조건과 다릅니다. 제한적 추가 판독과 일반 Vision 복구는 별도 정책이며, V9의 전용 타임아웃·배치 기본값을 이 main 설정표에 섞어 적용하지 않습니다.
+
 ## 프로젝트 구조
 
+주요 파일만 표시한 구조입니다. `output/`과 원본 PDF는 사용자가 실행하면서 별도로 준비·생성합니다.
+
 ```text
-2026_GovReport_Analyzer/
+2026_GovReport_Analyzer_Public/
 ├─ main.py                    # CLI 진입점
 ├─ config.py                  # 백엔드, 배치, 라우팅, quota, 검수 설정
 ├─ carbon_guideline.md        # 환경부 가이드라인 기반 보조 지침
 ├─ data/
 │  ├─ appendix3_reduction_units.csv  # 부록3 감축원단위 114건
 │  ├─ appendix4_projects.csv         # 부록4 표준 사업목록 507건
+│  ├─ reading_mapping_rules_v1.json  # 판독 연결의 명시 규칙
 │  ├─ evaluation/
 │  │  └─ benchmark_manifest.json     # 개발용·홀드아웃 평가 파일/해시 계약
 │  └─ golden/                        # 고정 골든셋과 시각요소 인벤토리
@@ -794,6 +976,15 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 ├─ utils/
 │  ├─ llm_client.py           # LLM 호출, JSON 파싱, quota 대기, 재시도
 │  ├─ llm_cache.py            # 성공 응답 캐시
+│  ├─ local_process.py        # 로컬 CLI 타임아웃·프로세스 트리 종료
+│  ├─ reading_pipeline.py     # 운영 Organizer와 판독 A/B 규칙 연결
+│  ├─ reading_compatibility.py # A 형식 호환·원문 보존
+│  ├─ reading_semantic_binding.py # B 의미 연결·충돌·보류
+│  ├─ reading_cell_validation.py # 저장 전후 행·셀 보존 검증
+│  ├─ reading_financial_period.py # 금액·기간 합계 계약
+│  ├─ reading_context_facts.py # 지역·정성·조직·원단위 문맥
+│  ├─ text_optimization.py    # 텍스트 배정·입력 감사와 독립 최적화
+│  ├─ vision_review.py        # 제한적 추가 판독의 예산 관리
 │  ├─ parallel.py             # 순서 보존 병렬 실행/실패 수집
 │  ├─ pdf_reader.py           # PDF 파싱
 │  ├─ hwp_reader.py           # HWP/HWPX 파싱(kordoc)
@@ -811,6 +1002,13 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 │  │                          #   (보조 모듈 vision_benchmark_*.py)
 │  ├─ reclean_offline.py      # 저장된 원시 추출로 organizer만 재실행(정제 A/B, 토큰 0)
 │  ├─ run_ab_validation.py    # A/B 검증 리포트 생성
+│  ├─ run_text_optimization_ab.py # Vision을 끈 텍스트 독립 A/B
+│  ├─ preflight_text.py       # 무호출 텍스트 배정·입력 사전 점검
+│  ├─ preflight_vision.py     # 무호출 시각 후보·추가 판독 사전 점검
+│  ├─ run_reading_compatibility_a.py # 저장 판독 입력의 형식 호환
+│  ├─ run_reading_semantic_b.py # 저장 판독 입력의 의미 연결
+│  ├─ verify_reading_excel_a.py # 실제 Organizer·Excel 저장 검증
+│  ├─ replay_reading_pipeline.py # 저장 스냅샷의 후단 재생
 │  ├─ build_reference_data.py # 부록 CSV 생성(1회, 경계 검증 내장)
 │  └─ verify_routing_coverage.py
 └─ tests/                     # 신뢰성·기능 계약 회귀 테스트
@@ -818,11 +1016,21 @@ py main.py "서울특별시_탄소중립계획.pdf" --sheet-closed-loop --hybrid
 
 ## 테스트
 
-300개 이상의 테스트가 v4의 신뢰성 계약, v5의 기능 계약, v6의 측정·병합 계약과 고정 평가 계약을 함께 검증합니다.
+회귀 테스트는 호출·복구, 판독 연결, 의미 계약, 실제 셀 보존, 골든 채점을 구분합니다. 과거 기록의 `passed` 수는 당시 선택한 파일·환경의 결과이며, 현재 공개본 전체 테스트를 새로 통과했다는 의미가 아닙니다.
+
+우선 아래 합성 입력 중심의 빠른 회귀검증을 실행할 수 있습니다. 원본 PDF 전체 판독이나 모델 실호출은 하지 않습니다.
 
 ```powershell
-python -m pytest tests/ -q
+py -m pytest tests/test_reading_pipeline_integration.py tests/test_reading_full_run_regressions.py tests/test_text_optimization.py tests/test_local_process.py -q
 ```
+
+전체 테스트는 필요한 평가 fixture와 의존성을 갖춘 환경에서 실행합니다.
+
+```powershell
+py -m pytest tests/ -q
+```
+
+공개 `main`에는 `data/evaluation/visual_regression_p0_v1`이 없어 `tests/test_visual_regression_fixture.py` 등 해당 자료에 의존하는 테스트를 그대로 재현할 수 없습니다. 별도 실행 산출물이 필요한 검증도 입력을 준비해야 합니다. 자료 누락 오류를 코드 통과로 처리하거나, 일부 테스트를 제외한 결과를 전체 통과로 표시하지 않습니다.
 
 주요 테스트 역할은 다음과 같습니다.
 
@@ -847,45 +1055,72 @@ python -m pytest tests/ -q
 | 시각 병합 게이트·경로 | `tests/test_visual_merge_labeled.py`, `tests/test_visual_schema_extension.py`, `tests/test_m24*_*.py` |
 | 소수정 일반화 회귀 | `tests/test_v53_organizer_generalization.py`, `tests/test_v63_minor_fixes.py` |
 | 오프라인 재정제 | `tests/test_reclean_offline.py` |
+| A 형식 호환·B 의미 연결·셀 보존 | `tests/test_reading_compatibility.py`, `tests/test_reading_semantic_binding.py`, `tests/test_reading_cell_validation.py` |
+| 운영 통합·전체 실행에서 발견한 회귀 | `tests/test_reading_pipeline_integration.py`, `tests/test_reading_full_run_regressions.py` |
+| 금액·기간·지역·정성·계획/연도 연결 | `tests/test_reading_financial_period.py`, `tests/test_reading_context_facts.py`, `tests/test_reading_plan_year_budget.py` |
+| 제한 판독 예산·CLI 종료·시각 문맥 | `tests/test_vision_review_budget.py`, `tests/test_local_process.py`, `tests/test_visual_reading_context.py` |
+| 텍스트 입력·배정·독립 A/B | `tests/test_text_optimization.py`, `tests/test_text_optimization_ab.py` |
 
 ## 검증과 운영 팁
 
-### 라우팅 최적화 검증
+### 텍스트 입력·배정 사전 점검
 
-라우팅 기본값을 더 공격적으로 바꾸기 전에는 정답지 기반 커버리지 검증을 먼저 통과해야 합니다.
+최적화를 활성화하기 전, 모델 호출 없이 `baseline/audit/optimized/clustered`의 루트 작업 수·문자 수·시트-페이지 배정을 비교합니다. PDF는 직접 준비해야 합니다.
 
 ```powershell
-py scripts/verify_routing_coverage.py "서울특별시_탄소중립계획_정리.xlsx" "서울특별시_탄소중립계획.pdf"
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss_ffffff"
+py scripts/preflight_text.py ".\서울특별시_탄소중립계획.pdf" `
+  --golden ".\data\golden\서울특별시_골든셋_v1_초벌.xlsx" `
+  --output ".\output\text_preflight_$stamp.json"
 ```
+
+골든 기반 점검도 원문에서 찾은 문자열의 배정 유지 검사이며, 최종 셀 정확도 검사가 아닙니다. 루트 호출 감소량에는 실제 재시도·재귀 분할 호출이 포함되지 않습니다.
 
 ### A/B 비교
 
-설정 변경 전후의 출력 차이를 기록하려면 A/B 하네스를 사용합니다.
+여기서 A/B 실험은 **조건 A와 조건 B 비교**입니다. 판독 연결의 **A단계 형식 호환·B단계 의미 연결**과 이름만 같고 다른 개념입니다.
+
+텍스트는 Vision과 분리해 비교합니다. 먼저 드라이런으로 입력·환경·명령을 확인하세요.
 
 ```powershell
-py scripts/run_ab_validation.py "서울특별시_탄소중립계획.pdf" --output-dir output/ab
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss_ffffff"
+py scripts/run_text_optimization_ab.py ".\검증표본.pdf" `
+  --experiment clustering --routing-mode audit --input-mode audit `
+  --agent codex --agent-model gpt-5.6-luna `
+  --output-dir ".\output\text_ab_plan_$stamp" --dry-run
 ```
 
-골든셋이 있으면 기존 라우팅 커버리지 검증과 함께 스니펫·구조 결과 xlsx 각각을 채점합니다. A/B 리포트에는 `골든셋 채점 — 스니펫`, `골든셋 채점 — 구조` 섹션이 추가되고, 세부 리포트는 같은 출력 디렉터리의 `golden_score_*.md/json`에 저장됩니다.
+실호출은 `--dry-run`을 빼고 **새 출력 폴더**로 실행합니다. 기본 무캐시·독립 원장 조건이며, Vision·GapFill·보조검수 등을 끈 텍스트 실험이므로 전체 파이프라인 시간과 직접 비교하지 않습니다. 입력/배정 최적화는 `--experiment inputs`로 별도 비교합니다. 상세 조건은 [텍스트 최적화 안내](docs/text_optimization.md)를 따르세요.
+
+기존 `run_ab_validation.py`는 가이드라인 스니펫/구조 주입 비교 도구입니다. 위 텍스트 묶음 실험과 구분하며, 다음 명령은 모델을 실제 호출합니다.
 
 ```powershell
-py scripts/run_ab_validation.py "서울특별시_탄소중립계획.pdf" `
-  --golden data/golden/서울특별시_골든셋_v1.xlsx `
-  --output-dir output/ab
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss_ffffff"
+py scripts/run_ab_validation.py ".\검증표본.pdf" `
+  --output-dir ".\output\guideline_ab_$stamp"
 ```
+
+골든 채점을 함께 실행하려면 표본 범위와 헤더 계약이 맞는 `--golden`을 지정합니다. 전체 골든을 작은 발췌본의 평가 분모로 그대로 사용하지 않습니다.
 
 ### 골든셋 채점
 
-파이프라인 출력 xlsx와 사람이 확정한 골든셋 xlsx를 LLM 호출 없이 대조합니다. 골든셋은 1행 헤더 형식이어야 하며, `00_문서메타`를 제외한 01~15 시트에는 계약 컬럼 뒤에 `골든_출처유형`, `골든_출처페이지`, `골든_채점제외`, `골든_비고`를 붙입니다.
+파이프라인 출력 xlsx와 평가용 골든셋 xlsx를 LLM 호출 없이 대조합니다. 동봉 서울 파일은 개발용 **초벌 골든**이며, 모든 원문 사실을 빠짐없이 포함한 완전한 정답이라고 가정하지 않습니다. 골든은 1행 헤더 형식이어야 하며, `00_문서메타`를 제외한 01~15 시트에는 계약 컬럼 뒤에 `골든_출처유형`, `골든_출처페이지`, `골든_채점제외`, `골든_비고` 등 채점 메타데이터를 둡니다.
+
+아래는 실행 형식입니다. 결과 파일은 실제 경로로 바꿔야 하고, 실행 전에 골든·출력·채점기의 열 계약이 맞는지 확인해야 합니다.
 
 ```powershell
-py scripts/score_against_golden.py output/서울_결과.xlsx data/golden/서울특별시_골든셋_v1.xlsx `
-  --report-dir output `
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss_ffffff"
+py scripts/score_against_golden.py ".\output\서울_결과.xlsx" ".\data\golden\서울특별시_골든셋_v1_초벌.xlsx" `
+  --report-dir ".\output\golden_score_$stamp" `
   --label 서울_기준선 `
   --json
 ```
 
+**최근 48.48% 등의 비교는 기존 골든 열을 고정한 분석 계약으로 재채점한 값입니다.** 현재 main의 일반 채점기는 확장된 출력 스키마에도 의존하므로 위 명령과 동봉 초벌 골든만으로 그 수치를 그대로 재현한다고 보장하지 않습니다. 헤더 오류가 나면 원본 골든을 임의로 수정하거나 열을 버리지 말고, 평가 전용 복사본·채점 계약·분모를 명시해 검증해야 합니다. 계약이 다른 점수는 같은 표에 섞어 개선율을 계산하지 않습니다.
+
 리포트에는 시트별 리콜·정밀도·값일치율, 엄격/완화 매칭 수, 텍스트 유래와 시각 유래 출처유형별 분해, 미매칭 상세, 값 불일치 상세, 출처페이지 교집합 참고 통계가 포함됩니다. 점수 자체는 실패 게이트가 아니며, 파일·형식 오류가 있을 때만 비정상 종료합니다.
+
+‘누락’은 적용한 엄격/완화 매칭 규칙에서 대응 행을 찾지 못했다는 뜻입니다. 근접후보의 실제 동일 사실 여부, 골든에 없는 올바른 추가 행, 단위·배율이 틀린 행을 별도로 원문 확인해야 합니다. 행 재현율·정밀도·매칭 행 값일치율·전체 셀 정확도의 분모도 구분합니다.
 
 ### 시각 요소 인벤토리 리콜 감사
 
@@ -905,11 +1140,13 @@ py scripts/audit_visual_inventory.py audit `
 
 리포트는 `visual_inventory_audit_*.md/json`으로 저장되며 요소별 상태(`이미지_미추출`, `triage_탈락`, `참고자료_제외`, `vision_유실`, `동일페이지_부분기록`, `기록됨`), 유형별 리콜, `IMAGE_TRIAGE_MIN_SCORE={3,4,5,6}` 및 `VECTOR_RENDER_MIN_DRAWINGS={30,45,60}` 민감도 표를 포함합니다. dump 초안은 파이프라인이 본 후보만 나열하므로 사람이 원문 PDF를 넘기며 통째로 누락된 요소를 직접 추가해야 최종 인벤토리가 됩니다.
 
-### 캐시
+### 캐시·중단 복구·저장 응답 재생
 
-성공한 LLM 응답은 `.cache/llm_responses`에 저장됩니다. 같은 프롬프트·모델·이미지 조합은 재사용되므로 재실행 비용이 줄어듭니다. 실패 응답은 캐시하지 않습니다.
+`LLM_CACHE_ENABLED=1`이면 성공한 LLM 응답을 `.cache/llm_responses`에 저장합니다. 요청 지문이 같은 응답을 재사용하지만, 이것만으로 모든 성공 배치의 복원이 보장되지는 않습니다. 실패 응답은 성공 캐시로 취급하지 않습니다.
 
-긴 실행이 중간에 멈췄다면 같은 `LLM_CACHE_DIR`을 유지한 채 같은 입력·모델·옵션으로 재실행하세요. 성공했던 호출은 캐시에서 재사용되고, 실패했거나 캐시되지 않은 구간만 다시 호출되는 보충런 패턴으로 이어갈 수 있습니다.
+- 배치 복원은 `RUN_STATE_DIR`과 `--resume` 또는 `--retry-failed-only`가 담당합니다. 입력·코드·설정 지문이 달라지면 기존 상태를 그대로 복원할 수 없으며, 선택 복구도 필요한 범위에서는 모델을 호출합니다.
+- 연결 코드만 평가할 때는 저장된 `*_visual_merge_input.json.gz` 등을 해당 재생 도구로 읽습니다. 원본 응답을 고치지 않고 새 결과·차이를 남깁니다. 안내: [운영 연결 및 재생](scripts/README_reading_pipeline.md).
+- 무캐시 새 판독과 저장 응답 후단 재생은 다른 실험입니다. 모델 호출 시간과 결정론적 후단 실행 시간을 따로 기록합니다.
 
 ### 실행 시간 로그
 
@@ -919,7 +1156,7 @@ py scripts/audit_visual_inventory.py audit `
 
 ### `JSON 파싱 실패`
 
-응답에 설명이 섞이거나 JSON이 깨진 경우입니다. 현재는 1회 재요청 후에도 실패하면 원장과 검증리포트에 남깁니다. 반복된다면 `BATCH_SIZE`를 낮추는 것이 안전합니다.
+응답에 설명이 섞이거나 JSON이 깨진 경우입니다. 설정된 재시도·분할·복구 상한 안에서 재처리하고, 해결되지 않은 범위는 원장과 검증리포트에 남깁니다. 반복된다면 실패 입력 크기·배치 구성·모델 응답을 확인하세요. 타임아웃만 늘리거나 배치를 과도하게 쪼개면 총 호출량과 시간이 오히려 증가할 수 있습니다.
 
 ### `원장 호출실패` 또는 `원장 파싱실패`
 
@@ -948,6 +1185,18 @@ Codex/Claude 로컬 에이전트에서 quota나 세션 한도가 감지되면 �
 - HWP/HWPX 입력은 텍스트·표 중심이며 PDF 이미지 분석과 동일한 수준의 이미지 추출을 보장하지 않습니다.
 - 지도형 시각화와 수치가 없는 그래프는 자동 판독 신뢰도가 낮습니다.
 - opt-in 최적화는 반드시 A/B 검증 후 사용해야 합니다.
+- 최근 전체 실행에는 재정 계획 문맥 누락에 따른 보류와 천 단위 배율 판독 오류 등이 남아 있습니다. 소표본 회귀 통과만으로 전체 PDF의 회귀 해소를 주장하지 않습니다.
+- 근거 부족 행을 보류하면 잘못된 자동 반영은 줄일 수 있지만 실제 정답도 최종 셀에서 빠질 수 있습니다. 보류 원행·사유·최종 셀을 함께 평가해야 합니다.
+- 자동 품질 점수, 파일 저장 성공, 모든 배치의 운영상 완료는 원문 대비 사실 정확도와 다릅니다.
+- V9의 성능·평가 개선은 별도 비교 대상이며 현재 main에 모두 반영된 것이 아닙니다.
+
+## 공개 배포 시 확인 사항
+
+- 공개용 파일을 별도로 선별하고 `.env`, 인증 정보, 개인 경로, 원본·결과 데이터의 공개 권한을 확인합니다. `.env.example`에는 실제 키와 개인 CLI 경로를 넣지 않습니다.
+- 현재 파일에서 민감정보를 지워도 과거 Git 이력에서 제거되는 것은 아닙니다. 개발 저장소의 브랜치·태그·전체 이력을 그대로 전송하지 말고 공개용 파일 스냅샷을 검토합니다. 이미 노출된 키는 이력 정리와 별도로 폐기·재발급해야 합니다.
+- `git status --short`, `git diff --cached --stat`, `git diff --cached`로 게시 대상만 확인한 뒤 커밋합니다. 전체 작업 폴더를 확인 없이 `git add .`로 올리지 않습니다.
+- `.gitignore`에는 기존 규칙과 함께 `outputs/`, `.agents/`, `.env.*` 및 안전한 예제 파일 예외(`!.env.example`)도 필요 여부를 점검합니다. **이 README 수정 자체가 `.gitignore`를 변경하거나 기존 추적 파일을 해제하지는 않습니다.**
+- V9 공개 후에는 상단 브랜치 표에 실제 원격 브랜치·커밋·검증 범위를 갱신합니다. 별도 브랜치 공개를 main 병합이나 성능 검증 완료로 표시하지 않습니다.
 
 ## 변경 이력 요약
 
@@ -960,7 +1209,7 @@ Codex/Claude 로컬 에이전트에서 quota나 세션 한도가 감지되면 �
 - v8 (2026-08-01 ~ 08-20): `DocumentObject` 기반 선택적 OCR/VLM, 객체별 적응형 복구, 근거 ID 병합 계약 v3, 무API 병합 A/B, 문서 비종속 목차·본문 라우팅, v7 추출 충실도 선별 통합, 시각 계약·고정 회귀 fixture, 물리 객체 계보, 의미 스키마·과잉 추출 격리, 부분 체크포인트 보존, singleflight·capacity 회로, 보수적 시트 클러스터링 A/B를 통합
 - v8 성능·연결 후속 (2026-08-26 ~ 09-18): 제한 Vision 복구와 텍스트 A/B, 판독 A 형식 호환/B 의미 연결, 실제 Excel 저장 검증, 단위·기간·지역·정성 계약을 추가하고 기존 main.py에 연결
 - v8 안정화·평가 후속 (2026-09-19 ~ 09-22): CLI 프로세스 종료·부분 실패 전파, 제한적 Vision 판독·응답 재사용, 조직 문맥·동일 사실 식별, 목차 호출 제외, 텍스트 감사·독립 최적화, 고정 응답 연결 복구·선택 재판독 검증. 최신 전체 실행은 3시간 14분 07초·골든 셀 정확도 48.48%로 속도 개선과 정확도 회귀를 함께 기록
-- V9 비교 상태 (2026-09-22): `origin/feat/v9-integration`의 구현·평가 개선을 분석한 상태이며 현재 작업 브랜치에 전체 통합하지 않음. 고정 평가 계약과 저장 응답 회귀검증 후 선별 도입 대상으로 유지
+- V9 비교 상태 (2026-09-22): 개발 `origin/feat/v9-integration`의 구현·평가 개선을 분석했으며 공개 main에 전체 통합하지 않음. 공개용 `codex/v9-public-snapshot`의 로컬 작업 폴더 준비는 확인했으나 원격 공개는 문서 작성 시점에 미확인. 고정 평가 계약과 저장 응답 회귀검증 후 선별 도입 대상으로 유지
 
 <details>
 <summary><b>이전 버전 업데이트 기록 전문</b> (내용 보존용)</summary>
