@@ -12,24 +12,19 @@ import io
 import json
 import re
 import threading
-import time
 from collections.abc import Sequence
-from dataclasses import dataclass
 
 import config
-from utils.reading_pipeline import instruction as reading_instruction
-from utils.visual_reference import reference_keyword_hits
 from agents.organizer_agent import _IPCC_GAS_NAMES, _gas_sector_key
 from utils.document_objects import DocumentObject, build_document_objects
 from utils.evidence_merge import (
     EvidenceMatch,
     build_evidence_catalog,
+    match_evidence,
     normalize_evidence_ids,
-    resolve_observation_evidence,
 )
 from utils.pdf_reader import PDFContent, PageContent
 from utils.object_routing import deduplicate_evidence_objects
-from utils.physical_objects import normalize_object_ids
 from utils.selective_ocr import (
     apply_triage_metadata,
     build_triage_plan,
@@ -42,7 +37,6 @@ from utils.selective_ocr import (
 from utils import llm_client
 from utils.parallel import parallel_map_collect
 from utils.run_state import RunState
-from utils.vision_review import ReviewBudget, candidate_manifest, promote_review_candidates
 from utils.vision_recovery import (
     ObjectOutcomeLedger,
     has_usable_table_value,
@@ -81,7 +75,7 @@ DePlot 방식처럼 그래프 이미지를 먼저 선형화된 표 데이터로 
 규칙:
 1. 막대그래프, 꺾은선그래프, 영역그래프, 원그래프, 데이터 표뿐 아니라 diagram, infographic, flow, strategy_map, risk_map, risk_matrix도 구조화하세요.
 2. 일반 사진, 로고, 장식, 데이터가 없는 홍보물만 type을 "해당없음"으로 반환하세요. 기후위험·취약성 지도, 리스크 행렬, 전략 체계도, 단계 흐름도는 구조화 대상입니다.
-3. target_sheet는 regional_conditions, emissions_regional, emissions_management, emissions_forecast, reduction_targets, vision_strategy, mitigation_projects, financial_plan, foundation_measures, governance_feedback, other 중 하나로 분류하세요.
+3. target_sheet는 regional_conditions, emissions_regional, emissions_management, emissions_forecast, reduction_targets, vision_strategy, mitigation_projects, financial_plan, foundation_measures, other 중 하나로 분류하세요.
 - 온실가스 배출·흡수 전망(BAU, 목표 시나리오, 배출량 추계) 차트는 forecast로 분류하세요. 기후 시나리오(SSP·RCP 등의 기온·강수 전망), 영향·취약성·리스크 자료는 foundation으로 분류하세요.
 - 감축목표 차트(기준연도 대비 목표배출량·감축량·감축률, 부문별 목표)는 target으로 분류하세요.
 4. 단위가 "천 tCO2eq", "천톤CO2eq"이면 unit에 그대로 적고 값은 이미지에 보이는 숫자 그대로 반환하세요.
@@ -100,14 +94,6 @@ DePlot 방식처럼 그래프 이미지를 먼저 선형화된 표 데이터로 
 16. 구조 도표는 수치가 없어도 노드·단계·관계를 행 단위로 분리하고 fields에 구조역할, 상위항목, 관계, 순서, 단계, 담당주체, 설명을 기록하세요.
 17. 전략 체계도는 target_sheet=vision_strategy, 기후위험 지도·리스크 행렬은 foundation_measures, 지역 현황 인포그래픽은 regional_conditions로 분류하세요.
 18. 구조를 읽을 수 있지만 기존 시트에 안전하게 매핑할 수 없으면 target_sheet=other로 두고 내용을 버리지 마세요.
-19. 캡션, X축, Y축, 범례를 서로 섞지 말고 각각 caption, x_axis, y_axis, legend에 원문 그대로 기록하세요.
-20. 각 값 행이 범례 계열에서 왔으면 fields.범례항목, 축 범주에서 왔으면 fields.축항목에 해당 라벨을 그대로 기록하세요.
-21. 배출 총량, 기준연도 대비 증가량·감축량, 비율, 원단위를 서로 바꾸지 마세요. fields.값역할에 배출전망|증가량|감소량|비율|원단위를 구분하고, 대비 기준은 fields.기준연도 또는 기준기간에 보존하세요. 증가량을 총량 전망값으로 반환하지 마세요.
-22. 소계·합계·표 머리글·주관부서·상위 과제를 개별 사업명으로 만들지 마세요. fields.정보유형=성과집계|메타데이터|상위과제 및 구조역할·상위항목으로 구분하여 원문을 보존하세요. 사업 관리번호가 보이면 fields.관리번호에 함께 기록하세요.
-23. 같은 사업의 세대수·면적·감축량·원단위·달성도 구간은 서로 다른 측정항목입니다. 각 행의 fields.측정항목, 범례항목, 축항목, 기간원문을 보존하고 사업명만으로 묶지 마세요.
-24. 예산표의 계·국비·시비 등은 fields.재원구분에 원문대로 기록하세요. 같은 연간 금액이 합계와 시비에 각각 있어도 둘의 역할은 다릅니다. 표에 재원 머리글이 있는데 연결이 불명확하면 미표기로 단정하지 말고 불확실성을 기록하세요.
-25. 사업명 원문을 동의어로 재작성하지 마세요. 명칭이 다르면 같은 사업이라고 추측하지 말고 관리번호·행 위치·근거 문구를 보존하세요. 동일 사실을 다른 항목명으로 중복 출력하지 마세요.
-26. 조직 구성·기능은 governance_feedback으로 분류하고 fields.거버넌스기구를 명시하세요. 위원수는 정보유형=기관구성, 측정값·측정단위·항목원문(합계/위촉/당연 등)으로 구분하고, 조직기능은 정보유형=조직기능, 역할·값원문에 실제 기능 문구를 동일하게 보존하세요. 구성요소명은 항목·구성요소원문, 담당 부서는 담당부서에 기록하며 서로 다른 기능은 별도 행으로 유지하세요. 상위기관·구성경로는 명시 관계만 기록하고 없는 연도나 지역을 만들지 마세요. 지역 근거는 _reading.문맥 구분 또는 객체문맥으로 전달하고, 인쇄된 표 번호가 있으면 각 행의 fields.표ID에 반복하여 표별 적용범위를 식별하세요. 구조 도표라는 이유만으로 곧바로 업무 행에 승인되지는 않습니다.
 
 시트별 fields 예시:
 - vehicle: {"용도": "승용", "차종": "전기", "대수": 123, "주행거리": 45.1}
@@ -132,38 +118,6 @@ NEGATIVE_REVALIDATION_SYSTEM = """당신은 탄소중립 보고서의 시각자�
 보이는 텍스트·수치·단위·노드·관계만 기록하고 추측하거나 계산하지 마세요.
 실제로 사진·로고·장식·데이터 없는 홍보물이면 type을 해당없음으로 유지하세요.
 반드시 JSON만 반환하세요."""
-
-
-class VisionBatchContractError(llm_client.LLMCallError):
-    """A batch response that contains usable rows but misses object indexes."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        partial_rows: list[dict],
-        unresolved_indexes: list[int],
-    ) -> None:
-        super().__init__(message)
-        self.partial_rows = partial_rows
-        self.unresolved_indexes = unresolved_indexes
-
-
-@dataclass
-class VisionTaskResult:
-    """Keep batch completeness separate from the successful rows it contains."""
-
-    rows: list[dict]
-    complete: bool = True
-    error: str = ""
-
-
-class VisionQuotaError(llm_client.LLMQuotaExceededError):
-    """Stop the queue on quota without losing already recovered sibling rows."""
-
-    def __init__(self, message: str, partial_rows: list[dict]) -> None:
-        super().__init__(message)
-        self.partial_rows = partial_rows
 
 
 _NEGATIVE_VISUAL_TYPES = frozenset({"해당없음", "not_relevant", "none", "irrelevant"})
@@ -213,6 +167,32 @@ def _negative_revalidation_signals(image: dict) -> list[str]:
     ):
         propagated.append("caption:numeric_data")
     return list(dict.fromkeys(propagated))
+
+
+def _vision_batch_size() -> int:
+    """vision 배치 크기 — 로컬 에이전트 백엔드는 IMAGE_ANALYSIS_BATCH_SIZE_LOCAL_AGENT를 쓴다."""
+    if llm_client.is_local_agent_provider("vision"):
+        value = getattr(config, "IMAGE_ANALYSIS_BATCH_SIZE_LOCAL_AGENT", 4)
+    else:
+        value = getattr(config, "IMAGE_ANALYSIS_BATCH_SIZE", 8)
+    return max(1, int(value or 1))
+
+
+def _candidate_metrics(pages_with_images: list[tuple[PageContent, dict]]) -> dict:
+    """게이트 보조 관찰용 vision 후보 집계(총수·렌더 변형별·배치 수)."""
+    by_variant: dict[str, int] = {}
+    for _page, image in pages_with_images:
+        variant = str(image.get("render_variant") or image.get("source_kind") or "embedded")
+        by_variant[variant] = by_variant.get(variant, 0) + 1
+    batch_size = _vision_batch_size()
+    metrics = {
+        "vision_candidates_total": len(pages_with_images),
+        "vision_batch_size": batch_size,
+        "vision_batches_total": -(-len(pages_with_images) // batch_size) if pages_with_images else 0,
+    }
+    for variant, count in sorted(by_variant.items()):
+        metrics[f"vision_candidates_variant.{variant}"] = count
+    return metrics
 
 
 def _is_relevant_image(image: dict) -> bool:
@@ -646,7 +626,7 @@ def _is_reference_chart(analysis: dict) -> bool:
         str(analysis.get(k, "") or "")
         for k in ["title", "summary", "unit", "chart_type"]
     ).casefold()
-    return bool(reference_keyword_hits(text, config.IMAGE_CHART_REFERENCE_KEYWORDS))
+    return any(keyword.casefold() in text for keyword in config.IMAGE_CHART_REFERENCE_KEYWORDS)
 
 
 def _is_table_like_chart(analysis: dict) -> bool:
@@ -664,43 +644,6 @@ def _has_chart_value(item: dict) -> bool:
             "석유_비에너지유", "가스", "전력", "열", "신재생",
         ]
     )
-
-
-def _has_explicit_function_text(item: dict, target_sheet: str) -> bool:
-    """A typed organization function is a value, even without a numeric cell.
-
-    This only removes numeric/year penalties. It does not approve the region,
-    target sheet, evidence, confidence, or semantic contract for final storage.
-    """
-    if not getattr(config, 'READING_PIPELINE_ENABLED', True) or target_sheet != 'governance_feedback':
-        return False
-    fields = item.get('fields')
-    if not isinstance(fields, dict) or fields.get('정보유형') != '조직기능':
-        return False
-    if not isinstance(fields.get('거버넌스기구'), str) or not fields['거버넌스기구'].strip():
-        return False
-    if _has_chart_value(item) or fields.get('측정값') is not None:
-        return False  # Mixed quantitative/function contracts need review.
-    envelope = fields.get('_reading', {})
-    if not isinstance(envelope, dict):
-        return False
-    if envelope.get('레코드분류', 'text_fact') != 'text_fact':
-        return False
-    if envelope.get('값상태', '정성표기') != '정성표기':
-        return False
-    originals = [x for x in (fields.get('값원문'), envelope.get('값원문')) if x not in (None, '')]
-    if not originals:
-        originals = [fields.get('설명')]
-    if not all(isinstance(x, str) and x.strip() for x in originals):
-        return False
-    if len({x.strip() for x in originals}) != 1:
-        return False
-    text = originals[0].strip()
-    if re.sub(r'\s+', '', text).casefold() in {'-', '–', '—', '미표기', '미확인', '판독불가', '확인불가', '없음', '해당없음', 'n/a', 'null'}:
-        return False
-    if text in (item.get('항목'), fields.get('구성요소원문'), fields.get('거버넌스기구')):
-        return False  # A component/entity label alone is not a function.
-    return True
 
 
 def _physical_observation_key(observation: dict) -> str:
@@ -768,7 +711,7 @@ def _infer_chart_kind(item: dict, analysis: dict) -> str:
 class ImageAgent:
     """에이전트 2-b: 이미지·그래프 분석 에이전트"""
 
-    def __init__(self, run_state: RunState | None = None, review_budget=None):
+    def __init__(self, run_state: RunState | None = None):
         self._image_results: list[dict] = []
         self._triage_stats: dict = {}
         self.run_state = (
@@ -781,8 +724,6 @@ class ImageAgent:
         self._counter_lock = threading.Lock()
         self._object_outcomes = ObjectOutcomeLedger()
         self._negative_revalidation_seen: set[str] = set()
-        self.review_budget = review_budget or ReviewBudget(run_state)
-        self.preflight = {}
 
     @staticmethod
     def _image_evidence_ids(image: dict) -> list[str]:
@@ -822,7 +763,7 @@ class ImageAgent:
         image: dict,
         page_num: int,
     ) -> list[str]:
-        if image.get("review_promoted") or not getattr(config, "VISION_NEGATIVE_REVALIDATION_ENABLED", True):
+        if not getattr(config, "VISION_NEGATIVE_REVALIDATION_ENABLED", True):
             return []
         signals = _negative_revalidation_signals(image)
         if not signals:
@@ -873,7 +814,7 @@ class ImageAgent:
 {{
   "contract_version": {VISUAL_CONTRACT_VERSION},
   "type": "chart_table|structured_visual|해당없음",
-  "target_sheet": "regional_conditions|emissions_regional|emissions_management|emissions_forecast|reduction_targets|vision_strategy|mitigation_projects|financial_plan|foundation_measures|governance_feedback|other",
+  "target_sheet": "regional_conditions|emissions_regional|emissions_management|emissions_forecast|reduction_targets|vision_strategy|mitigation_projects|financial_plan|foundation_measures|other",
   "chart_type": "막대|꺾은선|영역|원|표|복합|diagram|infographic|flow|strategy_map|risk_map|risk_matrix|기타",
   "title": "원문 제목 또는 캡션",
   "unit": "단위 원문",
@@ -1090,20 +1031,6 @@ class ImageAgent:
             status = str(getattr(decision, "final_status", "needs_review") or "needs_review")
             counts[status] = counts.get(status, 0) + 1
         self._triage_stats["final_statuses"] = counts
-        self._triage_stats.update({
-            "object_total": len(decisions),
-            "object_candidates": sum(row.action == "ocr_required" for row in decisions),
-            "review_required_objects": sum(row.action == "review_required" for row in decisions),
-            "review_required_visual_objects": sum(
-                row.action == "review_required" and row.object_type in {"image", "figure"}
-                for row in decisions
-            ),
-            "explicit_non_data_objects": sum(row.action == "skip_non_data" for row in decisions),
-            "empty_native_text_objects": sum(
-                row.action == "review_required" and row.object_type == "text"
-                for row in decisions
-            ),
-        })
 
     @staticmethod
     def _attach_source_metadata(result: dict, image: dict) -> dict:
@@ -1195,13 +1122,9 @@ class ImageAgent:
 {{
   "contract_version": {VISUAL_CONTRACT_VERSION},
   "type": "chart_table|structured_visual|해당없음",
-  "target_sheet": "regional_conditions|emissions_regional|emissions_management|emissions_forecast|reduction_targets|vision_strategy|mitigation_projects|financial_plan|foundation_measures|governance_feedback|other",
+  "target_sheet": "regional_conditions|emissions_regional|emissions_management|emissions_forecast|reduction_targets|vision_strategy|mitigation_projects|financial_plan|foundation_measures|other",
   "chart_type": "막대|꺾은선|영역|원|표|복합|diagram|infographic|flow|strategy_map|risk_map|risk_matrix|기타",
   "title": "그래프/표 제목",
-  "caption": "그림·표 번호를 포함한 캡션 원문",
-  "x_axis": {{"title": "X축 제목", "unit": "X축 단위", "labels": ["축 라벨"]}},
-  "y_axis": {{"title": "Y축 제목", "unit": "Y축 단위", "labels": ["축 라벨"]}},
-  "legend": ["범례 원문"],
   "unit": "단위 원문",
   "page_number": {page_num},
   "table": [
@@ -1211,7 +1134,7 @@ class ImageAgent:
       "종류": "현황|전망|목표|기타",
       "값": 12345,
       "단위": "단위 원문",
-      "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "범례항목": "이 행의 범례 계열 원문", "축항목": "이 행의 축 범주 원문", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU 또는 SSP/RCP", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "...", "평가유형": "projection|impact|vulnerability|risk|disaster", "기후변수": "...", "기준기간": "...", "미래기간": "...", "공간단위": "...", "리스크항목": "...", "취약성지표": "...", "리스크등급": "...", "구조역할": "비전|목표|전략|과제|단계|주체|지표|기타", "상위항목": "...", "관계": "포함|연결|선행|후속", "순서": 1, "단계": "...", "담당주체": "...", "설명": "..."}}
+      "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU 또는 SSP/RCP", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "...", "평가유형": "projection|impact|vulnerability|risk|disaster", "기후변수": "...", "기준기간": "...", "미래기간": "...", "공간단위": "...", "리스크항목": "...", "취약성지표": "...", "리스크등급": "...", "구조역할": "비전|목표|전략|과제|단계|주체|지표|기타", "상위항목": "...", "관계": "포함|연결|선행|후속", "순서": 1, "단계": "...", "담당주체": "...", "설명": "..."}}
     }}
   ],
   "summary": "이미지 내용 요약 1문장",
@@ -1225,7 +1148,6 @@ class ImageAgent:
 fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣고, 확신이 없으면 생략하세요(추측 금지).
 이미지에 숫자축만 있고 정확한 값을 읽기 어려우면 대략값을 만들지 말고 null로 반환하세요.
 항목명·범례명·부호·기간·단위는 원문 그대로 기록하고 동의어나 축약어로 바꾸지 마세요.
-캡션·X축·Y축·범례는 각각 caption, x_axis, y_axis, legend에 분리하여 기록하고, 행별 계열/범주는 fields.범례항목 또는 fields.축항목에 기록하세요.
 `21~30년` 같은 기간은 연도=null, fields.기간원문="21~30년"으로 기록하세요.
 BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에 묶지 말고 값 하나당 table 한 행으로 분리하세요.
 합계와 세부값이 함께 보이면 모두 별도 행으로 반환하고 동일한 fields.합계그룹을 부여하세요.
@@ -1233,8 +1155,6 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
 기존 시트에 안전하게 매핑할 수 없는 구조는 target_sheet=other로 보존하세요.
 모든 값 행에 fields.값근거를 반드시 기록하세요."""
 
-        if getattr(config, "READING_PIPELINE_ENABLED", True):
-            prompt += "\n" + reading_instruction(VISUAL_TARGET_SHEETS) + "\n확장 필드와 _reading은 해당 table 행의 fields 안에 넣으세요. 대상 시트와 구조 시각자료의 기존 병합 제한은 유지됩니다."
         parsed, parse_ok = llm_client.call_vision_json(image["base64"], prompt, system=CHART_TABLE_SYSTEM, stage="vision")
         if not parse_ok:
             if fail_fast:
@@ -1312,13 +1232,9 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
       "page_number": 123,
       "contract_version": {VISUAL_CONTRACT_VERSION},
       "type": "chart_table|structured_visual|해당없음",
-      "target_sheet": "regional_conditions|emissions_regional|emissions_management|emissions_forecast|reduction_targets|vision_strategy|mitigation_projects|financial_plan|foundation_measures|governance_feedback|other",
+      "target_sheet": "regional_conditions|emissions_regional|emissions_management|emissions_forecast|reduction_targets|vision_strategy|mitigation_projects|financial_plan|foundation_measures|other",
       "chart_type": "막대|꺾은선|영역|원|표|복합|diagram|infographic|flow|strategy_map|risk_map|risk_matrix|기타",
       "title": "그래프/표 제목",
-      "caption": "그림·표 번호를 포함한 캡션 원문",
-      "x_axis": {{"title": "X축 제목", "unit": "X축 단위", "labels": ["축 라벨"]}},
-      "y_axis": {{"title": "Y축 제목", "unit": "Y축 단위", "labels": ["축 라벨"]}},
-      "legend": ["범례 원문"],
       "unit": "단위 원문",
       "table": [
         {{
@@ -1327,7 +1243,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
           "종류": "현황|전망|목표|기타",
           "값": 12345,
           "단위": "단위 원문",
-          "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "범례항목": "이 행의 범례 계열 원문", "축항목": "이 행의 축 범주 원문", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU 또는 SSP/RCP", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "...", "평가유형": "projection|impact|vulnerability|risk|disaster", "기후변수": "...", "기준기간": "...", "미래기간": "...", "공간단위": "...", "리스크항목": "...", "취약성지표": "...", "리스크등급": "...", "구조역할": "비전|목표|전략|과제|단계|주체|지표|기타", "상위항목": "...", "관계": "포함|연결|선행|후속", "순서": 1, "단계": "...", "담당주체": "...", "설명": "..."}}
+          "fields": {{"값근거": "명시라벨|표셀|축추정|계산값|불명", "기간원문": "원문 기간", "집계수준": "합계|세부", "합계그룹": "검산 그룹명", "지표범주": "인문사회|자연환경|경제산업|에너지", "지표명": "...", "배출유형": "직접배출|간접배출|흡수원", "부문": "...", "세부부문": "...", "관리부문": "...", "직간접구분": "직접|간접", "시나리오": "BAU 또는 SSP/RCP", "값역할": "목표배출량|목표감축량|기준배출량|배출전망", "목표수준": "총괄|부문", "목표범위": "지역전체|관리권한", "목표연도": 2030, "계획구분": "...", "사업명": "...", "재원구분": "...", "평가유형": "projection|impact|vulnerability|risk|disaster", "기후변수": "...", "기준기간": "...", "미래기간": "...", "공간단위": "...", "리스크항목": "...", "취약성지표": "...", "리스크등급": "...", "구조역할": "비전|목표|전략|과제|단계|주체|지표|기타", "상위항목": "...", "관계": "포함|연결|선행|후속", "순서": 1, "단계": "...", "담당주체": "...", "설명": "..."}}
         }}
       ],
       "summary": "이미지 내용 요약 1문장",
@@ -1341,7 +1257,6 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
 - 이미지에 숫자축만 있고 정확한 값을 읽기 어려우면 값을 추정하지 말고 null로 반환하세요.
 - fields의 시트별 필수 분류 필드는 이미지에서 확신할 때만 넣고, 확신이 없으면 생략하세요(추측 금지).
 - 항목명·범례명·부호·기간·단위는 원문 그대로 기록하고 동의어나 축약어로 바꾸지 마세요.
-- 캡션·X축·Y축·범례는 각각 caption, x_axis, y_axis, legend에 분리하고, 각 행에는 fields.범례항목 또는 fields.축항목으로 출처 라벨을 연결하세요.
 - `21~30년` 같은 기간은 연도=null, fields.기간원문="21~30년"으로 기록하세요.
 - 정량값은 값 하나당 table 한 행으로 분리하고, fields에 다른 정량값을 중첩하지 마세요.
 - 합계와 세부값은 별도 행으로 반환하고 동일한 fields.합계그룹을 부여하세요.
@@ -1353,8 +1268,6 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
 - 반드시 JSON만 반환하세요."""
 
         images = [image["base64"] for _, image in batch]
-        if getattr(config, "READING_PIPELINE_ENABLED", True):
-            prompt += "\n" + reading_instruction(VISUAL_TARGET_SHEETS) + "\n확장 필드와 _reading은 해당 table 행의 fields 안에 넣으세요. 대상 시트와 구조 시각자료의 기존 병합 제한은 유지됩니다."
         parsed, parse_ok = llm_client.call_vision_batch_json(images, prompt, system=CHART_TABLE_SYSTEM, stage="vision")
         if not parse_ok:
             if fail_fast:
@@ -1365,40 +1278,21 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             if fail_fast:
                 raise llm_client.LLMCallError("Vision 배치 응답 스키마 불일치")
             return []
-        returned_indexes: list[int] = []
-        for raw in raw_analyses:
-            if not isinstance(raw, dict):
-                continue
-            try:
-                returned_indexes.append(int(raw.get("image_index")))
-            except (TypeError, ValueError):
-                continue
-        expected_indexes = list(range(1, len(batch) + 1))
-        index_counts = {
-            index: returned_indexes.count(index)
-            for index in expected_indexes
-        }
-        contract_violated = sorted(returned_indexes) != expected_indexes
-        unresolved_indexes = [
-            index for index in expected_indexes if index_counts[index] != 1
-        ]
-        if contract_violated:
-            # Preserve independently successful objects. Duplicate indexes are
-            # ambiguous, so only indexes returned exactly once are accepted.
-            unambiguous_indexes = {
-                index for index, count in index_counts.items() if count == 1
-            }
-            preserved_analyses: list[dict] = []
+        if fail_fast:
+            returned_indexes: list[int] = []
             for raw in raw_analyses:
                 if not isinstance(raw, dict):
                     continue
                 try:
-                    image_index = int(raw.get("image_index"))
+                    returned_indexes.append(int(raw.get("image_index")))
                 except (TypeError, ValueError):
                     continue
-                if image_index in unambiguous_indexes:
-                    preserved_analyses.append(raw)
-            raw_analyses = preserved_analyses
+            expected_indexes = list(range(1, len(batch) + 1))
+            if sorted(returned_indexes) != expected_indexes:
+                raise llm_client.LLMCallError(
+                    f"Vision 배치 객체 계약 위반: expected={expected_indexes}, "
+                    f"returned={sorted(returned_indexes)}"
+                )
 
         page_by_index = {idx: page.page_number for idx, (page, _) in enumerate(batch, start=1)}
         image_by_index = {idx: image for idx, (_, image) in enumerate(batch, start=1)}
@@ -1457,13 +1351,6 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             raw["page_number"] = page_number
             raw["municipality"] = municipality
             results.append(self._attach_source_metadata(raw, image))
-        if fail_fast and contract_violated:
-            raise VisionBatchContractError(
-                f"Vision 배치 객체 계약 위반: expected={expected_indexes}, "
-                f"returned={sorted(returned_indexes)}",
-                partial_rows=results,
-                unresolved_indexes=unresolved_indexes,
-            )
         return results
 
     def _infer_target_sheet(self, analysis: dict) -> str:
@@ -1554,15 +1441,11 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 or item.get("항목")
             )
         )
-        qualitative_function = _has_explicit_function_text(item, target_sheet)
-        if not _has_chart_value(item) and not qualitative_project and not qualitative_function:
+        if not _has_chart_value(item) and not qualitative_project:
             reasons.append("값 없음")
 
         year_int = _chart_year_int(item.get("연도"))
-        # The Organizer applies the explicit period/year contract. Do not reject
-        # all period totals before that contract can run; no merge is allowed here.
-        reading_contract = getattr(config, "READING_PIPELINE_ENABLED", True) and "_reading" in fields
-        if year_int is None and not qualitative_project and not qualitative_function and not reading_contract:
+        if year_int is None and not qualitative_project:
             reasons.append("연도 없음/비숫자")
         allowed_years = config.IMAGE_CHART_MERGE_YEARS_BY_SHEET.get(
             target_sheet, config.IMAGE_CHART_MERGE_YEARS
@@ -1570,30 +1453,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         if year_int is not None and year_int not in allowed_years:
             reasons.append("연도 범위 외")
 
-        # Apply the same meaning gate before the legacy inline merge as well as
-        # Organizer's evidence-gated path. Keep every rejected reading in audit.
-        from utils.visual_fact_identity import semantic_block
-        def semantic_view(value):
-            return {"페이지": analysis.get("page_number"), "대상시트": target_sheet,
-                    "항목": value.get("항목"), "연도": value.get("연도"),
-                    "원문값": value.get("값"), "단위": value.get("단위"),
-                    "판독필드": value.get("fields") or {},
-                    "근거ID목록": analysis.get("source_evidence_ids") or []}
-        separation = semantic_block(semantic_view(item), [semantic_view(x)
-            for x in analysis.get("table", []) if isinstance(x, dict)])
-        if separation:
-            reasons.append("G6 의미 분리: " + separation[1])
         can_merge = not reasons
-        if qualitative_function:
-            # Never raise a model's medium/low rating to high. An explicit row
-            # confidence can only lower the page-level rating, not raise it.
-            observed = str(confidence or 'low').lower()
-            row_confidence = item.get('confidence', fields.get('confidence'))
-            if row_confidence is not None and self._confidence_rank(row_confidence) < self._confidence_rank(observed):
-                observed = str(row_confidence).lower()
-            if self._confidence_rank(observed) < self._confidence_rank(min_conf) and '신뢰도 기준 미달' not in reasons:
-                reasons.append('신뢰도 기준 미달')
-            return not reasons, observed if not reasons else 'low', reasons
         if can_merge:
             return True, "high", []
         if _has_chart_value(item) and not any(r in reasons for r in ["참고자료/해외사례", "연도 범위 외"]):
@@ -1624,22 +1484,12 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         if value_source == "unknown" and _is_table_like_chart(analysis):
             value_source = "table_cell"
         evidence_ids = normalize_evidence_ids(analysis.get("source_evidence_ids"))
-        if evidence_match is not None:
-            if evidence_match.exact:
-                evidence_ids = [evidence_match.evidence_id]
-            elif evidence_match.evidence_ids:
-                evidence_ids = list(evidence_match.evidence_ids)
-        source_object_ids = list(normalize_object_ids(
-            analysis.get("source_object_ids"),
-        ))
         physical_object_ids = [
             str(value)
             for value in (analysis.get("source_physical_object_ids") or [])
             if str(value or "").strip()
         ]
         physical_object_ids = list(dict.fromkeys(physical_object_ids))
-        if evidence_match is not None and evidence_match.physical_object_ids:
-            physical_object_ids = list(evidence_match.physical_object_ids)
         blockers = list(reasons or [])
         if evidence_match is not None and not evidence_match.exact:
             blockers.append(evidence_match.reason)
@@ -1651,8 +1501,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 or item.get("항목")
             )
         )
-        qualitative_function = _has_explicit_function_text(item, target_sheet)
-        all_null = not _has_chart_value(item) and not qualitative_project and not qualitative_function
+        all_null = not _has_chart_value(item) and not qualitative_project
         if all_null and "값 없음" not in blockers:
             blockers.append("판독값 전부 null")
         reason_text = "; ".join(dict.fromkeys(blockers))
@@ -1690,24 +1539,18 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             "대상시트": target_sheet,
             "그래프유형": analysis.get("chart_type", ""),
             "제목": analysis.get("title", ""),
-            "캡션": analysis.get("caption", "") or analysis.get("title", ""),
-            "X축": analysis.get("x_axis") or {},
-            "Y축": analysis.get("y_axis") or {},
-            "범례목록": analysis.get("legend") or [],
-            "단위": item.get("단위") or ("" if qualitative_function else analysis.get("unit", "")),
+            "단위": item.get("단위") or analysis.get("unit", ""),
             "항목": item.get("항목") or fields.get("용도") or fields.get("감축사업명") or "",
             "연도": item.get("연도"),
             "값": item.get("값"),
             "원문값": fields.get("원문값", item.get("값")),
-            "원문단위": fields.get("원문단위", item.get("단위") or ("" if qualitative_function else analysis.get("unit", ""))),
+            "원문단위": fields.get("원문단위", item.get("단위") or analysis.get("unit", "")),
             "정규화값": fields.get("정규화값"),
             "정규화단위": fields.get("정규화단위", ""),
             "정규화배율": fields.get("정규화배율"),
             "값근거": value_source,
             "계약버전": analysis.get("contract_version") or VISUAL_CONTRACT_VERSION,
             "신뢰도": confidence or analysis.get("confidence", "low"),
-            "모델신뢰도": analysis.get("confidence", "low"),
-            "신뢰도판정근거": "명시 조직기능: 숫자·연도 누락 감점 제외, 기존 보호 조건 유지" if qualitative_function else "기존 시각값 판정",
             "반영여부": "반영" if merged else "검토",
             "근거": evidence_text,
             "판독필드": fields,
@@ -1716,17 +1559,8 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             ),
             "근거ID목록": evidence_ids,
             "근거객체ID": ",".join(evidence_match.object_ids) if evidence_match is not None else "",
-            "원본객체ID": source_object_ids[0] if len(source_object_ids) == 1 else "",
-            "원본객체ID목록": source_object_ids,
             "물리객체ID": physical_object_ids[0] if len(physical_object_ids) == 1 else "",
             "물리객체ID목록": physical_object_ids,
-            "근거분리방식": evidence_match.method if evidence_match is not None else "legacy",
-            "근거교정여부": bool(evidence_match.corrected) if evidence_match is not None else False,
-            "근거좌표": analysis.get("source_bbox"),
-            "렌더그룹ID": analysis.get("render_group_id", "") or "",
-            "패널인덱스": analysis.get("panel_index"),
-            "패널수": analysis.get("panel_count") or 0,
-            "재구성방식": analysis.get("reconstruction_method", "") or "",
             "렌더변형": analysis.get("render_variant", "") or "",
             "렌더변형목록": [analysis.get("render_variant")] if analysis.get("render_variant") else [],
             "물리중복통합수": 0,
@@ -1784,23 +1618,10 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
 
         for analysis in analyses:
             evidence_match = (
-                resolve_observation_evidence(
-                    analysis,
-                    evidence_catalog or {},
-                    enabled=getattr(
-                        config, "VISUAL_EXACT_OBJECT_RESOLUTION_ENABLED", True
-                    ),
-                )
+                match_evidence(analysis.get("source_evidence_ids"), evidence_catalog or {})
                 if strict_evidence
                 else None
             )
-            if evidence_match is not None and evidence_match.exact:
-                analysis["source_evidence_ids"] = [evidence_match.evidence_id]
-                analysis["source_object_ids"] = list(evidence_match.object_ids)
-                if evidence_match.physical_object_ids:
-                    analysis["source_physical_object_ids"] = list(
-                        evidence_match.physical_object_ids
-                    )
             chart_rows = analysis.get("table", []) if analysis.get("type") == "chart_table" else []
             target_sheet = self._infer_target_sheet(analysis)
             if isinstance(chart_rows, list):
@@ -1840,9 +1661,8 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     # 선반영하지 않는다. 근거 ID를 붙인 후보를 Organizer의 단일 게이트로 넘긴다.
                     auto_merge = (
                         can_merge
-                        and target_sheet not in {"reduction_targets", "governance_feedback"}
+                        and target_sheet != "reduction_targets"
                         and not strict_evidence
-                        and not (getattr(config, "READING_PIPELINE_ENABLED", True) and "_reading" in fields)
                     )
                     self._append_chart_observation(
                         text_results, analysis, item, target_sheet,
@@ -2075,16 +1895,10 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 "caption": image.get("caption", ""),
                 "source_kind": image.get("source_kind", ""),
                 "source_evidence_ids": image.get("source_evidence_ids", []),
-                "review_promoted": bool(image.get("review_promoted")),
                 "bbox": image.get("bbox"),
             })
         descriptor = {
             "visual_contract_version": VISUAL_CONTRACT_VERSION,
-            "chart_table_prompt_sha256": hashlib.sha256(CHART_TABLE_SYSTEM.encode("utf-8")).hexdigest(),
-            "reading_pipeline_contract": (
-                hashlib.sha256(reading_instruction(VISUAL_TARGET_SHEETS).encode('utf-8')).hexdigest()
-                if getattr(config, "READING_PIPELINE_ENABLED", True) else "off"
-            ),
             "negative_revalidation_enabled": bool(
                 getattr(config, "VISION_NEGATIVE_REVALIDATION_ENABLED", True)
             ),
@@ -2170,50 +1984,6 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         return children
 
     def _run_vision_task(self, task: dict, municipality: str) -> list[dict]:
-        """Compatibility entry point for callers needing only the saved rows."""
-        return self._run_vision_task_result(task, municipality).rows
-
-    def _run_bounded_review_task(self, task, municipality):
-        """One promoted object per task, serialized by extract; retries share budget."""
-        page, image = task["batch"][0]
-        identity = (image.get("source_physical_object_ids") or image["source_evidence_ids"])[0]
-        cached = self.review_budget.results.get(identity)
-        if cached is not None:
-            self._object_outcomes.mark_attempt(self._task_evidence_ids(task), label="review_memory")
-            for row in cached.rows:
-                self._record_analysis_outcome(row, "제한적 판독 결과 재사용")
-            return cached
-        batch_id = self._vision_batch_id(task)
-        if (self.run_state is not None and self.run_state.restored_result(batch_id) is not None
-                and not self._forced_retry_evidence_ids(task)):
-            return self._run_vision_task_result(task, municipality)
-        image_hash = hashlib.sha256(image["base64"].encode("ascii")).hexdigest()
-        timeout, reason = self.review_budget.claim(identity, page.page_number, image_hash)
-        if not timeout:
-            if identity in self.review_budget.entries:
-                self._object_outcomes.mark_attempt(self._task_evidence_ids(task), label="review_previous_attempt")
-            for evidence in self._task_evidence_ids(task):
-                self._object_outcomes.record(evidence, "needs_review", response_received=False, reason=reason)
-            record = self.run_state.record_for(batch_id) if self.run_state is not None else None
-            prior_rows = record.get("result", []) if isinstance(record, dict) else []
-            prior_rows = prior_rows if isinstance(prior_rows, list) else []
-            self._persist_vision(task, "unresolved", error=reason)
-            return VisionTaskResult(prior_rows, complete=False, error=reason)
-        started = time.monotonic()
-        status = "interrupted"
-        try:
-            with llm_client.limited_vision_call(timeout):
-                result = self._run_vision_task_result(task, municipality)
-            status = "ok" if result.complete else "partial"
-            self.review_budget.results[identity] = result
-            return result
-        except Exception:
-            status = "failed"
-            raise
-        finally:
-            self.review_budget.finish(identity, time.monotonic() - started, status)
-
-    def _run_vision_task_result(self, task: dict, municipality: str) -> VisionTaskResult:
         checkpoint_task = task
         batch_id = self._vision_batch_id(checkpoint_task)
         forced_ids = self._forced_retry_evidence_ids(checkpoint_task)
@@ -2243,12 +2013,12 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                             response_received=True,
                             reason="체크포인트 호출 완료, 구조화 데이터 없음",
                         )
-                return VisionTaskResult(restored_rows)
+                return restored_rows
             if isinstance(restored, list) and forced_ids:
                 restored_rows = [row for row in restored if isinstance(row, dict)]
                 task = self._forced_retry_task(checkpoint_task, forced_ids)
                 if not task.get("batch"):
-                    return VisionTaskResult(restored_rows)
+                    return restored_rows
                 print(
                     "  [Vision 선택복구] "
                     f"배치 {checkpoint_task.get('batch_num', '?')}: 근거 객체 {len(forced_ids)}개 재판독"
@@ -2259,7 +2029,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             ) and not forced_ids:
                 with self._counter_lock:
                     self.skipped_batches += 1
-                return VisionTaskResult([], complete=False, error="실행 정책에 따라 건너뜀")
+                return []
 
         batch = list(task.get("batch", []))
 
@@ -2316,87 +2086,6 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                         )
                     if result:
                         rows.append(result)
-        except VisionBatchContractError as exc:
-            max_depth = max(0, int(getattr(config, "VISION_RECOVERY_MAX_SPLIT_DEPTH", 6)))
-            unresolved_index_set = set(exc.unresolved_indexes)
-            unresolved_batch = [
-                item for index, item in enumerate(batch, start=1)
-                if index in unresolved_index_set
-            ]
-            unresolved_evidence = list(dict.fromkeys(
-                evidence_id
-                for _page, image in unresolved_batch
-                for evidence_id in self._image_evidence_ids(image)
-            ))
-            can_retry = (
-                not task.get("review_promoted")
-                and bool(unresolved_batch)
-                and bool(getattr(config, "VISION_SPLIT_ON_FAILURE", True))
-                and int(task.get("split_depth", 0)) < max_depth
-                and (
-                    not unresolved_evidence
-                    or any(
-                        self._object_outcomes.attempt_count(value) < max_object_attempts
-                        for value in unresolved_evidence
-                    )
-                )
-            )
-            recovered_rows: list[dict] = []
-            recovery_failed = False
-            quota_error = None
-            if can_retry:
-                child = {
-                    **task,
-                    "batch": unresolved_batch,
-                    "batch_num": f"{task.get('batch_num', '?')}.missing",
-                    "batch_total": 1,
-                    "split_depth": int(task.get("split_depth", 0)) + 1,
-                }
-                # A missing-object retry has its own descriptor/checkpoint, not
-                # the full parent's ID copied by **task.
-                child.pop("batch_id", None)
-                with self._counter_lock:
-                    self.split_batches += 1
-                try:
-                    child_result = self._run_vision_task_result(child, municipality)
-                    recovered_rows = child_result.rows
-                    recovery_failed = not child_result.complete
-                except llm_client.LLMQuotaExceededError as child_exc:
-                    recovered_rows = getattr(child_exc, "partial_rows", [])
-                    recovery_failed = True
-                    quota_error = child_exc
-                except (
-                    llm_client.LLMTimeoutError,
-                    llm_client.LLMCallError,
-                ):
-                    recovery_failed = True
-                if len(recovered_rows) < len(unresolved_batch):
-                    recovery_failed = True
-            elif unresolved_batch:
-                recovery_failed = True
-
-            merged = self._merge_vision_results([exc.partial_rows, recovered_rows])
-            merged = self._replace_forced_results(restored_rows, merged, forced_ids)
-            if recovery_failed:
-                for evidence_id in unresolved_evidence:
-                    self._object_outcomes.record(
-                        evidence_id,
-                        "needs_review",
-                        response_received=False,
-                        reason=f"Vision 부분 결과 보존 후 미복구: {exc}",
-                    )
-                with self._counter_lock:
-                    self.failed_batches += 1
-            self._persist_vision(
-                checkpoint_task,
-                "partial" if recovery_failed else "ok",
-                result=merged,
-                error=str(exc) if recovery_failed else "",
-                recovered=True,
-            )
-            if quota_error is not None:
-                raise VisionQuotaError(str(quota_error), merged) from quota_error
-            return VisionTaskResult(merged, not recovery_failed, str(exc) if recovery_failed else "")
         except llm_client.LLMQuotaExceededError as exc:
             if restored_rows and forced_ids:
                 stale_rows = self._mark_forced_retry_failure(restored_rows, forced_ids, str(exc))
@@ -2419,12 +2108,13 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 )
             with self._counter_lock:
                 self.failed_batches += 1
-            raise VisionQuotaError(str(exc), stale_rows) from exc
+            if stale_rows:
+                return stale_rows
+            raise
         except (llm_client.LLMTimeoutError, llm_client.LLMCallError) as exc:
             max_depth = max(0, int(getattr(config, "VISION_RECOVERY_MAX_SPLIT_DEPTH", 6)))
             can_split = (
-                not task.get("review_promoted")
-                and bool(getattr(config, "VISION_SPLIT_ON_FAILURE", True))
+                bool(getattr(config, "VISION_SPLIT_ON_FAILURE", True))
                 and len(batch) > 1
                 and int(task.get("split_depth", 0)) < max_depth
                 and (
@@ -2441,37 +2131,23 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     self.split_batches += 1
                 child_results: list[list[dict]] = []
                 child_failed = False
-                child_errors: list[str] = []
-                quota_error = None
                 for child in children:
                     try:
-                        child_result = self._run_vision_task_result(child, municipality)
-                        child_results.append(child_result.rows)
-                        if not child_result.complete:
-                            child_failed = True
-                            child_errors.append(child_result.error)
-                    except llm_client.LLMQuotaExceededError as child_exc:
-                        child_results.append(getattr(child_exc, "partial_rows", []))
+                        child_results.append(self._run_vision_task(child, municipality))
+                    except llm_client.LLMQuotaExceededError:
+                        raise
+                    except (llm_client.LLMTimeoutError, llm_client.LLMCallError):
                         child_failed = True
-                        child_errors.append(str(child_exc))
-                        quota_error = child_exc
-                        break
-                    except (llm_client.LLMTimeoutError, llm_client.LLMCallError) as child_exc:
-                        child_failed = True
-                        child_errors.append(str(child_exc))
                 merged = self._merge_vision_results(child_results)
                 merged = self._replace_forced_results(restored_rows, merged, forced_ids)
-                error = "; ".join(dict.fromkeys(child_errors)) if child_failed else ""
                 self._persist_vision(
                     checkpoint_task,
                     "partial" if child_failed else "ok",
                     result=merged,
-                    error=error,
+                    error=str(exc) if child_failed else "",
                     recovered=True,
                 )
-                if quota_error is not None:
-                    raise VisionQuotaError(str(quota_error), merged) from quota_error
-                return VisionTaskResult(merged, not child_failed, error)
+                return merged
             status = "parse_fail" if any(
                 token in str(exc) for token in ("파싱", "스키마", "누락")
             ) else "call_fail"
@@ -2496,13 +2172,13 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             with self._counter_lock:
                 self.failed_batches += 1
             if restored_rows and forced_ids:
-                return VisionTaskResult(stale_rows, complete=False, error=str(exc))
+                return stale_rows
             raise
 
         rows = [row for row in rows if isinstance(row, dict)]
         rows = self._replace_forced_results(restored_rows, rows, forced_ids)
         self._persist_vision(checkpoint_task, "ok", result=rows, recovered=bool(forced_ids))
-        return VisionTaskResult(rows)
+        return rows
 
     def extract(
         self,
@@ -2511,7 +2187,6 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         municipality: str,
         document: PDFContent | None = None,
         document_objects: Sequence[DocumentObject] | None = None,
-        preflight_only: bool = False,
     ) -> dict:
         selective_enabled = bool(
             getattr(config, "SELECTIVE_OCR_ENABLED", True) and document is not None
@@ -2521,8 +2196,6 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         backend = None
         render_stats = {}
         physical_stats = {}
-        from utils.vision_toc import TocPolicy
-        toc_policy = TocPolicy(pages)
 
         if selective_enabled:
             raw_native_objects = (
@@ -2552,29 +2225,23 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 confidence_threshold=float(
                     getattr(config, "OCR_NATIVE_CONFIDENCE_THRESHOLD", 0.78)
                 ),
+                page_texts={page.page_number: page.text or "" for page in pages},
             )
-            toc_policy.apply(native_objects, triage_decisions, source_objects=raw_native_objects)
-            promote_review_candidates(triage_decisions, native_objects, pages, backend=backend.name)
+            skipped_index_captions = sum(row.action == "skip_index_caption" for row in triage_decisions)
             apply_triage_metadata(native_objects, triage_decisions)
             required = [row for row in triage_decisions if row.action == "ocr_required"]
             self._object_outcomes.register(row.evidence_id for row in required)
             native_kept = sum(row.action == "native_keep" for row in triage_decisions)
+            physical_stats["vision_skipped_index_captions"] = skipped_index_captions
             print(
                 "[에이전트2b 이미지분석] 객체 기반 선택적 OCR: "
                 f"원시 {len(raw_native_objects)}개 → 물리객체 {len(native_objects)}개 "
                 f"(중복통합 {physical_duplicates}개) → 보완 {len(required)}개 "
-                f"(기본추출 유지 {native_kept}개, "
-                f"판단 보류 {sum(row.action == 'review_required' for row in triage_decisions)}개, "
-                f"명시적 비데이터 {sum(row.action == 'skip_non_data' for row in triage_decisions)}개, "
+                f"(PyMuPDF 충분 {native_kept}개, 목차 캡션 제외 {skipped_index_captions}개, "
                 f"백엔드 {backend.name})"
             )
 
             if not backend.uses_vision:
-                if preflight_only:
-                    self.preflight = candidate_manifest(triage_decisions, [])
-                    self.preflight["toc_audit"] = toc_policy.audit()
-                    self.preflight["warning"] = "사전 점검은 OCR_BACKEND=vlm에서 실행하세요"
-                    return {"vision_preflight": self.preflight}
                 self._object_outcomes.mark_attempt(
                     (row.evidence_id for row in required),
                     label=f"ocr_backend:{backend.name}",
@@ -2629,9 +2296,6 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     f"[에이전트2b 이미지분석] {backend.name} 객체 "
                     f"{len(precomputed)}개 로드·병합 완료"
                 )
-                self._triage_stats.update(toc_policy.metrics())
-                self.preflight = candidate_manifest(triage_decisions, [])
-                self.preflight["toc_audit"] = toc_policy.audit()
                 return text_results
 
             decision_by_object = {row.object_id: row for row in triage_decisions}
@@ -2669,10 +2333,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                         # 다시 렌더링한다. 순서 기반 오연결을 여기서 전파하지 않는다.
                         continue
                     if source_kind == "page_render":
-                        # Never route promoted identities through an unbounded normal batch.
-                        selected = [row for row in page_required if not row.promotion_reason]
-                        if not selected:
-                            selected = [row for row in page_required if row.promotion_reason][:1]
+                        selected = page_required
                     elif own is not None and own.action == "ocr_required":
                         selected = [own]
                     elif (
@@ -2682,7 +2343,6 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                         # 삽입 이미지와 그림 캡션의 좌표 연결이 불완전한 PDF는 같은 페이지의
                         # 시각 후보를 보수적으로 연결하고 이후 근거 ID 병합에서 중복을 제거한다.
                         selected = [row for row in page_required if row.object_type in {"chart", "figure"}]
-                        selected = [row for row in selected if not row.promotion_reason] or selected[:1]
                     if not selected or not _is_relevant_image(image):
                         continue
                     image["source_object_ids"] = list(dict.fromkeys(
@@ -2721,26 +2381,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                 for img in p.images
                 if _is_relevant_image(img)
             ]
-        raw_images = toc_policy.filter_images(raw_images)
-        promoted_ids = {row.evidence_id for row in triage_decisions if row.promotion_reason}
-        bounded_images, normal_images = {}, []
-        for page, image in raw_images:
-            ids = set(image.get("source_evidence_ids", []))
-            if ids and ids <= promoted_ids:
-                image["review_promoted"] = True
-                key = (image.get("source_physical_object_ids") or sorted(ids))[0]
-                previous = bounded_images.get(key)
-                # Prefer the full physical object/composite over one panel or
-                # context-only render (the latter cannot pass auto-merge gates).
-                priorities = {"composite": 0, "object": 0, "": 0, "panel": 1,
-                              "full_page_context": 2, "fallback_full_page": 2}
-                priority = priorities.get(str(image.get("render_variant", "")), 1)
-                prior_priority = priorities.get(str(previous[1].get("render_variant", "")), 1) if previous else 99
-                if priority < prior_priority:
-                    bounded_images[key] = (page, image)
-            else:
-                normal_images.append((page, image))
-        coverage_images = _coverage_reduce_images(normal_images) + list(bounded_images.values())
+        coverage_images = _coverage_reduce_images(raw_images)
         if len(coverage_images) != len(raw_images):
             print(
                 "[에이전트2b 이미지분석] 페이지 렌더 기준 중복 축소: "
@@ -2815,7 +2456,6 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             self._triage_stats.update(render_stats)
         if physical_stats:
             self._triage_stats.update(physical_stats)
-        self._triage_stats.update(toc_policy.metrics())
 
         # 상한 적용은 명시적으로 설정한 경우에만 수행한다. 기본값은 전수 분석이다.
         max_images = getattr(config, "MAX_IMAGES", None)
@@ -2828,36 +2468,13 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
         else:
             print("[에이전트2b 이미지분석] 이미지 분석 상한 없음: 후보 전수 분석")
 
-        # The manifest records execution order: normal batches, then serial probes.
-        pages_with_images = ([item for item in pages_with_images if not item[1].get("review_promoted")]
-                             + [item for item in pages_with_images if item[1].get("review_promoted")])
         total = len(pages_with_images)
         print(f"[에이전트2b 이미지분석] 분석 대상 이미지: {total}개")
-        self.preflight = candidate_manifest(triage_decisions, pages_with_images)
-        self.preflight["toc_audit"] = toc_policy.audit()
-        toc_metrics = toc_policy.metrics()
-        print(
-            f"[에이전트2b 이미지분석] 목차 정책 {toc_policy.policy['mode']}: "
-            f"확정 페이지 {toc_metrics['toc_confirmed_pages']}개, "
-            f"목차 객체 {toc_metrics['toc_would_exclude_objects']}개 / "
-            f"호출 전 제외 {toc_metrics['toc_excluded_ocr_objects']}개, "
-            f"추가 렌더 제외 {toc_metrics['toc_excluded_fallback_images']}개"
-        )
-        if preflight_only:
-            return {"vision_preflight": self.preflight}
-        expected_hash = getattr(config, "VISION_EXPECTED_CANDIDATE_SHA256", "")
-        if expected_hash and self.preflight["candidate_sha256"] != expected_hash:
-            raise ValueError("Vision 후보 해시가 사전 점검과 다릅니다. 모델 호출 전에 중단합니다.")
+        self._triage_stats.update(_candidate_metrics(pages_with_images))
 
         if total == 0:
             print("[에이전트2b 이미지분석] 분석할 이미지 없음.")
             if selective_enabled:
-                review_count = sum(row.action == "review_required" for row in triage_decisions)
-                if review_count:
-                    print(
-                        f"[에이전트2b 이미지분석] 판단 근거 부족 {review_count}개 보존: "
-                        "판독 성공이나 비데이터 확정이 아닙니다. 제한적 판독/검토가 필요합니다."
-                    )
                 for row in triage_decisions:
                     if row.action == "ocr_required":
                         row.status = "no_renderable_candidate"
@@ -2875,18 +2492,17 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             return text_results
 
         analyses = []
-        batch_size = max(1, int(getattr(config, "IMAGE_ANALYSIS_BATCH_SIZE", 1) or 1))
-        regular_images = [item for item in pages_with_images if not item[1].get("review_promoted")]
-        review_images = [item for item in pages_with_images if item[1].get("review_promoted")]
-        image_batches = [regular_images[i:i + batch_size] for i in range(0, len(regular_images), batch_size)]
-        image_batches += [[item] for item in review_images]
+        batch_size = _vision_batch_size()
+        image_batches = [
+            pages_with_images[i:i + batch_size]
+            for i in range(0, len(pages_with_images), batch_size)
+        ]
         vision_tasks = [
             {
                 "batch": image_batch,
                 "batch_num": batch_num,
                 "batch_total": len(image_batches),
                 "split_depth": 0,
-                "review_promoted": bool(image_batch[0][1].get("review_promoted")),
             }
             for batch_num, image_batch in enumerate(image_batches, start=1)
         ]
@@ -2901,30 +2517,11 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             f"(이미지당 batch={batch_size}, 동시={getattr(config, 'VISION_WORKERS', 2)})..."
         )
         batch_results_list = parallel_map_collect(
-            lambda task: self._run_vision_task_result(task, municipality),
-            [task for task in vision_tasks if not task["review_promoted"]],
+            lambda task: self._run_vision_task(task, municipality),
+            vision_tasks,
             workers=getattr(config, "VISION_WORKERS", 2),
             stats_label="vision_analysis",
         )
-        # Serial probes have an independent persisted time/call budget. They cannot
-        # spawn retries, negative revalidation or capacity fallback requests.
-        for task in vision_tasks:
-            if not task["review_promoted"]:
-                continue
-            try:
-                result = self._run_bounded_review_task(task, municipality)
-                batch_results_list.append((result, None))
-            except llm_client.LLMQuotaExceededError as exc:
-                batch_results_list.append((None, exc))
-                # Keep all subsequent probes held without issuing more requests.
-                for later in vision_tasks[len(batch_results_list):]:
-                    for evidence in self._task_evidence_ids(later):
-                        self._object_outcomes.record(evidence, "needs_review", response_received=False, reason="review_hold:quota_queue_stopped")
-                    self._persist_vision(later, "unresolved", error="review_hold:quota_queue_stopped")
-                    batch_results_list.append((VisionTaskResult([], False, "quota: review queue stopped"), None))
-                break
-            except Exception as exc:
-                batch_results_list.append((None, exc))
         outer_failed_batches = 0
         for task, result in zip(vision_tasks, batch_results_list):
             batch_num = task["batch_num"]
@@ -2933,24 +2530,13 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
             page_nums = [page.page_number for page, _ in image_batch]
             if err is not None:
                 outer_failed_batches += 1
-                preserved_rows = getattr(err, "partial_rows", [])
-                analyses.extend(preserved_rows)
                 print(
                     f"  배치 {batch_num}/{len(image_batches)} "
-                    f"(p{page_nums[0]}~{page_nums[-1]}) → 호출 실패({type(err).__name__}), "
-                    f"성공 결과 {len(preserved_rows)}건 보존"
+                    f"(p{page_nums[0]}~{page_nums[-1]}) → 호출 실패({type(err).__name__})"
                 )
                 continue
-            rows = batch_results.rows if batch_results is not None else []
+            rows = batch_results or []
             analyses.extend(rows)
-            if batch_results is None or not batch_results.complete:
-                outer_failed_batches += 1
-                print(
-                    f"  배치 {batch_num}/{len(image_batches)} "
-                    f"(p{page_nums[0]}~{page_nums[-1]}) → 부분 실패/미완료, "
-                    f"성공 결과 {len(rows)}건 보존"
-                )
-                continue
             if rows:
                 titles = ", ".join(str(r.get("title", "제목없음"))[:30] for r in rows[:3])
                 print(
@@ -3004,7 +2590,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     continue
                 if row.evidence_id in completed_evidence:
                     row.status = "completed"
-                elif self._object_outcomes.attempt_count(row.evidence_id) > 0:
+                elif row.evidence_id in attempted_evidence:
                     row.status = "attempted_no_result"
                 else:
                     row.status = "not_attempted"
@@ -3067,7 +2653,7 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
 
     def metrics(self) -> dict:
         """매니페스트에 기록할 이미지 triage·렌더 계측 스냅샷."""
-        return {**self._triage_stats, "review_budget": self.review_budget.snapshot()}
+        return dict(self._triage_stats)
 
     def report(self) -> str:
         types: dict[str, int] = {}
@@ -3093,9 +2679,6 @@ BAU·감축량·감축률·신규·누계·예산 등 정량값은 fields 안에
                     f" / 사전 제외 {triage.get('reference_filtered', 0)}개"
                     f"\n  - 객체 최종상태: "
                     f"{json.dumps(triage.get('final_statuses', {}), ensure_ascii=False, sort_keys=True)}"
-                    f"\n  - 판단 보류: 시각 객체 {triage.get('review_required_visual_objects', 0)}개 / "
-                    f"빈 텍스트 {triage.get('empty_native_text_objects', 0)}개 / "
-                    f"명시적 비데이터 제외 {triage.get('explicit_non_data_objects', 0)}개"
                     f"\n  - 음성 재검증: 시도 {triage.get('negative_revalidation_attempted', 0)}개 / "
                     f"복구 {triage.get('negative_revalidation_recovered', 0)}개 / "
                     f"음성확정 {triage.get('negative_revalidation_confirmed_negative', 0)}개 / "

@@ -11,7 +11,6 @@ import json
 import logging
 import re
 import time
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -20,9 +19,13 @@ from utils.pdf_reader import PageContent
 from utils.document_objects import DocumentObject, build_document_objects, render_table_object_chunks
 from utils import llm_client
 from utils.parallel import parallel_map, parallel_map_collect
-from utils.run_state import RunState, merge_rows_stably
-from utils.reading_pipeline import instruction as reading_instruction
-from utils.text_optimization import TextPolicy, trace_task, digest, CURRENT_TRACE, policy_snapshot as text_policy_snapshot
+from utils.run_state import (
+    EXTRACTION_SOURCE_FIELD,
+    EXTRACTION_SOURCE_TABLE_OBJECT,
+    EXTRACTION_SOURCE_TEXT_CHUNK,
+    RunState,
+    merge_rows_stably,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +48,6 @@ class BatchParseError(llm_client.LLMCallError):
     """응답은 도착했지만 JSON/시트 스키마가 유효하지 않은 배치."""
 
 
-class ClusterPartialParseError(BatchParseError):
-    def __init__(self, result, failed):
-        super().__init__("누락/잘못된 시트 응답: " + ", ".join(failed))
-        self.result = result
-        self.failed = failed
-
-
 _PROVENANCE_INSTRUCTION = (
     '각 행에 "출처페이지" 필드를 추가하고, 그 행의 근거가 된 페이지 번호'
     '(=== 페이지 N === 마커 기준)를 정수 또는 정수 배열로 기록하세요. 확실하지 않으면 null.'
@@ -72,9 +68,7 @@ def _page_range_label(page_nums: list[int]) -> str:
 
 def _attach_row_context(row: dict, municipality: str, page_nums: list[int]) -> dict:
     """행에 지자체명과 출처페이지 fallback을 결정론적으로 보강한다."""
-    if not row.get("지자체명") and not (
-        getattr(config, "READING_PIPELINE_ENABLED", True) and "_reading" in row
-    ):
+    if not row.get("지자체명"):
         row["지자체명"] = municipality
     if not row.get("출처페이지") and page_nums:
         row["출처페이지"] = list(page_nums)
@@ -91,7 +85,8 @@ EXTRACTION_SYSTEM = """당신은 한국 지자체 탄소중립 녹색성장 기�
 3. 모든 텍스트 필드는 한국어로 작성하세요.
 4. 반드시 유효한 JSON만 반환하세요.
 5. 표 제목, 표 캡션, 그림 제목, 절 제목 등 레이블·헤더 텍스트는 절대 데이터 값으로 사용하지 마세요.
-6. 데이터 맥락이 명확하지 않은 숫자(출처 불명, 단위 불일치)는 null로 처리하세요."""
+6. 데이터 맥락이 명확하지 않은 숫자(출처 불명, 단위 불일치)는 null로 처리하세요.
+7. 행을 구분하는 분류 필드(배출유형·직간접구분·시나리오·목표수준·재원구분 등)는 표 헤더·행 그룹·캡션·소제목에서 판정해 반드시 채우고, 값(수치) 필드만 확인 불가 시 null로 두세요. 분류 개념이 적용되지 않는 행(합계·목표·전망 등)만 분류 필드를 null로 두세요."""
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -139,6 +134,7 @@ JSON 형식:
 
 주의:
 - 배출범위: 직접배출/간접배출/흡수원 구분
+- 배출유형은 행 대사 키입니다. 표에 직접/간접 열·행 그룹이 있으면 그 축으로, 없으면 부문·세부부문 표기로 판정하세요 — 전력·열 소비는 간접배출, 연료 연소·산업공정·농업·폐기물은 직접배출, 흡수원·LULUCF는 흡수원. 합계·목표·전망 행만 null
 - 부문: 에너지, 산업공정, 농업, LULUCF, 폐기물 등 원문 표기
 - 연도별 데이터는 연도마다 별도 행으로 기록
 
@@ -155,6 +151,7 @@ JSON 형식:
 주의:
 - 관리부문은 건물/수송/농축산/폐기물/흡수원/전환/산업/수소/합계 중 하나
 - 직간접구분: direct/indirect/sink
+- 직간접구분은 행 대사 키입니다. 표에 직접/간접 열·행 그룹이 있으면 그 축으로, 없으면 세부부문 표기로 판정하세요 — 전력·열(지역난방·스팀) 소비는 indirect, 연료 연소(도시가스·석유·석탄·LNG·LPG)는 direct, 흡수원·LULUCF는 sink. 합계·목표·전망 행만 null
 - 합계포함여부: 해당 행이 합계에 포함되는지 (흡수원은 보통 제외)
 
 JSON 형식:
@@ -236,8 +233,6 @@ JSON 형식:
 주의:
 - 초기 5년은 연 단위, 이후는 연 단위 또는 기간 단위
 - 기간 표기("2029~2030")는 기간시작/기간종료로 분리
-- 재정투자표의 예산액·비예산 표기는 financial_plan에만 기록하며 목표물량/연간계획에 중복 배치하지 않는다
-- 금액형 성과지표(예: 투자유치액)는 명시된 성과지표명·원문 근거와 함께 목표로 보존한다
 
 JSON 형식:
 {"annual_implementation": [{"지자체명": "...", "관리번호": "...", "사업명": "...", "기간시작": 숫자or null, "기간종료": 숫자or null, "연도": 숫자or null, "연간계획": "...", "목표물량": 숫자or null, "목표단위": "...", "규제혁신계획": "...", "입법계획": "..."}]}
@@ -265,10 +260,6 @@ JSON 형식:
     "financial_plan": {
         "keywords": ["재정", "투자", "예산", "국비", "시비", "도비", "민간", "백만원", "억원"],
         "prompt": """이 배치에서 재정투자 계획(부문별·재원별·연도별 예산)을 추출하세요.
-
-계획구분은 정책 분류(총계/온실가스감축대책/대응기반강화/기타)입니다. 투자계획·집행실적 여부와 혼동하지 마세요.
-분류 근거가 없으면 null로 유지하고, 투자계획 여부는 _reading의 문맥 구분과 근거 문구로 보존하세요.
-예산액은 연차별 이행계획의 목표물량에 중복 기록하지 마세요.
 
 JSON 형식:
 {"financial_plan": [{"지자체명": "...", "계획구분": "총계|온실가스감축대책|대응기반강화|기타", "부문": "...", "사업명": "...", "재원구분": "합계|국비|도비|시비|민간", "연도": 숫자, "예산액": 숫자or null, "예산단위": "백만원|억원"}]}
@@ -517,6 +508,29 @@ def _chunk_run(run: list[PageContent], batch_size: int) -> list[list[PageContent
     return chunks
 
 
+def _batch_char_limit(split_depth: int) -> int | None:
+    """텍스트 단계 백엔드에 맞는 배치 문자 상한을 돌려준다. None이면 상한 없음.
+
+    루트 배치(split_depth 0): 로컬 에이전트는 EXTRACTION_MAX_BATCH_CHARS, API 백엔드는
+    EXTRACTION_MAX_BATCH_CHARS_API(0 → 상한 없음). 복구 자식은 백엔드와 무관하게
+    EXTRACTION_RECOVERY_MAX_BATCH_CHARS.
+    """
+    if split_depth > 0:
+        return max(1000, int(getattr(config, "EXTRACTION_RECOVERY_MAX_BATCH_CHARS", 12000)))
+    if llm_client.is_local_agent_provider("extraction"):
+        return max(1000, int(getattr(config, "EXTRACTION_MAX_BATCH_CHARS", 18000)))
+    api_limit = int(getattr(config, "EXTRACTION_MAX_BATCH_CHARS_API", 0) or 0)
+    if api_limit <= 0:
+        return None
+    return max(1000, api_limit)
+
+
+def _page_table_cells(page: PageContent) -> int:
+    """페이지의 표 셀 수 합. 행렬형 표의 예상 출력 행 수에 비례한다(표 요약 방지용)."""
+    records = getattr(page, "table_records", None) or []
+    return sum(int(record.get("cell_count") or 0) for record in records if isinstance(record, dict))
+
+
 def _build_semantic_batches(
     pages: list[PageContent],
     batch_size: int,
@@ -548,20 +562,33 @@ def _build_semantic_batches(
             current.extend(run)
     if current:
         batches.append(current)
-    max_chars = max(1000, int(getattr(config, "EXTRACTION_MAX_BATCH_CHARS", 18000)))
-    char_bounded: list[list[PageContent]] = []
+    max_chars = _batch_char_limit(split_depth=0)
+    max_cells = max(0, int(getattr(config, "EXTRACTION_MAX_BATCH_TABLE_CELLS", 0) or 0))
+    if max_chars is None and max_cells <= 0:
+        return batches
+    bounded: list[list[PageContent]] = []
     for batch in batches:
         current: list[PageContent] = []
+        current_cells = 0
         for page in batch:
+            page_cells = _page_table_cells(page)
             candidate = [*current, page]
-            if current and len(_build_page_text(candidate)) > max_chars:
-                char_bounded.append(current)
+            over_chars = (
+                max_chars is not None
+                and bool(current)
+                and len(_build_page_text(candidate)) > max_chars
+            )
+            over_cells = max_cells > 0 and bool(current) and current_cells + page_cells > max_cells
+            if over_chars or over_cells:
+                bounded.append(current)
                 current = [page]
+                current_cells = page_cells
             else:
                 current = candidate
+                current_cells += page_cells
         if current:
-            char_bounded.append(current)
-    return char_bounded
+            bounded.append(current)
+    return bounded
 
 
 def _split_text_with_page_marker(page: PageContent, max_chars: int) -> list[str]:
@@ -783,10 +810,6 @@ class ExtractorAgent:
         self.skipped_batches = 0
         self.enqueued_tasks = 0
         self.deduplicated_tasks = 0
-        self.text_policy = None
-        self.task_audit = []
-        self.call_audit = []
-        self.call_plan = []
         self.run_state = run_state
         self._document_objects_by_page: dict[int, tuple[DocumentObject, ...]] = {}
         for obj in document_objects or ():
@@ -855,7 +878,6 @@ class ExtractorAgent:
             contracts.append({
                 "sheet_key": sheet_key,
                 "schema_prompt": str(_SHEET_CONFIGS.get(sheet_key, {}).get("prompt", "")),
-                "reading_contract": reading_instruction([sheet_key]) if getattr(config, "READING_PIPELINE_ENABLED", True) else "",
                 "guideline_prompt": str(guideline_prompt or ""),
             })
         encoded = json.dumps({
@@ -929,7 +951,6 @@ class ExtractorAgent:
         batch_id = self._ensure_batch_id(task, kind)
         restored = self.run_state.restored_result(batch_id)
         if restored is not None:
-            task["effective_status"] = "restored"
             self.resumed_batches += 1
             page_nums = list(task.get("page_nums", []))
             checkpoint = self.run_state.record_for(batch_id) or {}
@@ -963,7 +984,6 @@ class ExtractorAgent:
             is_child=int(task.get("split_depth", 0)) > 0,
         ):
             self.skipped_batches += 1
-            task["effective_status"] = "skipped"
             return True, [] if kind == "sheet" else {key: [] for key in self._task_sheet_keys(task)}
         return False, None
 
@@ -977,11 +997,8 @@ class ExtractorAgent:
         error: str = "",
         recovered: bool = False,
     ) -> Any:
-        task["effective_status"] = status
         if self.run_state is None:
-            if result is not None:
-                task["preserved_result"] = result
-            return task.get("preserved_result")
+            return result
         batch_id = self._ensure_batch_id(task, kind)
         self.run_state.record_batch(
             batch_id=batch_id,
@@ -993,13 +1010,37 @@ class ExtractorAgent:
             error=error,
             split_depth=int(task.get("split_depth", 0)),
             recovered=recovered,
-            member_statuses=task.get("member_statuses"),
         )
         persisted = self.run_state.record_for(batch_id) or {}
         return persisted.get("result")
 
+    @staticmethod
+    def _child_extraction_source(child: dict) -> str:
+        """복구 자식의 object_id로 추출 원천을 판별한다(표 객체 청크 vs 본문 청크)."""
+        object_id = str(child.get("object_id") or "")
+        if not object_id:
+            return ""
+        if object_id.endswith("_text"):
+            return EXTRACTION_SOURCE_TEXT_CHUNK
+        return EXTRACTION_SOURCE_TABLE_OBJECT
+
+    @staticmethod
+    def _tag_child_rows(child: dict, rows: list[dict]) -> list[dict]:
+        source = ExtractorAgent._child_extraction_source(child)
+        if not source:
+            return rows
+        for row in rows:
+            if isinstance(row, dict) and not row.get(EXTRACTION_SOURCE_FIELD):
+                row[EXTRACTION_SOURCE_FIELD] = source
+        return rows
+
     def _merge_rows(self, sheet_key: str, existing: list[dict], incoming: list[dict]) -> list[dict]:
-        rows, conflicts = merge_rows_stably(sheet_key, existing, incoming)
+        rows, conflicts = merge_rows_stably(
+            sheet_key,
+            existing,
+            incoming,
+            prefer=(EXTRACTION_SOURCE_TABLE_OBJECT, EXTRACTION_SOURCE_TEXT_CHUNK),
+        )
         if self.run_state is not None:
             self.run_state.record_conflicts(conflicts)
         return rows
@@ -1026,12 +1067,6 @@ class ExtractorAgent:
                 continue
             seen.add(fingerprint)
             prepared.append(task)
-            self.call_plan.append({"fingerprint": fingerprint, "sheets": self._task_sheet_keys(task),
-                                   "pages": list(task.get("page_nums", [])),
-                                   "input_chars": len(task.get("batch_text", "")),
-                                   "input_sha256": digest(task.get("batch_text", "")),
-                                   "prompt_fingerprint": task.get("prompt_fingerprint"),
-                                   "reason": "routed_sheet_page_assignment"})
         self.enqueued_tasks += len(prepared)
         if self.run_state is not None:
             for task in prepared:
@@ -1102,9 +1137,6 @@ class ExtractorAgent:
             "split_depth": int(task.get("split_depth", 0)) + 1,
         })
         child.pop("batch_id", None)
-        child["parent_trace_id"] = task.get("trace_id")
-        for key in ("trace_id", "effective_status", "enqueue_fingerprint", "prompt_fingerprint", "preserved_result", "member_statuses"):
-            child.pop(key, None)
         return child
 
     @staticmethod
@@ -1208,17 +1240,14 @@ class ExtractorAgent:
         child_failed = False
         for child in children:
             try:
-                child_rows = self._run_sheet_task(child, municipality)
+                child_rows = self._tag_child_rows(child, self._run_sheet_task(child, municipality))
                 recovered = self._merge_rows(task["sheet_key"], recovered, child_rows)
-                child_failed = child_failed or child.get("effective_status") == "partial"
                 if self.run_state is not None:
                     child_record = self.run_state.record_for(str(child.get("batch_id") or "")) or {}
                     child_failed = child_failed or child_record.get("status") not in {None, "ok"}
             except Exception as child_exc:  # 성공한 형제 결과는 보존한다.
                 child_failed = True
-                preserved = self._record_call_failure(child, child_exc)
-                if isinstance(preserved, list):
-                    recovered = self._merge_rows(task["sheet_key"], recovered, preserved)
+                self._record_call_failure(child, child_exc)
         persisted = self._persist_task(
             task,
             "sheet",
@@ -1249,22 +1278,18 @@ class ExtractorAgent:
         for child in children:
             try:
                 child_result = self._run_cluster_task(child, municipality, extraction_prompts)
-                child_failed = child_failed or child.get("effective_status") == "partial"
                 for sheet_key, rows in child_result.items():
                     recovered[sheet_key] = self._merge_rows(
                         sheet_key,
                         recovered.setdefault(sheet_key, []),
-                        rows,
+                        self._tag_child_rows(child, list(rows)),
                     )
                 if self.run_state is not None:
                     child_record = self.run_state.record_for(str(child.get("batch_id") or "")) or {}
                     child_failed = child_failed or child_record.get("status") not in {None, "ok"}
             except Exception as child_exc:
                 child_failed = True
-                preserved = self._record_call_failure(child, child_exc)
-                if isinstance(preserved, dict):
-                    for key, rows in preserved.items():
-                        recovered[key] = self._merge_rows(key, recovered.get(key, []), rows)
+                self._record_call_failure(child, child_exc)
         persisted = self._persist_task(
             task,
             "cluster",
@@ -1279,7 +1304,6 @@ class ExtractorAgent:
         print(f"  [{label}] {page_range} 분할 복구 완료: {total_rows}건")
         return recovered
 
-    @trace_task("sheet")
     def _run_sheet_task(self, task: dict, municipality: str) -> list[dict]:
         """한 추출 태스크를 실행하고, 타임아웃이면 더 작은 페이지 묶음으로 복구한다."""
         restored, restored_rows = self._restore_task(task, "sheet")
@@ -1305,15 +1329,8 @@ class ExtractorAgent:
             )
         split_depth = int(task.get("split_depth", 0))
         max_depth = max(0, int(getattr(config, "EXTRACTION_TIMEOUT_MAX_SPLIT_DEPTH", 6)))
-        char_limit = max(
-            1000,
-            int(getattr(
-                config,
-                "EXTRACTION_MAX_BATCH_CHARS" if split_depth == 0 else "EXTRACTION_RECOVERY_MAX_BATCH_CHARS",
-                18000 if split_depth == 0 else 12000,
-            )),
-        )
-        if not task.get("no_split") and len(str(task.get("batch_text", ""))) > char_limit and split_depth < max_depth:
+        char_limit = _batch_char_limit(split_depth)
+        if char_limit is not None and len(str(task.get("batch_text", ""))) > char_limit and split_depth < max_depth:
             children = self._recovery_children(task, char_limit)
             if children:
                 self.preflight_splits += 1
@@ -1348,7 +1365,7 @@ class ExtractorAgent:
                 else getattr(config, "EXTRACTION_SPLIT_ON_FAILURE", True)
             )
             if (
-                task.get("no_split") or not split_enabled
+                not split_enabled
                 or int(task.get("split_depth", 0)) >= max_depth
                 or (
                     recovery_budget
@@ -1386,7 +1403,6 @@ class ExtractorAgent:
         self._persist_task(task, "sheet", "ok", result=rows)
         return rows
 
-    @trace_task("cluster")
     def _run_cluster_task(
         self,
         task: dict,
@@ -1405,15 +1421,6 @@ class ExtractorAgent:
                     f"체크포인트 복원: {total_restored}건"
                 )
             return restored_result
-        if self.run_state is not None and self.run_state.resume:
-            checkpoint = self.run_state.record_for(str(task.get("batch_id") or "")) or {}
-            members = checkpoint.get("member_statuses", {})
-            if checkpoint.get("status") == "partial" and set(members) == set(task["members"]):
-                missing = [key for key in task["members"] if members[key] != "ok"]
-                if missing:
-                    self.resumed_batches += 1
-                    return self._recover_cluster_members(task, municipality, extraction_prompts,
-                        ClusterPartialParseError(deepcopy(checkpoint.get("result") or {}), missing))
         root_started = float(task.setdefault("timeout_root_started", time.monotonic()))
         recovery_budget = max(
             0,
@@ -1429,15 +1436,8 @@ class ExtractorAgent:
             )
         split_depth = int(task.get("split_depth", 0))
         max_depth = max(0, int(getattr(config, "EXTRACTION_TIMEOUT_MAX_SPLIT_DEPTH", 6)))
-        char_limit = max(
-            1000,
-            int(getattr(
-                config,
-                "EXTRACTION_MAX_BATCH_CHARS" if split_depth == 0 else "EXTRACTION_RECOVERY_MAX_BATCH_CHARS",
-                18000 if split_depth == 0 else 12000,
-            )),
-        )
-        if len(str(task.get("batch_text", ""))) > char_limit and split_depth < max_depth:
+        char_limit = _batch_char_limit(split_depth)
+        if char_limit is not None and len(str(task.get("batch_text", ""))) > char_limit and split_depth < max_depth:
             children = self._recovery_children(task, char_limit)
             if children:
                 self.preflight_splits += 1
@@ -1463,8 +1463,6 @@ class ExtractorAgent:
                 fail_fast=True,
                 batch_id=str(task.get("batch_id") or ""),
             )
-        except ClusterPartialParseError as exc:
-            return self._recover_cluster_members(task, municipality, extraction_prompts, exc)
         except llm_client.LLMQuotaExceededError:
             raise
         except (llm_client.LLMTimeoutError, BatchParseError, llm_client.LLMCallError) as exc:
@@ -1514,61 +1512,6 @@ class ExtractorAgent:
         )
         self._persist_task(task, "cluster", "ok", result=result)
         return result
-
-    def _recover_cluster_members(self, task, municipality, prompts, failure):
-        """Never re-request successful members; unresolved keys remain partial."""
-        recovered = failure.result
-        remaining = list(failure.failed)
-        task.setdefault("timeout_root_started", time.monotonic())
-        task["member_statuses"] = {key: "partial" if key in remaining else "ok" for key in task["members"]}
-        # Persist before the first repair call, including valid empty arrays.
-        self._persist_task(task, "cluster", "partial", result=recovered, error="unresolved_members=" + ",".join(remaining))
-        attempts = text_policy_snapshot()["cluster_member_recovery_attempts"]
-        for attempt in range(attempts):
-            for key in list(remaining):
-                child = self._custom_child_task(task, pages=task.get("pages", []),
-                                                batch_text=task["batch_text"], child_number=attempt + 1)
-                child.pop("members", None)
-                child.update(sheet_key=key, guideline_prompt=prompts.get(key, ""), no_split=True)
-                try:
-                    rows = self._run_sheet_task(child, municipality)
-                    recovered[key] = self._merge_rows(key, recovered.get(key, []), rows)
-                    remaining.remove(key)
-                    task["member_statuses"][key] = "ok"
-                    self._persist_task(task, "cluster", "partial" if remaining else "ok", result=recovered,
-                                       error="unresolved_members=" + ",".join(remaining) if remaining else "", recovered=True)
-                except llm_client.LLMQuotaExceededError:
-                    self._persist_task(task, "cluster", "partial", result=recovered, error="quota; " + ",".join(remaining))
-                    raise
-                except Exception as exc:
-                    self._record_call_failure(child, exc)
-        for key in remaining:
-            self._record_batch(key, task.get("page_nums", []), "parse_fail", len(recovered.get(key, [])),
-                               "제한 복구 후 미해결", batch_id=str(task.get("batch_id") or ""))
-        self._persist_task(task, "cluster", "partial" if remaining else "ok", result=recovered,
-                           error="unresolved_members=" + ",".join(remaining) if remaining else "", recovered=True)
-        return recovered
-
-    def _call_extraction_json(self, prompt, sheets, batch_id):
-        row = {"batch_id": batch_id, "trace_id": CURRENT_TRACE.get(), "sheets": list(sheets), "prompt_chars": len(prompt),
-               "prompt_sha256": digest(prompt), "status": "running"}
-        self.call_audit.append(row)
-        start = time.perf_counter()
-        try:
-            result = llm_client.call_text_json(prompt, system=EXTRACTION_SYSTEM, stage="extraction")
-            row["status"] = "parsed" if result[1] else "parse_fail"
-            return result
-        except Exception as exc:
-            row.update(status="call_fail", error=str(exc)[:300])
-            raise
-        finally:
-            row["elapsed_seconds"] = round(time.perf_counter() - start, 6)
-
-    def optimization_audit(self):
-        return {"policy": text_policy_snapshot(), "routing": self.text_policy.audit() if self.text_policy else {},
-                "plan": self.call_plan, "tasks": self.task_audit, "calls": self.call_audit,
-                "raw_merged_rows": {k: len(v) for k, v in self._raw_results.items() if isinstance(v, list)},
-                "note": "Calls count extraction entrypoints, not internal transport retries. Rows are not accuracy. Task times overlap."}
 
     def ledger_summary(self) -> str:
         total = len(self.ledger)
@@ -1651,10 +1594,9 @@ class ExtractorAgent:
             f"지자체명: {municipality}"
             f"{guideline_block}\n\n"
             f"[배치 텍스트]\n{batch_text}\n\n"
-            f"{cfg['prompt']}\n\n{_PROVENANCE_INSTRUCTION}\n"
-            f"{reading_instruction([sheet_key]) if getattr(config, 'READING_PIPELINE_ENABLED', True) else ''}"
+            f"{cfg['prompt']}\n\n{_PROVENANCE_INSTRUCTION}"
         )
-        parsed, parse_ok = self._call_extraction_json(full_prompt, [sheet_key], batch_id)
+        parsed, parse_ok = llm_client.call_text_json(full_prompt, system=EXTRACTION_SYSTEM, stage="extraction")
 
         if not parse_ok or not isinstance(parsed, dict) or sheet_key not in parsed:
             if fail_fast:
@@ -1670,7 +1612,7 @@ class ExtractorAgent:
             return []
 
         items = parsed.get(sheet_key, [])
-        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        if not isinstance(items, list):
             if fail_fast:
                 raise BatchParseError("스키마 불일치")
             self._record_batch(
@@ -1732,10 +1674,9 @@ class ExtractorAgent:
             "항목 간 데이터를 섞지 말고, 각 행은 그 항목의 스키마 필드만 사용하세요.\n\n"
             f"{combined_schemas}\n\n"
             f"{_PROVENANCE_INSTRUCTION}\n\n"
-            f"{reading_instruction(sheet_keys) if getattr(config, 'READING_PIPELINE_ENABLED', True) else ''}\n\n"
             f"최종 출력은 다음 키를 모두 포함하는 단일 JSON 객체입니다: {{{keys_csv}}}"
         )
-        parsed, parse_ok = self._call_extraction_json(full_prompt, sheet_keys, batch_id)
+        parsed, parse_ok = llm_client.call_text_json(full_prompt, system=EXTRACTION_SYSTEM, stage="extraction")
 
         out: dict[str, list] = {sk: [] for sk in sheet_keys}
         if not parse_ok or not isinstance(parsed, dict):
@@ -1751,12 +1692,16 @@ class ExtractorAgent:
                     batch_id=batch_id,
                 )
             return out
-        invalid_keys = []
+        if fail_fast:
+            invalid_key = next(
+                (sk for sk in sheet_keys if sk not in parsed or not isinstance(parsed.get(sk), list)),
+                None,
+            )
+            if invalid_key is not None:
+                raise BatchParseError(f"{invalid_key} 스키마 불일치")
         for sk in sheet_keys:
             items = parsed.get(sk)
-            invalid = not isinstance(items, list) or any(not isinstance(item, dict) for item in items)
-            if invalid:
-                invalid_keys.append(sk)
+            if not isinstance(items, list):
                 self._record_batch(
                     sk,
                     page_nums,
@@ -1765,23 +1710,21 @@ class ExtractorAgent:
                     "스키마 불일치",
                     batch_id=batch_id,
                 )
-            for item in items if isinstance(items, list) else []:
+                continue
+            for item in items:
                 if not isinstance(item, dict):
                     continue
                 out[sk].append(_attach_row_context(item, municipality, page_nums))
-            if not invalid:
-                self._record_batch(sk, page_nums, "ok", len(out[sk]), batch_id=batch_id)
-        if invalid_keys and fail_fast:
-            raise ClusterPartialParseError(out, invalid_keys)
+            self._record_batch(sk, page_nums, "ok", len(out[sk]), batch_id=batch_id)
         return out
 
-    def _plan_cluster_tasks(
+    def _extract_clustered(
         self,
         routed_pages: dict[str, list[PageContent]],
         municipality: str,
         extraction_prompts: dict[str, str],
         batch_size: int,
-    ) -> list[dict]:
+    ) -> None:
         configured_clusters = getattr(config, "EXTRACTION_SHEET_CLUSTERS", [])
         clusters: list[list[str]] = []
         assigned: set[str] = set()
@@ -1828,16 +1771,9 @@ class ExtractorAgent:
                 nums |= {p.page_number for p in routed_pages.get(sk, [])}
             if not nums:
                 continue
-            # Partition by exact membership. Every (sheet, page) pair is
-            # identical to per-sheet routing; no union-page over-extraction.
-            signatures = {}
-            member_nums = {sk: {p.page_number for p in routed_pages.get(sk, [])} for sk in members}
-            for n in sorted(nums):
-                signature = tuple(sk for sk in members if n in member_nums[sk])
-                signatures.setdefault(signature, []).append(by_num[n])
-            batches = [(list(signature), batch) for signature, group in signatures.items()
-                       for batch in _build_semantic_batches(group, batch_size)]
-            for batch_num, (active_members, batch) in enumerate(batches, start=1):
+            cl_pages = [by_num[n] for n in sorted(nums)]
+            batches = _build_semantic_batches(cl_pages, batch_size)
+            for batch_num, batch in enumerate(batches, start=1):
                 page_nums = [p.page_number for p in batch]
                 page_range = (
                     f"p{page_nums[0]}~{page_nums[-1]}" if len(page_nums) > 1 else f"p{page_nums[0]}"
@@ -1852,20 +1788,15 @@ class ExtractorAgent:
                     "schedule_order": schedule_order,
                 }
                 schedule_order += 1
-                if len(active_members) == 1:
-                    sheet_key = active_members[0]
+                if len(members) == 1:
+                    sheet_key = members[0]
                     task.update({
                         "sheet_key": sheet_key,
                         "guideline_prompt": extraction_prompts.get(sheet_key, ""),
                     })
                 else:
-                    task["members"] = active_members
+                    task["members"] = members
                 tasks.append(task)
-
-        return tasks
-
-    def _extract_clustered(self, routed_pages, municipality, extraction_prompts, batch_size):
-        tasks = self._plan_cluster_tasks(routed_pages, municipality, extraction_prompts, batch_size)
 
         cluster_tasks = self._prepare_tasks(
             [task for task in tasks if "members" in task],
@@ -1926,47 +1857,12 @@ class ExtractorAgent:
             routed = {key: list(pages) for key in _SHEET_CONFIGS}
         else:
             routed = _route_pages_by_sheet(pages)
-        self.text_policy = TextPolicy(pages)
-        routed = self.text_policy.route(routed)
-        source_pages = {p.page_number: p for p in pages}
-        for row in self.text_policy.route_audit:
-            page = source_pages[row['page']]
-            rule = _ROUTE_CONFIGS.get(row['sheet'], {})
-            body = (page.text or '') + '\n' + '\n'.join(page.tables or [])
-            row['evidence'] = {
-                'strong_keywords': [kw for kw in rule.get('strong', []) if kw in body],
-                'weak_keywords': [kw for kw in rule.get('weak', []) if kw in body],
-                'native_table_count': len(page.tables),
-                'context_pages_policy': config.DOCUMENT_ROUTE_CONTEXT_PAGES,
-            }
         self.routed_page_nums = {
             key: {page.page_number for page in value}
             for key, value in routed.items()
             if value
         }
         return routed
-
-    @staticmethod
-    def _plan_sheet_tasks(routed_pages, extraction_prompts, batch_size):
-        tasks = []
-        for key, pages in routed_pages.items():
-            batches = _build_semantic_batches(pages, batch_size)
-            for number, batch in enumerate(batches, start=1):
-                nums = [p.page_number for p in batch]
-                tasks.append({"sheet_key": key, "pages": batch, "page_nums": nums,
-                              "batch_text": _build_page_text(batch), "page_range": _page_range_label(nums),
-                              "batch_num": number, "batch_total": len(batches),
-                              "guideline_prompt": extraction_prompts.get(key, "")})
-        return tasks
-
-    def plan_tasks(self, pages, extraction_prompts=None, batch_size=None):
-        """Exact root queue used by extract(), with no LLM or checkpoint writes."""
-        prompts = extraction_prompts or {}
-        routed = self.route_pages(pages)
-        size = config.BATCH_SIZE if batch_size is None else batch_size
-        if getattr(config, "EXTRACTION_SHEET_CLUSTERING", False) and not getattr(config, "FULL_DOCUMENT_SCAN", False):
-            return self._plan_cluster_tasks(routed, "", prompts, size)
-        return self._plan_sheet_tasks(routed, prompts, size)
 
     def extract_sheet_pages(
         self,
@@ -1985,7 +1881,20 @@ class ExtractorAgent:
         """
         if not sheet_pages:
             return []
-        tasks = self._plan_sheet_tasks({sheet_key: sheet_pages}, extraction_prompts, batch_size)
+        batches = _build_semantic_batches(sheet_pages, batch_size)
+        tasks: list[dict] = []
+        for batch_num, batch in enumerate(batches, start=1):
+            page_nums = [page.page_number for page in batch]
+            tasks.append({
+                "sheet_key": sheet_key,
+                "pages": batch,
+                "batch_text": _build_page_text(batch),
+                "guideline_prompt": extraction_prompts.get(sheet_key, ""),
+                "batch_num": batch_num,
+                "batch_total": len(batches),
+                "page_range": _page_range_label(page_nums),
+                "page_nums": page_nums,
+            })
 
         tasks = self._prepare_tasks(tasks, "sheet", extraction_prompts)
         rows_for_sheet: list[dict] = []
@@ -2027,7 +1936,23 @@ class ExtractorAgent:
 
         if getattr(config, "FULL_DOCUMENT_SCAN", False):
             print("[에이전트2 텍스트추출] 전체 문서 스캔 모드")
-            tasks = self.plan_tasks(pages, extraction_prompts, batch_size)
+            self.routed_page_nums = {key: {page.page_number for page in pages} for key in _SHEET_CONFIGS}
+            batches = _build_semantic_batches(pages, batch_size)
+            tasks: list[dict] = []
+            for batch_num, batch in enumerate(batches, start=1):
+                batch_text = _build_page_text(batch)
+                page_nums = [p.page_number for p in batch]
+                for sheet_key in _SHEET_CONFIGS:
+                    tasks.append({
+                        "sheet_key": sheet_key,
+                        "pages": batch,
+                        "batch_text": batch_text,
+                        "guideline_prompt": extraction_prompts.get(sheet_key, ""),
+                        "batch_num": batch_num,
+                        "batch_total": len(batches),
+                        "page_nums": page_nums,
+                        "page_range": _page_range_label(page_nums),
+                    })
             tasks = self._prepare_tasks(tasks, "sheet", extraction_prompts)
             results = parallel_map_collect(
                 lambda task: self._run_sheet_task(task, municipality),
@@ -2050,13 +1975,13 @@ class ExtractorAgent:
                     self._raw_results[sheet_key],
                     items or [],
                 )
-            print(f"  [full] 시트별 작업 {len(tasks)}개 추출 완료")
+            print(f"  [full] 배치 {len(batches)}개 × 16시트 추출 완료")
 
             total = {k: len(v) for k, v in self._raw_results.items() if isinstance(v, list)}
             print(f"[에이전트2 텍스트추출] 완료. 누적: {total}")
             return self._raw_results
 
-        routed_pages = self.route_pages(pages)
+        routed_pages = _route_pages_by_sheet(pages)
         route_summary = {k: len(v) for k, v in routed_pages.items() if v}
         print(f"[에이전트2 텍스트추출] 문서 구조 라우팅 완료: {route_summary}")
         self.routed_page_nums = {
@@ -2072,7 +1997,27 @@ class ExtractorAgent:
 
         # (시트, 배치) 조합은 서로 독립적이라 동시에 추출한다. parallel_map이 입력
         # 순서를 보존하므로 누적 순서는 순차 실행과 동일하다(출력 결정성 유지).
-        tasks = self._plan_sheet_tasks(routed_pages, extraction_prompts, batch_size)
+        tasks: list[dict] = []
+        for sheet_key in _SHEET_CONFIGS:
+            sheet_pages = routed_pages.get(sheet_key, [])
+            if not sheet_pages:
+                continue
+            batches = _build_semantic_batches(sheet_pages, batch_size)
+            for batch_num, batch in enumerate(batches, start=1):
+                page_nums = [p.page_number for p in batch]
+                page_range = (
+                    f"p{page_nums[0]}~{page_nums[-1]}" if len(page_nums) > 1 else f"p{page_nums[0]}"
+                )
+                tasks.append({
+                    "sheet_key": sheet_key,
+                    "pages": batch,
+                    "batch_text": _build_page_text(batch),
+                    "guideline_prompt": extraction_prompts.get(sheet_key, ""),
+                    "batch_num": batch_num,
+                    "batch_total": len(batches),
+                    "page_range": page_range,
+                    "page_nums": page_nums,
+                })
 
         tasks = self._prepare_tasks(tasks, "sheet", extraction_prompts)
         results = parallel_map_collect(

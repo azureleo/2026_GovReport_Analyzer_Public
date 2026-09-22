@@ -1,0 +1,149 @@
+{
+ "label": "서울_v8-1",
+ "pages": 515,
+ "raw_objects": 13048,
+ "physical_objects": 12626,
+ "physical_duplicates_merged": 422,
+ "objects_by_type": {
+  "text": 11001,
+  "image": 468,
+  "table": 923,
+  "chart": 233,
+  "figure": 1
+ },
+ "action_by_type": {
+  "text:native_keep": 11001,
+  "image:transport_only": 232,
+  "table:native_keep": 493,
+  "table:skip_index_caption": 323,
+  "chart:skip_index_caption": 196,
+  "image:skip_non_data": 56,
+  "table:ocr_required": 107,
+  "image:ocr_required": 180,
+  "figure:ocr_required": 1,
+  "chart:ocr_required": 37
+ },
+ "ocr_required": 325,
+ "ocr_required_by_type": {
+  "table": 107,
+  "image": 180,
+  "figure": 1,
+  "chart": 37
+ },
+ "skipped_index_captions": 519,
+ "required_caption_only": 38,
+ "required_missing_native": 31,
+ "required_reason_top": [
+  [
+   "strong:numbered_caption",
+   291
+  ],
+  [
+   "visual_requires_classification",
+   181
+  ],
+  [
+   "strong:table_structure",
+   107
+  ],
+  [
+   "strong:numeric_value",
+   82
+  ],
+  [
+   "strong:year_or_period",
+   53
+  ],
+  [
+   "strong:quantified_unit",
+   44
+  ],
+  [
+   "chart_requires_digitization",
+   37
+  ],
+  [
+   "strong:chart_structure",
+   37
+  ],
+  [
+   "text_strategy_table",
+   31
+  ],
+  [
+   "native_table_missing",
+   31
+  ],
+  [
+   "strong:data_terms:표",
+   27
+  ],
+  [
+   "negative_overridden_by_strong_or_structured_signal",
+   17
+  ],
+  [
+   "strong:visual_features:vector_density",
+   13
+  ],
+  [
+   "negative:사진",
+   11
+  ],
+  [
+   "strong:data_terms:배출",
+   10
+  ],
+  [
+   "strong:data_terms:에너지",
+   8
+  ],
+  [
+   "low_cell_fill:0.68",
+   8
+  ],
+  [
+   "low_cell_fill:0.57",
+   8
+  ],
+  [
+   "strong:data_terms:에너지,추이",
+   7
+  ],
+  [
+   "strong:data_terms:현황",
+   6
+  ],
+  [
+   "strong:context_terms:%,변화,비중,에너지,연도",
+   6
+  ],
+  [
+   "strong:data_terms:시설",
+   6
+  ],
+  [
+   "low_cell_fill:0.47",
+   6
+  ],
+  [
+   "low_cell_fill:0.69",
+   5
+  ],
+  [
+   "strong:data_terms:변화",
+   5
+  ]
+ ],
+ "render_regions_total": 387,
+ "render_variants": {
+  "object": 302,
+  "panel": 34,
+  "composite": 17,
+  "full_page_context": 28,
+  "fallback_full_page": 6
+ },
+ "vision_batch_size": 8,
+ "vision_batches_estimate": 49,
+ "seconds": 64.4
+}

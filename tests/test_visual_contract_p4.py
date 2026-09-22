@@ -57,7 +57,7 @@ def _structured_result(*, image_index: int | None = None) -> dict:
 
 
 def test_p4_contract_expands_visual_types_and_target_sheets() -> None:
-    assert VISUAL_CONTRACT_VERSION == 5
+    assert VISUAL_CONTRACT_VERSION == 4
     assert {"diagram", "infographic", "flow", "strategy_map"} <= STRUCTURED_VISUAL_TYPES
     assert {
         "regional_conditions",
@@ -233,7 +233,7 @@ def test_batch_path_revalidates_negative_and_preserves_all_object_results(monkey
     assert len(results) == 2
     recovered = next(row for row in results if row["page_number"] == 1)
     assert recovered["negative_revalidation"]["outcome"] == "recovered"
-    assert all(row["contract_version"] == 5 for row in results)
+    assert all(row["contract_version"] == 4 for row in results)
 
 
 def test_structured_visual_is_preserved_but_never_auto_merged(monkeypatch) -> None:

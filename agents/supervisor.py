@@ -20,14 +20,13 @@ from utils import llm_cache, llm_client, parallel
 from utils.pipeline_artifacts import PipelineArtifacts
 from utils.run_state import RunState, sha256_json
 from utils.visual_merge_ab import write_visual_merge_snapshot
+from utils.semantic_contract_guard import summarize_quarantine, write_quarantine_ledger
 from utils.semantic_routing import SemanticRoutingReport, validate_and_reclassify
 from utils.source_verifier import (
     QualityAssessment,
     SourceObjectInventoryReport,
     SourceVerificationReport,
     assess_quality,
-    extraction_outcome,
-    format_ratio,
     build_source_object_inventory,
     create_marked_pdf,
     verify_final_data,
@@ -35,7 +34,6 @@ from utils.source_verifier import (
 from agents.guideline_agent import GuidelineAgent
 from agents.extractor_agent import ExtractorAgent
 from agents.image_agent import ImageAgent
-from utils.vision_review import ReviewBudget
 from agents.organizer_agent import OrganizerAgent, detect_prior_plan_pages
 from agents.gap_fill_agent import GapFillAgent
 from agents.hybrid_review_agent import HybridReviewAgent, reconcile_reflected_merge_log
@@ -193,7 +191,7 @@ class Supervisor:
         self._active_run_state: RunState | None = None
         self._artifact_stats: dict = {}
         self._vision_render_stats: dict = {}
-        self.last_run_outcome = {}
+        self._vision_candidate_stats: dict = {}
 
     def mark_interrupted(self, reason: str = "") -> None:
         if self._active_run_state is not None:
@@ -213,15 +211,6 @@ class Supervisor:
             "render_reused",
             "render_seconds",
             "render_png_bytes",
-            "review_required_objects",
-            "review_required_visual_objects",
-            "explicit_non_data_objects",
-            "empty_native_text_objects",
-            "toc_confirmed_pages",
-            "toc_would_exclude_objects",
-            "toc_excluded_objects",
-            "toc_excluded_ocr_objects",
-            "toc_excluded_fallback_images",
         ):
             value = metrics.get(key)
             if isinstance(value, (int, float)):
@@ -470,7 +459,6 @@ class Supervisor:
                     sheet_merge_log,
                 )
 
-        raw_data["reading_pipeline_audit"] = list(getattr(organizer, "reading_pipeline_audit", []))
         return raw_data, extractor, review_candidates, merge_log
 
     def run(
@@ -578,9 +566,6 @@ class Supervisor:
             )
             self._log(f"[감독관] 실행 상태: {mode} ({run_state.run_id})")
 
-        review_budget = ReviewBudget(run_state)
-        vision_preflights = []
-        text_audits = []
         # STEP 2~3: 추출·정제 (품질 미달 시 재시도)
         final_data = None
         source_verification: SourceVerificationReport | None = None
@@ -627,8 +612,6 @@ class Supervisor:
             self._add_timing("텍스트 추출", elapsed)
             self._log(extractor.report())
             self._log(extractor.ledger_summary())
-            if hasattr(extractor, "optimization_audit"):
-                text_audits.append(extractor.optimization_audit())
             if run_state is not None:
                 state_summary = run_state.summary()
                 self._log(
@@ -644,7 +627,7 @@ class Supervisor:
             raw_data["execution_info"] = execution_info
 
             if include_images:
-                image_agent = ImageAgent(run_state=run_state, review_budget=review_budget)
+                image_agent = ImageAgent(run_state=run_state)
                 t0 = time.time()
                 try:
                     raw_data = image_agent.extract(
@@ -657,7 +640,11 @@ class Supervisor:
                 except llm_client.LLMQuotaExceededError as exc:
                     logger.warning("이미지 분석 quota/한도 문제로 기존 텍스트 결과로 계속 진행: %s", exc)
                 self._add_vision_render_stats(image_agent.metrics())
-                vision_preflights.append(image_agent.preflight)
+                self._vision_candidate_stats = {
+                    key: value
+                    for key, value in image_agent.metrics().items()
+                    if str(key).startswith("vision_") and isinstance(value, (int, float))
+                }
                 elapsed = time.time() - t0
                 self._add_timing("이미지 분석", elapsed)
                 self._log(image_agent.report())
@@ -911,11 +898,18 @@ class Supervisor:
             })
             if semantic_routing is not None:
                 pipeline_metrics.update(semantic_routing.metrics())
+            pipeline_metrics.update(self._vision_candidate_stats)
+            key_blank_stats = final_data.get("key_field_blank_ratio")
+            if isinstance(key_blank_stats, dict):
+                pipeline_metrics.update({
+                    f"key_field_blank_ratio.{key}": value.get("ratio")
+                    for key, value in key_blank_stats.items()
+                    if isinstance(value, dict)
+                })
             if source_object_inventory is not None:
                 pipeline_metrics.update({
-                    "automatic_source_object_coverage": (
-                        round(source_object_inventory.coverage_ratio, 4)
-                        if source_object_inventory.coverage_ratio is not None else None
+                    "automatic_source_object_coverage": round(
+                        source_object_inventory.coverage_ratio, 4
                     ),
                     "object_routing_error_rate": round(
                         source_object_inventory.routing_error_rate, 4
@@ -941,7 +935,7 @@ class Supervisor:
                 "[감독관] 독립 지표: "
                 "셀 정확도·객체 재현율=고정 평가(--evaluate) 시 산출, "
                 f"자동 객체 커버리지="
-                f"{format_ratio(quality_assessment.metrics.get('automatic_source_object_coverage'))}, "
+                f"{quality_assessment.metrics.get('automatic_source_object_coverage', 0):.1%}, "
                 f"라우팅 오류율={quality_assessment.metrics.get('routing_error_rate', 0):.1%}"
             )
 
@@ -968,26 +962,18 @@ class Supervisor:
         result_path = excel_agent.write(excel_data, output_path)
         elapsed = time.time() - t0
         self._add_timing("엑셀 작성", elapsed)
+        # 격리 원장은 엑셀 시트가 아니라 산출물 옆 JSON으로 남긴다(시트 계약 불변).
+        quarantine_records = final_data.get("semantic_contract_review") if final_data else None
+        if isinstance(quarantine_records, list):
+            try:
+                ledger_path = write_quarantine_ledger(quarantine_records, result_path)
+                self._log(
+                    f"[감독관] 의미 계약 격리 원장 {len(quarantine_records)}건: {ledger_path}"
+                )
+            except OSError as exc:
+                logger.warning("격리 원장 저장 실패: %s", exc)
         self._log(excel_agent.report())
         self._log(f"[감독관] 엑셀 작성 완료: {elapsed:.1f}초")
-
-        # Persist original held rows even when run-state recording is disabled.
-        from utils.reading_pipeline import audit_summary
-        reading_audit = (final_data or {}).get("reading_pipeline_audit", [])
-        reading_report_path = result_path.with_name(f"{result_path.stem}_reading_pipeline.json")
-        try:
-            reading_report_path.write_text(json.dumps({
-                **audit_summary(reading_audit),
-                "enabled": bool(getattr(config, "READING_PIPELINE_ENABLED", True)),
-                "accuracy_evaluated": False, "records": reading_audit,
-                "visual_context_records": (final_data or {}).get("visual_context_audit", []),
-            }, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-            self._log(f"[감독관] A/B 연결 기록: {reading_report_path}")
-        except OSError as exc:
-            # A locked audit file must not turn an already saved workbook into
-            # a failed extraction. Make the missing audit explicit to the user.
-            logger.warning("A/B 연결 기록 저장 실패. Excel은 유지합니다: %s", exc)
-            self._log(f"[감독관] 경고: A/B 연결 기록 저장 실패 ({exc})")
 
         # 외전 검수 도구와 같은 좌표 마킹 산출물. 점수 계산과 분리해 실패해도 Excel은 보존한다.
         if (
@@ -1050,22 +1036,6 @@ class Supervisor:
                 source_object_inventory,
             )
         self._log(f"  최종 품질 점수: {quality_assessment.score:.1f}/100")
-        self.last_run_outcome = extraction_outcome(
-            quality_assessment.metrics,
-            run_state.completion_status() if run_state is not None else "complete",
-        )
-        outcome_path = result_path.with_name(f"{result_path.stem}_run_outcome.json")
-        outcome_path.write_text(json.dumps(self.last_run_outcome, ensure_ascii=False, indent=2), encoding="utf-8")
-        text_audit_path = result_path.with_name(f"{result_path.stem}_text_audit.json")
-        text_audit_path.write_text(json.dumps({
-            "attempts": text_audits,
-            "final_rows_by_sheet": {k: len(final_data.get(k, [])) for k in config.EXTRACTION_SHEETS},
-            "attribution": "Final counts include downstream filtering/merging and possibly Vision; not per-call accuracy.",
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
-        if vision_preflights:
-            preflight_path = result_path.with_name(f"{result_path.stem}_vision_preflight.json")
-            preflight_path.write_text(json.dumps({"attempts": vision_preflights, "review_budget": review_budget.snapshot()}, ensure_ascii=False, indent=2), encoding="utf-8")
-        self._log(f"  결과 저장 여부: 성공 / 추출 상태: {self.last_run_outcome['status']} / 종료 코드: {self.last_run_outcome['exit_code']}")
         if run_state is not None:
             manifest_path = run_state.finalize(
                 output_path=result_path,
@@ -1078,16 +1048,16 @@ class Supervisor:
                     )
                 }),
                 extra={
-                    **self.last_run_outcome,
-                    "review_budget": review_budget.snapshot(),
                     "quality_score": quality_assessment.score,
-                    "text_audit_path": str(text_audit_path),
                     "quality_metrics": quality_assessment.metrics,
                     "timings_seconds": {key: round(value, 3) for key, value in self._timings.items()},
                     "llm_cache_stats": llm_cache.get_cache_stats(),
                     "llm_call_stats": llm_client.get_llm_stats(),
                     "parallel_queue_stats": parallel.get_parallel_stats(),
                     "pipeline_artifact_stats": dict(self._artifact_stats),
+                    "semantic_contract_review_summary": summarize_quarantine(
+                        final_data.get("semantic_contract_review") or []
+                    ),
                     "vision_render_stats": {
                         key: round(float(value), 3) if key.endswith("_seconds") else int(value)
                         for key, value in self._vision_render_stats.items()
@@ -1096,7 +1066,7 @@ class Supervisor:
             )
             state_summary = run_state.summary()
             self._log(
-                f"  배치 실행 상태: {run_state.completion_status()} "
+                f"  실행 상태: {run_state.completion_status()} "
                 f"(성공 {state_summary['ok']}/{state_summary['expected']}, "
                 f"미복구 {state_summary['failed'] + state_summary['missing']})"
             )

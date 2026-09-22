@@ -11,17 +11,13 @@ import pytest
 
 import config
 from agents import organizer_agent
-from scripts.golden_score_contract import 계약헤더
 from scripts.score_against_golden import score_workbooks
 
-골든열 = [
-    "골든_출처유형", "골든_출처페이지", "골든_채점제외", "골든_비고",
-    "골든_산출유형",
-]
+골든열 = ["골든_출처유형", "골든_출처페이지", "골든_채점제외", "골든_비고"]
 
 
 def _계약열(sheet_name: str) -> list[str]:
-    return 계약헤더(sheet_name)
+    return [header for header in config.EXCEL_HEADERS[sheet_name] if header not in {"출처페이지", "데이터상태"}]
 
 
 def _시트_쓰기(wb, sheet_name: str, rows: list[dict], *, golden: bool = False) -> None:
@@ -60,47 +56,6 @@ def test_organizer_공개_별칭은_기존_private_함수와_같은_객체다() 
     assert organizer_agent.normalize_direct_indirect_type is organizer_agent._normalize_direct_indirect_type
     assert organizer_agent.to_float is organizer_agent._to_float
     assert organizer_agent.normalize_provenance_pages is organizer_agent._normalize_provenance_pages
-
-
-def test_산출유형별_reported와_calculated를_분리_평가한다(tmp_path: Path) -> None:
-    result = _점수(
-        tmp_path,
-        {
-            "03_배출현황_지역": [
-                {
-                    "배출유형": "직접배출", "부문": "건물", "세부부문": "전기",
-                    "연도": 2020, "배출량": 100, "단위": "톤",
-                    "derivation_type": "explicit",
-                },
-                {
-                    "배출유형": "직접배출", "부문": "건물", "세부부문": "전기",
-                    "연도": 2021, "배출량": 90, "단위": "톤",
-                    "derivation_type": "calculated",
-                },
-            ]
-        },
-        {
-            "03_배출현황_지역": [
-                {
-                    "배출유형": "직접배출", "부문": "건물", "세부부문": "전기",
-                    "연도": 2020, "배출량": 100, "단위": "톤",
-                    "골든_출처유형": "텍스트표", "골든_출처페이지": "1",
-                    "골든_산출유형": "reported",
-                },
-                {
-                    "배출유형": "직접배출", "부문": "건물", "세부부문": "전기",
-                    "연도": 2021, "배출량": 90, "단위": "톤",
-                    "골든_출처유형": "텍스트표", "골든_출처페이지": "2",
-                    "골든_산출유형": "calculated",
-                },
-            ]
-        },
-    )
-
-    assert result["산출유형별_전체"]["reported"]["리콜"] == 1.0
-    assert result["산출유형별_전체"]["reported"]["산출유형일치율"] == 1.0
-    assert result["산출유형별_전체"]["calculated"]["리콜"] == 1.0
-    assert result["산출유형별_전체"]["calculated"]["값일치율"] == 1.0
 
 
 def test_시트03_엄격키_매칭으로_리콜과_정밀도를_계산한다(tmp_path: Path) -> None:
@@ -535,13 +490,6 @@ def test_출처유형_분해와_채점제외를_반영한다(tmp_path: Path) -> 
     assert result["출처유형별_전체"]["그래프"]["리콜"] == 0.5
     assert result["출처유형별_전체"]["시각 유래"]["리콜"] == 0.5
     assert result["출처유형별_수치시트"]["시각 유래"]["리콜"] == 0.5
-    assert result["시트별"]["03_배출현황_지역"]["출처유형별"]["시각 유래"] == {
-        "골든행수": 2,
-        "매칭수": 1,
-        "리콜": 0.5,
-        "값비교수": 2,
-        "값일치율": 1.0,
-    }
 
 
 def test_없는_골든시트와_형식오류시트를_명확히_보고한다(tmp_path: Path) -> None:

@@ -13,7 +13,7 @@ from typing import Any
 from openpyxl import load_workbook
 
 from scripts.audit_visual_inventory import AuditPaths, run_audit
-from scripts.score_against_golden import score_workbooks
+from scripts.benchmark_golden_score import score_workbooks
 from utils.routing_benchmark import evaluate_fixed_routing_inventory
 
 

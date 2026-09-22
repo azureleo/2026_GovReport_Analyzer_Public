@@ -31,40 +31,14 @@ import subprocess
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
-from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Sequence
 
 import config
 from utils.llm_cache import LLMCacheRequest, cached_response, cached_response_if_present
-from utils.local_process import run_local_command
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_limited_vision = ContextVar("limited_vision", default=None)
-
-
-@contextmanager
-def limited_vision_call(timeout_seconds: float):
-    """Per-thread single CLI request: no JSON retry, quota wait or model fallback."""
-    token = _limited_vision.set({"deadline": time.monotonic() + timeout_seconds, "requests": 0, "commands": 0})
-    try:
-        yield
-    finally:
-        _limited_vision.reset(token)
-
-
-def _claim_limited_vision_request(stage):
-    limit = _limited_vision.get()
-    if limit is None:
-        return False
-    if _resolve_provider(stage) not in {"codex", "claude"}:
-        raise LLMCallError("제한적 판독의 단일 호출/시간 보장은 현재 codex·claude CLI만 지원합니다")
-    if limit["requests"] or time.monotonic() >= limit["deadline"]:
-        raise LLMTimeoutError("제한적 Vision 호출 예산 소진")
-    limit["requests"] += 1
-    return True
 
 
 class LLMCallError(RuntimeError):
@@ -315,6 +289,29 @@ def _stage_config_value(mapping_name: str, stage: str | None) -> str:
     return str(mapping.get(stage, "") or "").strip()
 
 
+_PROVIDER_ALIASES = {
+    "local": "codex",
+    "local-agent": "codex",
+    "claude-code": "claude",
+    "gemini-api": "gemini",
+    "gpt": "openai",
+    "openai-api": "openai",
+}
+LOCAL_AGENT_PROVIDERS = frozenset({"codex", "claude", "auto"})
+
+
+def provider_name(stage: str | None = None) -> str:
+    """설정만으로 단계 백엔드 이름을 돌려준다(CLI·API 키 가용성 검사 없음, 예외 없음)."""
+    stage_provider = _stage_config_value("STAGE_PROVIDERS", stage).lower()
+    provider = stage_provider or (getattr(config, "LLM_PROVIDER", "codex") or "codex").strip().lower()
+    return _PROVIDER_ALIASES.get(provider, provider)
+
+
+def is_local_agent_provider(stage: str | None = None) -> bool:
+    """codex/claude(및 auto)는 로컬 에이전트로 본다 — 배치·타임아웃 기본값 분기용."""
+    return provider_name(stage) in LOCAL_AGENT_PROVIDERS
+
+
 def _resolve_provider(stage: str | None = None) -> str:
     stage_provider = _stage_config_value("STAGE_PROVIDERS", stage).lower()
     provider = stage_provider or (getattr(config, "LLM_PROVIDER", "codex") or "codex").strip().lower()
@@ -554,15 +551,18 @@ def _model_identity(provider: str, stage: str | None = None) -> str:
 
 def _run_command(command: Sequence[str], prompt: str, *, cwd: Path, timeout: int) -> str:
     """로컬 CLI를 실행하고 stdout을 반환한다."""
-    limit = _limited_vision.get()
-    if limit is not None:
-        remaining = limit["deadline"] - time.monotonic()
-        if limit["commands"] or remaining <= 0:
-            raise LLMTimeoutError("제한적 Vision CLI 실행 예산 소진")
-        limit["commands"] += 1
-        timeout = min(timeout, remaining)
     logger.debug("로컬 에이전트 실행: %s", " ".join(shlex.quote(part) for part in command))
-    completed = run_local_command(list(command), prompt, cwd=cwd, timeout=timeout)
+    completed = subprocess.run(
+        list(command),
+        input=prompt,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        cwd=str(cwd),
+        timeout=timeout,
+        check=False,
+    )
     if completed.returncode != 0:
         message = (
             "로컬 에이전트 실행 실패 "
@@ -578,14 +578,22 @@ def _run_command(command: Sequence[str], prompt: str, *, cwd: Path, timeout: int
     return completed.stdout.strip()
 
 
+def local_agent_timeout(stage: str | None = None) -> int:
+    """로컬 에이전트 호출 타임아웃(초). vision 단계는 LOCAL_AGENT_VISION_TIMEOUT을 쓴다."""
+    if stage == "vision":
+        return int(getattr(config, "LOCAL_AGENT_VISION_TIMEOUT", 600))
+    return int(getattr(config, "LOCAL_AGENT_TIMEOUT", 300))
+
+
 def _run_codex(
     prompt: str,
     *,
     image_paths: Sequence[Path] | None = None,
     cwd: Path,
     model: str | None = None,
+    timeout: int | None = None,
 ) -> str:
-    timeout = int(getattr(config, "LOCAL_AGENT_TIMEOUT", 300))
+    timeout = int(timeout if timeout is not None else local_agent_timeout())
     command = _split_command(getattr(config, "CODEX_COMMAND", "codex"))
 
     with tempfile.TemporaryDirectory(prefix="carbon-codex-") as tmpdir:
@@ -653,10 +661,11 @@ def _run_claude(
     image_paths: Sequence[Path] | None = None,
     cwd: Path,
     model: str | None = None,
+    timeout: int | None = None,
 ) -> str:
     # Claude Code는 버전별 CLI 옵션 차이가 있어 가장 보편적인 print 모드를 사용한다.
     # 이미지가 있으면 prompt에 cwd 내부 임시 파일 경로가 포함되어 Claude가 읽을 수 있다.
-    timeout = int(getattr(config, "LOCAL_AGENT_TIMEOUT", 300))
+    timeout = int(timeout if timeout is not None else local_agent_timeout())
     base_command = _split_command(getattr(config, "CLAUDE_COMMAND", "claude"))
     paths = list(image_paths or [])
     command = [*base_command, "-p", "--output-format", "text"]
@@ -688,8 +697,10 @@ def _call_local_agent(
     images_b64: Sequence[str] | None = None,
     provider: str | None = None,
     model: str | None = None,
+    stage: str | None = None,
 ) -> str:
     provider = provider or _resolve_provider()
+    timeout = local_agent_timeout(stage)
     images = list(images_b64 or ([] if image_b64 is None else [image_b64]))
     # 호출마다 깨끗한 작업 디렉터리를 쓴다. 프로젝트 CLAUDE.md/AGENTS.md 자동 로드를
     # 막고, 이미지는 이 디렉터리 안에 기록해 에이전트가 cwd 내부에서 읽게 한다.
@@ -706,9 +717,9 @@ def _call_local_agent(
 
         prepared = _agent_prompt(prompt, system, image_path=image_path, image_paths=image_paths)
         if provider == "codex":
-            return _run_codex(prepared, image_paths=image_paths, cwd=workdir, model=model)
+            return _run_codex(prepared, image_paths=image_paths, cwd=workdir, model=model, timeout=timeout)
         if provider == "claude":
-            return _run_claude(prepared, image_paths=image_paths, cwd=workdir, model=model)
+            return _run_claude(prepared, image_paths=image_paths, cwd=workdir, model=model, timeout=timeout)
         raise RuntimeError(f"지원하지 않는 로컬 에이전트입니다: {provider}")
 
 
@@ -775,8 +786,6 @@ def _sleep_with_heartbeat(total_seconds: float, label: str) -> None:
 
 
 def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
-    if _limited_vision.get() is not None:
-        max_retries = 1
     attempt = 0
     quota_waited = 0.0
     timeout_retries = max(0, int(getattr(config, "LOCAL_AGENT_TIMEOUT_RETRIES", 1)))
@@ -815,7 +824,7 @@ def _retry_local_call(fn, *, max_retries: int, label: str) -> str:
             # 차단기가 fallback 전환 또는 부분 실패 격리를 결정한다.
             raise
         except LLMQuotaExceededError as exc:
-            if _limited_vision.get() is not None or not getattr(config, "LLM_QUOTA_WAIT_ENABLED", True):
+            if not getattr(config, "LLM_QUOTA_WAIT_ENABLED", True):
                 raise
             parsed = _parse_quota_reset_seconds(str(exc))
             poll = int(getattr(config, "LLM_QUOTA_WAIT_POLL_SECONDS", 120))
@@ -878,14 +887,6 @@ def _call_local_with_capacity(
     cached_primary = cached_response_if_present(primary_request)
     if cached_primary is not None:
         return cached_primary
-    if _limited_vision.get() is not None:
-        # Bounded probes use exactly the requested model, never capacity fallback.
-        return cached_response(primary_request, lambda: _record_call(
-            kind, provider, lambda: _retry_local_call(
-                lambda: _call_local_agent(prompt, system, images_b64=images_b64,
-                                         provider=provider, model=primary_model or None),
-                max_retries=1, label=f"{provider} bounded {kind}"),
-            request=primary_request, stage=stage))
     while True:
         selected_model, is_probe = _capacity_select_model(provider, primary_model, stage)
         if selected_model in tried_models:
@@ -917,6 +918,7 @@ def _call_local_with_capacity(
                             images_b64=images_b64,
                             provider=provider,
                             model=selected_model or None,
+                            stage=stage,
                         ),
                         max_retries=max_retries,
                         label=(
@@ -1023,8 +1025,6 @@ def call_vision(
     stage: str | None = None,
 ) -> str:
     """이미지 + 텍스트 프롬프트를 단계별 백엔드 오버라이드까지 반영해 전달한다."""
-    if _claim_limited_vision_request(stage):
-        max_retries = 1
     provider = _resolve_provider(stage)
     stage_model = _stage_model(stage)
     request = LLMCacheRequest(
@@ -1096,9 +1096,6 @@ def call_vision_batch(
         return "{}"
     if len(images_b64) == 1:
         return call_vision(images_b64[0], prompt, system=system, max_retries=max_retries, stage=stage)
-
-    if _claim_limited_vision_request(stage):
-        max_retries = 1
 
     provider = _resolve_provider(stage)
     stage_model = _stage_model(stage)
@@ -1678,8 +1675,6 @@ def call_vision_json(
     parsed = parse_json(raw)
     if _json_parse_ok(raw, parsed):
         return parsed, True
-    if _limited_vision.get() is not None:
-        return parsed, False
     retry_raw = call_vision(image_b64, f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries, stage=stage)
     retry_parsed = parse_json(retry_raw)
     return retry_parsed, _json_parse_ok(retry_raw, retry_parsed)
@@ -1697,8 +1692,6 @@ def call_vision_batch_json(
     parsed = parse_json(raw)
     if _json_parse_ok(raw, parsed):
         return parsed, True
-    if _limited_vision.get() is not None:
-        return parsed, False
     retry_raw = call_vision_batch(images_b64, f"{prompt}{_JSON_RETRY_SUFFIX}", system=system, max_retries=max_retries, stage=stage)
     retry_parsed = parse_json(retry_raw)
     return retry_parsed, _json_parse_ok(retry_raw, retry_parsed)

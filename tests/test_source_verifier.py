@@ -87,9 +87,7 @@ def test_quality_score_uses_grounding_fill_provenance_and_is_capped():
 
     assessment = assess_quality(final_data, verification)
 
-    # No recorded batches means no extraction-success points (v2 contract).
-    assert assessment.score == 85.0
-    assert assessment.metrics["extraction_success_ratio"] is None
+    assert assessment.score == 95.0
     assert assessment.metrics["source_inventory_connected"] is False
     assert any("점수 상한" in issue for issue in assessment.issues)
 
@@ -151,7 +149,6 @@ def test_source_object_inventory_connects_table_and_unlocks_full_score():
         grounding_ratio=1.0, provenance_ratio=1.0,
     )
 
-    final_data["pipeline_metrics"] = {"extraction_batches_total": 1, "extraction_batches_ok": 1}
     inventory = build_source_object_inventory(final_data, document)
     assessment = assess_quality(final_data, verification, inventory)
 

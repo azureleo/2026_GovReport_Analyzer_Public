@@ -276,6 +276,7 @@ class ExtractionLedgerTests(unittest.TestCase):
             }]
 
         with patch.object(config, "EXTRACTION_MAX_BATCH_CHARS", 1000), \
+             patch.object(config, "EXTRACTION_MAX_BATCH_CHARS_API", 1000), \
              patch.object(config, "EXTRACTION_RECOVERY_MAX_BATCH_CHARS", 1000), \
              patch.object(agent, "_extract_sheet", side_effect=fake_extract):
             rows = agent.extract_sheet_pages(

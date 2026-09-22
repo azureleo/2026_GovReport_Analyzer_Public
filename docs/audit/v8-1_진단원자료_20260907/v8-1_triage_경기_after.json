@@ -1,0 +1,146 @@
+{
+ "label": "경기_v8-1",
+ "pages": 476,
+ "raw_objects": 16750,
+ "physical_objects": 16554,
+ "physical_duplicates_merged": 196,
+ "objects_by_type": {
+  "image": 294,
+  "text": 15513,
+  "table": 631,
+  "chart": 116
+ },
+ "action_by_type": {
+  "image:skip_non_data": 27,
+  "text:native_keep": 15513,
+  "image:transport_only": 163,
+  "table:native_keep": 398,
+  "table:skip_index_caption": 104,
+  "chart:skip_index_caption": 104,
+  "chart:ocr_required": 12,
+  "table:ocr_required": 129,
+  "image:ocr_required": 104
+ },
+ "ocr_required": 245,
+ "ocr_required_by_type": {
+  "chart": 12,
+  "table": 129,
+  "image": 104
+ },
+ "skipped_index_captions": 208,
+ "required_caption_only": 12,
+ "required_missing_native": 12,
+ "required_reason_top": [
+  [
+   "strong:numbered_caption",
+   132
+  ],
+  [
+   "strong:table_structure",
+   129
+  ],
+  [
+   "visual_requires_classification",
+   104
+  ],
+  [
+   "strong:numeric_value",
+   101
+  ],
+  [
+   "text_strategy_table",
+   96
+  ],
+  [
+   "strong:quantified_unit",
+   82
+  ],
+  [
+   "strong:year_or_period",
+   77
+  ],
+  [
+   "low_cell_fill:0.64",
+   13
+  ],
+  [
+   "chart_requires_digitization",
+   12
+  ],
+  [
+   "strong:chart_structure",
+   12
+  ],
+  [
+   "native_table_missing",
+   12
+  ],
+  [
+   "strong:visual_features:vector_density",
+   11
+  ],
+  [
+   "low_cell_fill:0.67",
+   11
+  ],
+  [
+   "low_cell_fill:0.55",
+   9
+  ],
+  [
+   "low_cell_fill:0.68",
+   9
+  ],
+  [
+   "strong:data_terms:표",
+   9
+  ],
+  [
+   "strong:data_terms:추이",
+   9
+  ],
+  [
+   "low_cell_fill:0.63",
+   9
+  ],
+  [
+   "strong:data_terms:배출",
+   7
+  ],
+  [
+   "low_cell_fill:0.65",
+   7
+  ],
+  [
+   "low_cell_fill:0.66",
+   7
+  ],
+  [
+   "low_cell_fill:0.56",
+   7
+  ],
+  [
+   "low_cell_fill:0.70",
+   6
+  ],
+  [
+   "low_cell_fill:0.69",
+   6
+  ],
+  [
+   "strong:context_terms:배출",
+   6
+  ]
+ ],
+ "render_regions_total": 263,
+ "render_variants": {
+  "object": 242,
+  "panel": 4,
+  "composite": 2,
+  "full_page_context": 14,
+  "fallback_full_page": 1
+ },
+ "vision_batch_size": 8,
+ "vision_batches_estimate": 33,
+ "seconds": 77.1
+}

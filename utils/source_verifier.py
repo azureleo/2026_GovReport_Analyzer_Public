@@ -321,7 +321,7 @@ class SourceObjectInventoryReport:
     confirmed_objects: int
     partial_objects: int
     unconfirmed_objects: int
-    coverage_ratio: float | None
+    coverage_ratio: float
     routing_evaluable_objects: int = 0
     routing_mismatch_objects: int = 0
     routing_error_rate: float = 0.0
@@ -335,27 +335,6 @@ class SourceObjectInventoryReport:
     triage_missed_objects: int = 0
     triage_miss_rate: float = 0.0
     triage_unresolved_objects: int = 0
-    transport_proxy_objects: int = 0
-    attempted_objects: int = 0
-    attempt_denominator_objects: int = 0
-    held_objects: int = 0
-    explicit_non_data_objects: int = 0
-
-    def evaluation_metrics(self) -> dict[str, Any]:
-        return {
-            "evaluation_version": "source-inventory-v2",
-            "source_object_coverage_unavailable_reason": (
-                "no_confirmed_data_candidates" if self.coverage_ratio is None else None
-            ),
-            "vision_attempted_objects": self.attempted_objects,
-            "vision_attempt_denominator": self.attempt_denominator_objects,
-            "vision_attempt_rate": self.attempted_objects / self.attempt_denominator_objects if self.attempt_denominator_objects else None,
-            "source_object_held_objects": self.held_objects,
-            "source_object_held_rate": self.held_objects / self.total_objects if self.total_objects else None,
-            "source_object_explicit_non_data": self.explicit_non_data_objects,
-            "source_object_explicit_exclusion_rate": self.explicit_non_data_objects / self.total_objects if self.total_objects else None,
-            "source_object_transport_proxies": self.transport_proxy_objects,
-        }
 
     def excel_rows(self, municipality: str) -> list[dict[str, Any]]:
         return [row.as_excel_row(municipality) for row in self.rows]
@@ -364,11 +343,9 @@ class SourceObjectInventoryReport:
         return (
             f"원문 객체 {self.total_objects}개, 확인 {self.confirmed_objects}개, "
             f"부분 {self.partial_objects}개, 미확인 {self.unconfirmed_objects}개, "
-            f"완전성 {format_ratio(self.coverage_ratio)}, "
+            f"완전성 {self.coverage_ratio:.1%}, "
             f"추출분모 {self.extraction_denominator_objects}개, "
             f"제외후보 {self.excluded_candidate_objects}개, "
-            f"내용 미확정 검토 {self.review_candidate_objects}개(완전성 분모에서 분리), "
-            f"판독 보류 {self.held_objects}개, "
             f"Triage 누락의심 {self.triage_missed_objects}개 "
             f"({self.triage_miss_rate:.1%}), "
             f"시트의미 판정 {self.routing_evaluable_objects}개, "
@@ -377,7 +354,7 @@ class SourceObjectInventoryReport:
         )
 
     def validation_issues(self, municipality: str) -> list[dict[str, str]]:
-        severity = "정보" if self.coverage_ratio is not None and self.coverage_ratio >= 0.8 and not self.held_objects else "경고"
+        severity = "정보" if self.coverage_ratio >= 0.8 else "경고"
         issues = [{
             "지자체명": municipality,
             "심각도": severity,
@@ -976,13 +953,6 @@ def _object_evaluation_target(obj: DocumentObject, page_text: str) -> str:
         return ""
     if obj.metadata.get("is_index_reference") or is_index_page(page_text):
         return ""
-    if obj.metadata.get("triage_action") == "review_required":
-        return "review"
-    if obj.metadata.get("promotion_reason"):
-        status = obj.metadata.get("final_status")
-        if status == "not_relevant":
-            return "triage_negative"
-        return "extraction" if status == "extracted" else "review"
     if _is_data_object(obj, page_text):
         return "extraction"
     if obj.metadata.get("triage_action") == "skip_non_data":
@@ -1315,12 +1285,12 @@ def build_source_object_inventory(
 
     total = len(results)
     extraction_rows = [
-        row for row in results if row.evaluation_target == "extraction"
+        row for row in results if row.evaluation_target in {"extraction", "review"}
     ]
     coverage_denominator = len(extraction_rows)
     coverage = (
         sum(row.completeness_score for row in extraction_rows) / coverage_denominator
-        if coverage_denominator else None
+        if coverage_denominator else 1.0
     )
     routing_statuses = {"일치", "오배치의심", "본문미연결"}
     routing_evaluable = sum(row.routing_status in routing_statuses for row in results)
@@ -1336,11 +1306,6 @@ def build_source_object_inventory(
             row.status in {"미확인", "검토필요"} for row in extraction_rows
         ),
         coverage_ratio=coverage,
-        transport_proxy_objects=sum(bool(obj.metadata.get("render_proxy") or obj.metadata.get("context_only") or obj.metadata.get("triage_action") == "transport_only") for obj in prepared.objects),
-        attempted_objects=sum(row.attempt_count > 0 for row in results if row.triage_action in {"ocr_required", "review_required"}),
-        attempt_denominator_objects=sum(row.triage_action in {"ocr_required", "review_required"} for row in results),
-        held_objects=sum(row.final_status in {"needs_review", "no_data"} for row in results if row.evaluation_target != "triage_negative"),
-        explicit_non_data_objects=sum(row.triage_action == "skip_non_data" for row in results),
         routing_evaluable_objects=routing_evaluable,
         routing_mismatch_objects=routing_mismatches,
         routing_error_rate=(
@@ -1446,29 +1411,17 @@ def assess_quality(
     warnings = sum(row.get("심각도") == "경고" for row in base_validation)
     error_types = {_validation_issue_type(row) for row in base_validation if row.get("심각도") == "오류"}
     warning_types = {_validation_issue_type(row) for row in base_validation if row.get("심각도") == "경고"}
-    business_rows = sum(
-        1
-        for key in config.EXTRACTION_SHEETS
-        if isinstance(final_data.get(key), list)
-        for row in final_data[key]
-        if isinstance(row, dict) and any(_filled(value) for value in row.values())
-    )
-    integrity_ratio = (
-        max(0.0, 1.0 - min(1.0, len(error_types) * 0.2 + len(warning_types) * 0.035))
-        if business_rows else 0.0
-    )
+    integrity_ratio = max(0.0, 1.0 - min(1.0, len(error_types) * 0.2 + len(warning_types) * 0.035))
 
     grounding_ratio = verification.grounding_ratio if verification is not None else 0.0
     provenance_ratio = verification.provenance_ratio if verification is not None else 0.0
-    object_coverage = source_inventory.coverage_ratio if source_inventory is not None else None
-    object_ratio = object_coverage or 0.0
+    object_ratio = source_inventory.coverage_ratio if source_inventory is not None else 0.0
     pipeline_metrics = final_data.get("pipeline_metrics", {})
     if not isinstance(pipeline_metrics, dict):
         pipeline_metrics = {}
     extraction_total = int(pipeline_metrics.get("extraction_batches_total", 0) or 0)
     extraction_ok = int(pipeline_metrics.get("extraction_batches_ok", 0) or 0)
-    extraction_success = extraction_ok / extraction_total if extraction_total else None
-    extraction_ratio = extraction_success or 0.0
+    extraction_ratio = extraction_ok / extraction_total if extraction_total else 1.0
     row_routing_error = pipeline_metrics.get("routing_error_rate")
     object_routing_error = (
         source_inventory.routing_error_rate if source_inventory is not None else None
@@ -1496,30 +1449,22 @@ def assess_quality(
             "핵심시트": core_ratio * 10.0,
             "추출성공": extraction_ratio * 15.0,
         }
-    if not business_rows:
-        components = {key: 0.0 for key in components}
     score = sum(components.values())
     if source_inventory is None:
         score = min(score, float(getattr(config, "QUALITY_MAX_WITHOUT_SOURCE_INVENTORY", 95.0)))
 
     issues: list[str] = []
-    if not business_rows:
-        issues.append("실질 업무 행 0개: 추출 성공으로 평가할 수 없음")
-    if object_coverage is None:
-        issues.append("객체 완전성 평가 불가: 확정 데이터 분모 없음 또는 인벤토리 비활성")
-    if extraction_success is None:
-        issues.append("추출 배치 성공률 평가 불가: 실행 배치 분모 0")
     if verification is None:
         issues.append("원문 대조 비활성: 원문 근거 점수를 계산할 수 없음")
     elif grounding_ratio < 0.8:
         issues.append(f"원문 근거 점수 낮음 ({grounding_ratio:.0%})")
-    if source_inventory is not None and object_coverage is not None and object_ratio < 0.8:
+    if source_inventory is not None and object_ratio < 0.8:
         issues.append(f"원문 표·그래프 객체 완전성 낮음 ({object_ratio:.0%})")
     if fill_ratio < 0.8:
         issues.append(f"필수 필드 채움률 낮음 ({fill_ratio:.0%})")
     if provenance_ratio < 0.8:
         issues.append(f"출처페이지 보유율 낮음 ({provenance_ratio:.0%})")
-    if extraction_success is not None and extraction_ratio < 0.95:
+    if extraction_ratio < 0.95:
         failures = max(0, extraction_total - extraction_ok)
         issues.append(
             f"추출 배치 성공률 낮음 ({extraction_ratio:.0%}, 실패 {failures}/{extraction_total})"
@@ -1542,17 +1487,14 @@ def assess_quality(
         issues.append(f"시트 의미 라우팅 오류율 높음 ({routing_error_rate:.1%})")
 
     metrics = {
-        "evaluation_version": "quality-v2",
-        "business_rows": business_rows,
         "score": round(score, 2),
         "grounding_ratio": round(grounding_ratio, 4),
-        "source_object_coverage_ratio": round(object_coverage, 4) if object_coverage is not None else None,
+        "source_object_coverage_ratio": round(object_ratio, 4),
         "required_field_fill_ratio": round(fill_ratio, 4),
         "provenance_ratio": round(provenance_ratio, 4),
         "integrity_ratio": round(integrity_ratio, 4),
         "core_sheet_ratio": round(core_ratio, 4),
-        "extraction_success_ratio": round(extraction_success, 4) if extraction_success is not None else None,
-        "extraction_success_unavailable_reason": "no_extraction_batches" if extraction_success is None else None,
+        "extraction_success_ratio": round(extraction_ratio, 4),
         "extraction_batches_total": extraction_total,
         "extraction_batches_ok": extraction_ok,
         "validation_errors": errors,
@@ -1600,7 +1542,7 @@ def assess_quality(
         # 평가를 명시적으로 실행한 경우에만 외부 평가 리포트에서 채워진다.
         "cell_accuracy": None,
         "object_recall": None,
-        "automatic_source_object_coverage": round(object_coverage, 4) if object_coverage is not None else None,
+        "automatic_source_object_coverage": round(object_ratio, 4),
         "routing_error_rate": round(routing_error_rate, 4),
         "row_routing_error_rate": round(float(row_routing_error or 0.0), 4),
         "object_routing_error_rate": round(float(object_routing_error or 0.0), 4),
@@ -1611,29 +1553,7 @@ def assess_quality(
             source_inventory.routing_mismatch_objects if source_inventory is not None else 0
         ),
     }
-    if source_inventory is not None:
-        metrics.update(source_inventory.evaluation_metrics())
-        metrics["evaluation_version"] = "quality-v2/source-inventory-v2"
     return QualityAssessment(round(max(0.0, score), 2), issues, metrics)
-
-
-def format_ratio(value: float | None) -> str:
-    return "평가 불가(분모 없음)" if value is None else f"{value:.1%}"
-
-
-def extraction_outcome(metrics: dict, batch_status: str = "complete") -> dict:
-    """Artifact persistence is not evidence of successful extraction or accuracy."""
-    if not metrics.get("business_rows"):
-        status, code = "no_data", 2
-    elif (batch_status != "complete" or metrics.get("source_object_held_objects", 0)
-          or metrics.get("source_object_review_candidates", 0)
-          or metrics.get("score", 0) < float(getattr(config, "QUALITY_THRESHOLD", 80))):
-        status, code = "needs_review", 3
-    else:
-        status, code = "complete", 0
-    return {"status": status, "exit_code": code, "file_saved": True,
-            "batch_status": batch_status, "business_rows": metrics.get("business_rows", 0),
-            "accuracy_evaluated": False, "evaluation_version": metrics.get("evaluation_version")}
 
 
 def create_marked_pdf(

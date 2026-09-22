@@ -27,7 +27,7 @@ def test_run_command_classifies_model_capacity(monkeypatch) -> None:
         stdout = ""
         stderr = "ERROR: Selected model is at capacity. Please try a different model."
 
-    monkeypatch.setattr(llm_client, "run_local_command", lambda *args, **kwargs: Completed())
+    monkeypatch.setattr(llm_client.subprocess, "run", lambda *args, **kwargs: Completed())
 
     with pytest.raises(llm_client.LLMCapacityError, match="at capacity"):
         llm_client._run_command(["fake"], "prompt", cwd=Path("."), timeout=5)

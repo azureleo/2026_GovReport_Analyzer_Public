@@ -1,0 +1,149 @@
+{
+ "label": "경기_v8base",
+ "pages": 476,
+ "raw_objects": 16750,
+ "physical_objects": 16554,
+ "dups": 196,
+ "by_type": {
+  "image": 294,
+  "text": 15513,
+  "table": 631,
+  "chart": 116
+ },
+ "action_by_type": {
+  "image:skip_non_data": 27,
+  "text:native_keep": 15513,
+  "image:transport_only": 163,
+  "table:native_keep": 398,
+  "table:ocr_required": 233,
+  "chart:ocr_required": 116,
+  "image:ocr_required": 104
+ },
+ "ocr_required": 453,
+ "required_reason_top": [
+  [
+   "strong:numbered_caption",
+   340
+  ],
+  [
+   "strong:numeric_value",
+   299
+  ],
+  [
+   "strong:table_structure",
+   233
+  ],
+  [
+   "native_table_missing",
+   116
+  ],
+  [
+   "chart_requires_digitization",
+   116
+  ],
+  [
+   "strong:chart_structure",
+   116
+  ],
+  [
+   "visual_requires_classification",
+   104
+  ],
+  [
+   "text_strategy_table",
+   96
+  ],
+  [
+   "strong:quantified_unit",
+   92
+  ],
+  [
+   "strong:year_or_period",
+   85
+  ],
+  [
+   "negative_overridden_by_strong_or_structured_signal",
+   54
+  ],
+  [
+   "negative:목차",
+   51
+  ],
+  [
+   "strong:data_terms:표",
+   38
+  ],
+  [
+   "strong:data_terms:표,현황",
+   24
+  ],
+  [
+   "strong:data_terms:추이",
+   17
+  ],
+  [
+   "low_cell_fill:0.64",
+   13
+  ],
+  [
+   "strong:visual_features:vector_density",
+   11
+  ],
+  [
+   "low_cell_fill:0.67",
+   11
+  ],
+  [
+   "strong:context_terms:목표,에너지,용량,전망,표",
+   10
+  ],
+  [
+   "strong:data_terms:배출",
+   9
+  ],
+  [
+   "low_cell_fill:0.55",
+   9
+  ],
+  [
+   "low_cell_fill:0.68",
+   9
+  ],
+  [
+   "low_cell_fill:0.63",
+   9
+  ],
+  [
+   "strong:data_terms:감축,목표,표",
+   8
+  ],
+  [
+   "strong:data_terms:비중,추이",
+   8
+  ]
+ ],
+ "required_table_conf_buckets": {
+  "0.1": 116,
+  "0.7": 18,
+  "0.6": 94,
+  "0.5": 4,
+  "0.4": 1
+ },
+ "required_caption_only": 116,
+ "required_missing_native": 116,
+ "render_regions_total": 689,
+ "render_variants": {
+  "object": 450,
+  "full_page_context": 232,
+  "panel": 4,
+  "composite": 2,
+  "fallback_full_page": 1
+ },
+ "page_images_total": 362,
+ "page_render_images": 163,
+ "pages_over_18000": 0,
+ "pages_over_12000": 39,
+ "max_page_chars": 15433,
+ "pages_with_tables": 456,
+ "seconds": 74.6
+}

@@ -9,9 +9,8 @@ import openpyxl
 from scripts.golden_score_contract import (
     골든열,
     계약헤더,
-    레거시계약헤더,
+    필수채점필드,
     데이터시트,
-    산출유형목록,
     문자열,
     시트자료,
     값있음,
@@ -49,50 +48,35 @@ def _행목록(ws, headers: list[str], *, golden: bool, sheet_name: str) -> tupl
             continue
         source_type = 문자열(data.get("골든_출처유형")) if golden else ""
         source_pages = normalize_provenance_pages(data.get("골든_출처페이지")) if golden else ""
-        derivation_type = 문자열(data.get("골든_산출유형")).casefold() if golden else ""
         if golden and sheet_name != "00_문서메타" and source_type not in 출처유형목록:
             errors.append(f"{sheet_name} {row_number}행: 골든_출처유형 값이 허용 코드가 아닙니다: {source_type or '빈칸'}")
         if golden and sheet_name != "00_문서메타" and not source_pages:
             warnings.append(f"{sheet_name} {row_number}행: 골든_출처페이지가 비어 있습니다")
-        if golden and derivation_type and derivation_type not in 산출유형목록:
-            errors.append(
-                f"{sheet_name} {row_number}행: 골든_산출유형 값이 허용 코드가 아닙니다: "
-                f"{derivation_type}"
-            )
         rows.append(행(row_number, data, source_type, source_pages))
     return rows, excluded, errors, warnings
 
 
 def _골든시트(ws, sheet_name: str) -> 시트자료:
     headers = [문자열(cell.value) for cell in ws[1]]
-    expected = 계약헤더(sheet_name)
-    legacy_expected = 레거시계약헤더(sheet_name)
     errors: list[str] = []
-    warnings: list[str] = []
-    contract_length = len(expected)
-    if headers[: len(expected)] == expected:
-        pass
-    elif headers[: len(legacy_expected)] == legacy_expected:
-        contract_length = len(legacy_expected)
-        if legacy_expected != expected:
-            warnings.append(
-                f"{sheet_name}: 확장 전 레거시 계약 열을 사용합니다. "
-                "새 필드는 채점 분모에서 제외됩니다."
-            )
-    else:
+    # 계약 검증은 config.EXCEL_HEADERS 순서 일치가 아니라 "채점 축이 읽는 필드가
+    # 골든 헤더에 존재하는가"로 한다. 행 값은 헤더 이름으로 읽으므로 열 순서·추가
+    # 열은 채점에 영향이 없고, config가 확장돼도(v8) 같은 골든을 같은 축으로 잰다.
+    required = 필수채점필드(sheet_name)
+    missing = [field for field in required if field not in headers]
+    if missing:
         if _제목행_추정(headers, sheet_name):
             errors.append(f"{sheet_name}: 1행이 제목 행으로 추정됩니다. 골든셋은 1행이 헤더여야 합니다.")
         else:
-            errors.append(f"{sheet_name}: 계약 컬럼이 명세와 다릅니다. 기대={expected}, 실제={headers[:len(expected)]}")
+            errors.append(f"{sheet_name}: 채점 필수 컬럼이 없습니다: {missing}")
     if sheet_name != "00_문서메타" and not errors:
-        golden_headers = headers[contract_length : contract_length + len(골든열)]
-        if golden_headers[:2] != 골든열[:2]:
+        if "골든_출처유형" not in headers or "골든_출처페이지" not in headers:
             errors.append(f"{sheet_name}: 골든_출처유형·골든_출처페이지 컬럼이 계약 컬럼 뒤에 필요합니다.")
     rows, excluded, row_errors, row_warnings = _행목록(ws, headers, golden=True, sheet_name=sheet_name)
     errors.extend(row_errors)
     if errors:
-        return 시트자료(sheet_name, headers, [], "형식 오류", errors, excluded, [*warnings, *row_warnings])
-    return 시트자료(sheet_name, headers, rows, 제외행수=excluded, 경고=[*warnings, *row_warnings])
+        return 시트자료(sheet_name, headers, [], "형식 오류", errors, excluded, row_warnings)
+    return 시트자료(sheet_name, headers, rows, 제외행수=excluded, 경고=row_warnings)
 
 
 def _출력시트(ws, sheet_name: str) -> 시트자료:

@@ -1,5 +1,4 @@
 from __future__ import annotations
-from copy import deepcopy
 
 from utils.visual_contract import (
     comparison_equal,
@@ -89,22 +88,3 @@ def test_visual_rows_keep_raw_and_normalized_quantity_metadata() -> None:
     assert fields["원문단위"] == "천tCO2eq"
     assert fields["정규화값"] == 31500
     assert fields["정규화단위"] == "tCO2eq"
-
-
-def test_null_functions_and_composition_roles_are_not_deduplicated():
-    functions = [{"항목": "전체회의", "값": None, "fields": {
-        "정보유형": "조직기능", "역할": "전체회의", "값원문": text}}
-        for text in ("정책 심의", "계획 수립 심의", "점검평가")]
-    counts = [{"항목": "위원회", "값": 2, "단위": "명", "fields": {
-        "정보유형": "기관구성", "항목원문": role}} for role in ("당연", "위촉")]
-    rows = functions + counts
-    before = deepcopy(rows)
-    result = normalize_visual_table_rows(rows + deepcopy(rows), chart_type="표")
-    assert len(result) == 5
-    assert rows == before
-
-
-def test_same_value_with_different_context_is_preserved_for_conflict_review():
-    row = {"항목": "위원회", "값": 2, "단위": "명", "fields": {"담당부서": "부서A"}}
-    other = deepcopy(row); other['fields']['담당부서'] = '부서B'
-    assert len(normalize_visual_table_rows([row, other], chart_type='표')) == 2

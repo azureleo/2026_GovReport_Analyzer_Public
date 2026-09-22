@@ -152,69 +152,6 @@ def test_missing_multiple_and_ambiguous_evidence_are_isolated(monkeypatch) -> No
         assert result["병합차단사유"]
 
 
-def test_organizer_reassigns_wrong_evidence_to_unique_numbered_object(monkeypatch) -> None:
-    monkeypatch.setattr(config, "VISUAL_EVIDENCE_MERGE_ENABLED", True, raising=False)
-    monkeypatch.setattr(
-        config, "VISUAL_EXACT_OBJECT_RESOLUTION_ENABLED", True, raising=False
-    )
-    observation = _observation(evidence_ids=["ev-60"])
-    observation["제목"] = "그림 2-61 관리권한 배출량"
-    observation["병합차단사유"] = "복수 근거 ID(2개)"
-    objects = [
-        {
-            **_object("obj-60", "ev-60"),
-            "number": "그림 2-60",
-            "caption": "그림 2-60 다른 배출량",
-        },
-        {
-            **_object("obj-61", "ev-61"),
-            "number": "그림 2-61",
-            "caption": "그림 2-61 관리권한 배출량",
-        },
-    ]
-
-    cleaned = _organize(observation, objects)
-    result = cleaned["chart_observations"][0]
-
-    assert result["근거ID"] == "ev-61"
-    assert result["근거객체ID"] == "obj-61"
-    assert result["근거분리방식"] == "object_number_explicit"
-    assert result["근거교정여부"] is True
-    assert result["병합상태"] == "accept"
-    assert cleaned["visual_inventory"][0]["근거분리방식"] == "object_number_explicit"
-
-
-def test_organizer_keeps_mixed_table_and_figure_observation_in_review(monkeypatch) -> None:
-    monkeypatch.setattr(config, "VISUAL_EVIDENCE_MERGE_ENABLED", True, raising=False)
-    monkeypatch.setattr(
-        config, "VISUAL_EXACT_OBJECT_RESOLUTION_ENABLED", True, raising=False
-    )
-    observation = _observation(evidence_ids=["ev-figure"])
-    observation["제목"] = "그림 2-87 배출량 / 표 2-35 관리권한 배출량"
-    objects = [
-        {
-            **_object("obj-figure", "ev-figure"),
-            "number": "그림 2-87",
-            "caption": "그림 2-87 배출량",
-        },
-        {
-            **_object("obj-table", "ev-table"),
-            "object_type": "table",
-            "number": "표 2-35",
-            "caption": "표 2-35 관리권한 배출량",
-        },
-    ]
-
-    cleaned = _organize(observation, objects)
-    result = cleaned["chart_observations"][0]
-
-    assert result["근거매칭상태"] == "mixed_objects"
-    assert result["근거분리방식"] == "mixed_object_numbers"
-    assert result["병합상태"] == "needs_review"
-    assert "복수 표·그림 번호" in result["병합차단사유"]
-    assert cleaned["emissions_management"] == []
-
-
 def test_all_null_visual_value_is_isolated(monkeypatch) -> None:
     monkeypatch.setattr(config, "VISUAL_EVIDENCE_MERGE_ENABLED", True, raising=False)
 

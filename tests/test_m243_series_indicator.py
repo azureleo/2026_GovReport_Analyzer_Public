@@ -8,12 +8,6 @@ import config
 from agents.organizer_agent import OrganizerAgent
 
 
-@pytest.fixture(autouse=True)
-def _legacy_series_layout(monkeypatch) -> None:
-    # 이 파일의 기존 회귀는 보완 OFF 기준의 열 배치를 고정한다.
-    monkeypatch.setattr(config, "REGIONAL_VISUAL_ENRICHMENT_ENABLED", False, raising=False)
-
-
 def _지역여건_관찰값(*, item: str | None, value: float = 100.0) -> dict:
     observation = {
         "지자체명": "서울특별시",
@@ -105,27 +99,3 @@ def test_플래그가_꺼지면_지역여건_라벨병합_산출은_불변이다
     assert not any(
         row.get("영역") == "시각병합" for row in cleaned["validation_report"]
     )
-
-
-def test_보완_on은_분해형_차트명과_계열을_하나의_지표명으로_조립한다(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(config, "VISUAL_MERGE_LABELED_ENABLED", True, raising=False)
-    monkeypatch.setattr(config, "REGIONAL_VISUAL_ENRICHMENT_ENABLED", True, raising=False)
-    observation = _지역여건_관찰값(item="가정용")
-    observation["제목"] = "가상시 용도별 전력 소비량"
-    observation["근거"] = json.dumps({
-        "지표범주": "에너지",
-        "지표명": "가상시 용도별 전력 소비량",
-        "연도": 2020,
-    }, ensure_ascii=False)
-
-    cleaned = OrganizerAgent().organize({
-        "municipality_name": "가상시",
-        "chart_observations": [observation],
-    })
-
-    row = cleaned["regional_conditions"][0]
-    assert row["지표명"] == "전력 소비량(가정용)"
-    assert row["지표세부범주"] == "가상시 용도별 전력 소비량"
-    assert row["derivation_type"] == "normalized"

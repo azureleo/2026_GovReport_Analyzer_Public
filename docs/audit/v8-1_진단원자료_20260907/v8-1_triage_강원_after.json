@@ -1,0 +1,143 @@
+{
+ "label": "강원_v8-1",
+ "pages": 346,
+ "raw_objects": 9469,
+ "physical_objects": 9302,
+ "physical_duplicates_merged": 167,
+ "objects_by_type": {
+  "text": 8589,
+  "image": 122,
+  "table": 545,
+  "chart": 46
+ },
+ "action_by_type": {
+  "text:native_keep": 8589,
+  "image:transport_only": 63,
+  "table:native_keep": 388,
+  "table:skip_index_caption": 117,
+  "chart:skip_index_caption": 35,
+  "chart:ocr_required": 11,
+  "image:ocr_required": 54,
+  "table:ocr_required": 40,
+  "image:skip_non_data": 5
+ },
+ "ocr_required": 105,
+ "ocr_required_by_type": {
+  "chart": 11,
+  "image": 54,
+  "table": 40
+ },
+ "skipped_index_captions": 152,
+ "required_caption_only": 11,
+ "required_missing_native": 2,
+ "required_reason_top": [
+  [
+   "strong:numbered_caption",
+   79
+  ],
+  [
+   "visual_requires_classification",
+   54
+  ],
+  [
+   "strong:numeric_value",
+   43
+  ],
+  [
+   "strong:table_structure",
+   40
+  ],
+  [
+   "strong:year_or_period",
+   25
+  ],
+  [
+   "text_strategy_table",
+   18
+  ],
+  [
+   "strong:quantified_unit",
+   13
+  ],
+  [
+   "chart_requires_digitization",
+   11
+  ],
+  [
+   "strong:chart_structure",
+   11
+  ],
+  [
+   "low_cell_fill:0.67",
+   6
+  ],
+  [
+   "native_table_missing",
+   6
+  ],
+  [
+   "strong:data_terms:배출,비중",
+   5
+  ],
+  [
+   "low_cell_fill:0.69",
+   5
+  ],
+  [
+   "strong:data_terms:배출,전망,추이",
+   5
+  ],
+  [
+   "low_cell_fill:0.64",
+   4
+  ],
+  [
+   "strong:data_terms:표",
+   4
+  ],
+  [
+   "strong:context_terms:목표,배출,비중,예산,추진체계",
+   3
+  ],
+  [
+   "strong:data_terms:목표,표",
+   3
+  ],
+  [
+   "strong:data_terms:추진체계",
+   3
+  ],
+  [
+   "low_cell_fill:0.58",
+   3
+  ],
+  [
+   "negative_overridden_by_strong_or_structured_signal",
+   3
+  ],
+  [
+   "strong:data_terms:현황",
+   3
+  ],
+  [
+   "strong:visual_features:vector_density",
+   3
+  ],
+  [
+   "low_cell_fill:0.61",
+   3
+  ],
+  [
+   "strong:data_terms:예산",
+   2
+  ]
+ ],
+ "render_regions_total": 105,
+ "render_variants": {
+  "fallback_full_page": 7,
+  "object": 98
+ },
+ "vision_batch_size": 8,
+ "vision_batches_estimate": 14,
+ "seconds": 28.5
+}

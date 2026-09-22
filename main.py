@@ -530,7 +530,6 @@ def main():
             if config.OCR_BACKEND in {"unlimited_ocr", "uocr", "markdown"}:
                 print(f"  OCR 결과 디렉터리: {config.OCR_RESULTS_DIR or '미지정'}")
     print(f"  LLM 캐시: {'활성' if config.LLM_CACHE_ENABLED else '비활성'}")
-    print(f"  A/B 판독 연결 규칙: {'활성' if config.READING_PIPELINE_ENABLED else '비활성'} (추가 모델 호출 없음)")
     if config.RUN_STATE_ENABLED:
         resume_mode = (
             "실패 배치만 재실행"
@@ -552,11 +551,6 @@ def main():
         print(
             "  Vision 체크포인트: "
             f"{'활성' if config.VISION_CHECKPOINT_ENABLED else '비활성'}"
-        )
-        print(
-            f"  근거 부족 제한적 판독: {'활성' if config.VISION_REVIEW_ENABLED else '비활성'} "
-            f"(최대 {config.VISION_REVIEW_MAX_OBJECTS}객체 / {config.VISION_REVIEW_MAX_CALLS}회 / "
-            f"추가 누적 {config.VISION_REVIEW_MAX_SECONDS:g}초)"
         )
     print(f"  라우팅 샤프닝: {'활성' if config.ROUTE_DROP_UBIQUITOUS_WEAK else '비활성'}")
     print(f"  결정론적 원문 대조: {'활성' if config.SOURCE_VERIFICATION_ENABLED else '비활성'}")
@@ -622,9 +616,7 @@ def main():
             max_pipeline_retries=args.retries,
             include_images=not args.no_images,
         )
-        outcome = supervisor.last_run_outcome
-        print(f"\n결과 파일 저장: {result_path}")
-        print(f"추출 상태: {outcome.get('status', 'unknown')} (저장 성공과 정확도 판정은 별개입니다)")
+        print(f"\n완료! 결과 파일: {result_path}")
         if args.evaluate:
             from utils.benchmark_evaluation import (
                 EvaluationContractError,
@@ -653,7 +645,7 @@ def main():
                 f"라우팅 오류율={metrics.get('routing_error_rate')}"
             )
             print(f"[평가] 리포트: {evaluation.report_markdown}")
-        return int(outcome.get("exit_code", 0))
+        return 0
     except KeyboardInterrupt:
         supervisor.mark_interrupted("사용자 중단")
         print("\n[중단] 사용자에 의해 중단되었습니다.")

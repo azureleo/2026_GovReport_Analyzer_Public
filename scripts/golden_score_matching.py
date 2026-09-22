@@ -57,44 +57,26 @@ def _세부부문완화후보허용(sheet_name: str, golden_row: Any, output_row
     )
 
 
-def _감축목표완화후보허용(
-    sheet_name: str,
-    golden_row: Any,
-    output_row: Any,
-) -> bool:
+def _감축목표완화후보허용(sheet_name: str, golden_row: Any, output_row: Any) -> bool:
     if sheet_name != "06_감축목표":
         return True
     golden_level = dedup_key_text(golden_row.값.get("목표수준"))
     output_level = dedup_key_text(output_row.값.get("목표수준"))
     golden_base_year = 키값("기준연도", golden_row.값.get("기준연도"))
     output_base_year = 키값("기준연도", output_row.값.get("기준연도"))
-    level_diverged = bool(
-        golden_level and output_level and golden_level != output_level
-    )
+    level_diverged = bool(golden_level and output_level and golden_level != output_level)
     base_year_diverged = bool(
-        golden_base_year
-        and output_base_year
-        and golden_base_year != output_base_year
+        golden_base_year and output_base_year and golden_base_year != output_base_year
     )
     if not level_diverged and not base_year_diverged:
         return True
     common_fields = [
         field_name
-        for field_name in (
-            "목표감축량",
-            "목표배출량",
-            "감축률(%)",
-            "기준배출량",
-            "배출전망",
-        )
-        if 값있음(golden_row.값.get(field_name))
-        and 값있음(output_row.값.get(field_name))
+        for field_name in ("목표감축량", "목표배출량", "감축률(%)", "기준배출량", "배출전망")
+        if 값있음(golden_row.값.get(field_name)) and 값있음(output_row.값.get(field_name))
     ]
     return bool(common_fields) and all(
-        _상대오차일치(
-            golden_row.값.get(field_name),
-            output_row.값.get(field_name),
-        )
+        _상대오차일치(golden_row.값.get(field_name), output_row.값.get(field_name))
         for field_name in common_fields
     )
 
@@ -108,10 +90,7 @@ _의미완화토큰필드 = {
 
 
 def _지표토큰(row: Any, sheet_name: str = "02_지역여건") -> set[str]:
-    text = " ".join(
-        str(row.값.get(field_name) or "")
-        for field_name in _의미완화토큰필드[sheet_name]
-    )
+    text = " ".join(str(row.값.get(field_name) or "") for field_name in _의미완화토큰필드[sheet_name])
     parts = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE).split()
     return {정규화토큰 for 토큰 in parts if (정규화토큰 := dedup_key_text(토큰))}
 
@@ -122,28 +101,18 @@ def _자카드(left: set[str], right: set[str]) -> float:
 
 
 def _의미완화전제충족(
-    golden_row: Any,
-    output_row: Any,
-    sheet_name: str = "02_지역여건",
+    golden_row: Any, output_row: Any, sheet_name: str = "02_지역여건"
 ) -> bool:
     if sheet_name == "01_계획개요":
-        golden_type = dedup_key_text(golden_row.값.get("개요유형"))
-        output_type = dedup_key_text(output_row.값.get("개요유형"))
-        if not golden_type and not output_type:
+        골든유형 = dedup_key_text(golden_row.값.get("개요유형"))
+        출력유형 = dedup_key_text(output_row.값.get("개요유형"))
+        if not 골든유형 and not 출력유형:
             return False
-        return not (
-            golden_type
-            and output_type
-            and golden_type != output_type
-        )
+        return not (골든유형 and 출력유형 and 골든유형 != 출력유형)
     if sheet_name == "07_비전전략":
-        golden_level = dedup_key_text(golden_row.값.get("전략수준"))
-        output_level = dedup_key_text(output_row.값.get("전략수준"))
-        return not (
-            golden_level
-            and output_level
-            and golden_level != output_level
-        )
+        골든수준 = dedup_key_text(golden_row.값.get("전략수준"))
+        출력수준 = dedup_key_text(output_row.값.get("전략수준"))
+        return not (골든수준 and 출력수준 and 골든수준 != 출력수준)
     if sheet_name == "13_이행관리환류":
         return True
     if sheet_name != "02_지역여건":
@@ -163,17 +132,10 @@ def _의미완화전제충족(
     return True
 
 
-def _의미완화후보(
-    golden_row: Any,
-    output_row: Any,
-    sheet_name: str,
-) -> float | None:
+def _의미완화후보(golden_row: Any, output_row: Any, sheet_name: str) -> float | None:
     if not _의미완화전제충족(golden_row, output_row, sheet_name):
         return None
-    유사도 = _자카드(
-        _지표토큰(golden_row, sheet_name),
-        _지표토큰(output_row, sheet_name),
-    )
+    유사도 = _자카드(_지표토큰(golden_row, sheet_name), _지표토큰(output_row, sheet_name))
     return 유사도 if 유사도 >= SEMANTIC_MATCH_MIN_JACCARD else None
 
 
@@ -193,9 +155,7 @@ def _의미완화매칭하기(
         candidates: list[tuple[float, int, Any]] = []
         for output_idx in sorted(remaining_output):
             유사도 = _의미완화후보(
-                golden_rows[golden_idx],
-                output_rows[output_idx],
-                sheet_name,
+                golden_rows[golden_idx], output_rows[output_idx], sheet_name
             )
             if 유사도 is None:
                 continue
@@ -310,10 +270,7 @@ def _문자유사매칭하기(
 
 
 def 매칭하기(
-    golden_rows: list,
-    output_rows: list,
-    sheet_name: str,
-    보수티어만: bool = False,
+    golden_rows: list, output_rows: list, sheet_name: str, 보수티어만: bool = False
 ) -> tuple[list[매칭], set[int], set[int], list[매칭], list[매칭], list[매칭]]:
     matches: list[매칭] = []
     remaining_golden = set(range(len(golden_rows)))
@@ -333,11 +290,7 @@ def 매칭하기(
                     continue
                 if relaxed and not _세부부문완화후보허용(sheet_name, golden_row, candidate):
                     continue
-                if relaxed and not _감축목표완화후보허용(
-                    sheet_name,
-                    golden_row,
-                    candidate,
-                ):
+                if relaxed and not _감축목표완화후보허용(sheet_name, golden_row, candidate):
                     continue
                 matches.append(매칭(golden_row, candidate, label, row_key))
                 remaining_golden.remove(golden_idx)
@@ -348,30 +301,19 @@ def 매칭하기(
     문자유사관찰들 = []
     if not 보수티어만 and sheet_name in 의미완화적용시트:
         의미완화매칭들 = _의미완화매칭하기(
-            golden_rows,
-            output_rows,
-            remaining_golden,
-            remaining_output,
-            sheet_name,
+            golden_rows, output_rows, remaining_golden, remaining_output, sheet_name
         )
         if sheet_name == "02_지역여건":
             소비된골든 = {id(match.골든) for match in 의미완화매칭들}
             소비된출력 = {id(match.출력) for match in 의미완화매칭들}
             문자유사골든잔여 = {
-                idx
-                for idx in remaining_golden
-                if id(golden_rows[idx]) not in 소비된골든
+                idx for idx in remaining_golden if id(golden_rows[idx]) not in 소비된골든
             }
             문자유사출력잔여 = {
-                idx
-                for idx in remaining_output
-                if id(output_rows[idx]) not in 소비된출력
+                idx for idx in remaining_output if id(output_rows[idx]) not in 소비된출력
             }
             문자유사매칭들, 문자유사관찰들 = _문자유사매칭하기(
-                golden_rows,
-                output_rows,
-                문자유사골든잔여,
-                문자유사출력잔여,
+                golden_rows, output_rows, 문자유사골든잔여, 문자유사출력잔여
             )
     return (
         matches,
@@ -473,37 +415,6 @@ def 값비교(
     return total, disagreements, by_row, scale_equivalents
 
 
-def 셀정확도집계(sheet_name: str, golden_rows: list, matches: list[매칭]) -> tuple[int, int]:
-    """모든 의미 셀을 분모로 삼고 매칭 행의 정확한 셀을 센다."""
-    excluded = {"지자체명", "출처페이지", "데이터상태", "derivation_type", "근거ID"}
-    fields = [
-        field_name
-        for field_name in 계약헤더(sheet_name)
-        if field_name not in excluded
-    ]
-    matched_by_row = {match.골든.번호: match for match in matches}
-    expected = 0
-    correct = 0
-    for golden_row in golden_rows:
-        match = matched_by_row.get(golden_row.번호)
-        for field_name in fields:
-            golden_value = golden_row.값.get(field_name)
-            if not 값있음(golden_value):
-                continue
-            expected += 1
-            if (
-                match is not None
-                and 값있음(match.출력.값.get(field_name))
-                and _필드일치(
-                    field_name,
-                    golden_value,
-                    match.출력.값.get(field_name),
-                )
-            ):
-                correct += 1
-    return correct, expected
-
-
 def 출처집계초기화() -> dict[str, 출처집계]:
     return {name: 출처집계() for name in [*출처유형목록, "텍스트 유래", "시각 유래"]}
 
@@ -567,7 +478,7 @@ def 문자유사포함출처직렬화(
 
 def 시트점수(sheet_name: str, golden: 시트자료, output: 시트자료) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[매칭], dict[int, 값집계], list[매칭], list[매칭], list[매칭], list[dict[str, Any]]]:
     if golden.상태 != "정상":
-        return ({"상태": golden.상태, "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "셀기대수": 0, "셀일치수": 0, "값비교수": 0, "값일치수": 0, "값일치율": None, "값일치율(스케일동치 포함)": None, "스케일동치쌍수": 0, "골든만있는값": 0, "출력만있는값": 0, "의미완화매칭수": 0, "문자유사매칭수": 0}, [], [], [], [], {}, [], [], [], [])
+        return ({"상태": golden.상태, "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "값일치율": None, "값일치율(스케일동치 포함)": None, "스케일동치쌍수": 0, "골든만있는값": 0, "출력만있는값": 0, "의미완화매칭수": 0, "문자유사매칭수": 0}, [], [], [], [], {}, [], [], [], [])
     if sheet_name == "00_문서메타":
         if golden.행들 and output.행들:
             matches = [매칭(golden.행들[0], output.행들[0], "엄격", "문서메타")]
@@ -593,7 +504,6 @@ def 시트점수(sheet_name: str, golden: 시트자료, output: 시트자료) ->
             문자유사관찰들,
         ) = 매칭하기(golden.행들, output.행들, sheet_name)
     value_stats, disagreements, row_values, scale_equivalents = 값비교(sheet_name, matches)
-    correct_cells, expected_cells = 셀정확도집계(sheet_name, golden.행들, matches)
     recall = round(len(matches) / len(golden.행들), 4) if golden.행들 else None
     precision = round(len(matches) / len(output.행들), 4) if output.행들 else None
     missing_golden = [{"시트": sheet_name, "행번호": golden.행들[idx].번호, "키": 키(golden.행들[idx], sheet_name, False) or 키(golden.행들[idx], sheet_name, True) or "", "골든_출처유형": golden.행들[idx].출처유형, "골든_출처페이지": golden.행들[idx].출처페이지} for idx in sorted(remaining_golden)]
@@ -602,9 +512,9 @@ def 시트점수(sheet_name: str, golden: 시트자료, output: 시트자료) ->
         round((value_stats.일치 + len(scale_equivalents)) / value_stats.전체, 4)
         if value_stats.전체 else None
     )
-    summary = {"상태": "정상", "골든행수": len(golden.행들), "출력행수": len(output.행들), "매칭수": len(matches), "엄격매칭수": sum(1 for match in matches if match.방식 == "엄격"), "완화매칭수": sum(1 for match in matches if match.방식 == "완화"), "리콜": recall, "정밀도": precision, "셀기대수": expected_cells, "셀일치수": correct_cells, "값비교수": value_stats.전체, "값일치수": value_stats.일치, "값일치율": value_stats.비율(), "값일치율(스케일동치 포함)": inclusive_value_rate, "스케일동치쌍수": len(scale_equivalents), "골든만있는값": value_stats.골든만, "출력만있는값": value_stats.출력만, "의미완화매칭수": len(의미완화매칭들), "문자유사매칭수": len(문자유사매칭들)}
+    summary = {"상태": "정상", "골든행수": len(golden.행들), "출력행수": len(output.행들), "매칭수": len(matches), "엄격매칭수": sum(1 for match in matches if match.방식 == "엄격"), "완화매칭수": sum(1 for match in matches if match.방식 == "완화"), "리콜": recall, "정밀도": precision, "값일치율": value_stats.비율(), "값일치율(스케일동치 포함)": inclusive_value_rate, "스케일동치쌍수": len(scale_equivalents), "골든만있는값": value_stats.골든만, "출력만있는값": value_stats.출력만, "의미완화매칭수": len(의미완화매칭들), "문자유사매칭수": len(문자유사매칭들)}
     return summary, missing_golden, missing_output, disagreements, matches, row_values, 의미완화매칭들, 문자유사매칭들, 문자유사관찰들, scale_equivalents
 
 
 def 없는골든요약(output: 시트자료) -> dict[str, Any]:
-    return {"상태": "골든 없음", "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "셀기대수": 0, "셀일치수": 0, "값비교수": 0, "값일치수": 0, "값일치율": None, "값일치율(스케일동치 포함)": None, "스케일동치쌍수": 0, "골든만있는값": 0, "출력만있는값": 0, "의미완화매칭수": 0, "문자유사매칭수": 0}
+    return {"상태": "골든 없음", "골든행수": 0, "출력행수": len(output.행들), "매칭수": 0, "엄격매칭수": 0, "완화매칭수": 0, "리콜": None, "정밀도": None, "값일치율": None, "값일치율(스케일동치 포함)": None, "스케일동치쌍수": 0, "골든만있는값": 0, "출력만있는값": 0, "의미완화매칭수": 0, "문자유사매칭수": 0}

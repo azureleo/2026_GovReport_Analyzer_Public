@@ -379,7 +379,7 @@ class LLMClientTests(unittest.TestCase):
         original_run_codex = llm_client._run_codex
         original_sleep = llm_client.time.sleep
 
-        def fake_run_codex(prompt, *, image_paths=None, cwd, model=None):
+        def fake_run_codex(prompt, *, image_paths=None, cwd, model=None, timeout=None):
             calls["run"] += 1
             return '{"ok": true}'
 
@@ -402,12 +402,29 @@ class LLMClientTests(unittest.TestCase):
         self.assertEqual(calls, {"run": 1, "sleep": 0})
 
     def test_run_command_decodes_subprocess_output_with_utf8_replacement(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result = llm_client._run_command(
-                [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read() + b'\\xff')"],
-                "프롬프트", cwd=Path(directory), timeout=10,
-            )
-        self.assertEqual(result, "프롬프트\ufffd")
+        captured = {}
+
+        class Completed:
+            returncode = 0
+            stdout = '{"ok": true}'
+            stderr = ""
+
+        original_run = llm_client.subprocess.run
+
+        def fake_run(command, **kwargs):
+            captured.update(kwargs)
+            return Completed()
+
+        try:
+            llm_client.subprocess.run = fake_run
+
+            result = llm_client._run_command(["fake"], "프롬프트", cwd=Path("."), timeout=5)
+        finally:
+            llm_client.subprocess.run = original_run
+
+        self.assertEqual(result, '{"ok": true}')
+        self.assertEqual(captured["encoding"], "utf-8")
+        self.assertEqual(captured["errors"], "replace")
 
     def test_gemini_vision_batch_uses_batch_call(self):
         calls = []

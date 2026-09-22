@@ -20,7 +20,7 @@ from PIL import Image
 
 import config
 from utils.document_objects import DocumentObject, parse_html_table, table_to_markdown
-from utils.object_routing import deduplicate_evidence_objects
+from utils.object_routing import deduplicate_evidence_objects, is_index_page
 from utils.pdf_reader import PDFContent, PageContent
 from utils.physical_objects import (
     PhysicalObjectIdentity,
@@ -66,13 +66,6 @@ _STRONG_VISUAL_METADATA = (
     "has_axis", "axis_detected", "has_legend", "legend_detected",
     "line_grid_density", "vector_chart", "multi_panel", "is_multi_panel",
     "chart_like", "table_like", "flow_like", "diagram_like",
-)
-# 주변 문맥의 '사진/참고 사례'는 해당 객체가 비데이터라는 증거가 아니다.
-# 좁은 객체 자체 라벨만 인정하고, 그 외에는 판독 전 판단 보류로 남긴다.
-_CLEAR_NON_DATA_CAPTION_RE = re.compile(
-    r"(?:사진|로고|(?:행사|회의|위원회|단체|기념|준공식|개소식)\s*사진|"
-    r"(?:기관|지자체|회사|기업)\s*로고|(?:event|group|committee)\s+photo|logo)",
-    re.IGNORECASE,
 )
 _MARKDOWN_SEPARATOR_RE = re.compile(
     r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$"
@@ -297,19 +290,6 @@ def strong_data_signals(obj: DocumentObject) -> list[str]:
     return reasons
 
 
-def explicit_non_data_signals(obj: DocumentObject) -> list[str]:
-    """전체 캡션이 명확한 비데이터 라벨일 때만 사전 제외 근거를 반환한다.
-
-    번호만 있거나 주변에 참고자료·모집·행사라는 단어가 있다는 이유로
-    이미지 내용을 추정하지 않는다. 강한 데이터 신호는 호출자가 우선한다.
-    """
-    caption = _CAPTION_NUMBER_RE.sub(" ", obj.caption or "")
-    caption = re.sub(r"\s+", " ", caption).strip(" []():.-")
-    if _CLEAR_NON_DATA_CAPTION_RE.fullmatch(caption):
-        return [f"explicit_non_data:caption:{caption}"]
-    return []
-
-
 @dataclass(slots=True)
 class TriageDecision:
     object_id: str
@@ -340,9 +320,6 @@ class TriageDecision:
     final_status: str = "needs_review"
     attempt_count: int = 0
     terminal_reason: str = ""
-    initial_action: str = ""
-    promotion_reason: str = ""
-    toc: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -374,10 +351,49 @@ class TriageDecision:
             "final_status": self.final_status,
             "attempt_count": self.attempt_count,
             "terminal_reason": self.terminal_reason,
-            "initial_action": self.initial_action or self.action,
-            "promotion_reason": self.promotion_reason,
-            "toc": dict(self.toc),
         }
+
+
+def _is_caption_placeholder(obj: DocumentObject) -> bool:
+    return bool(obj.metadata.get("caption_only") or obj.metadata.get("missing_native"))
+
+
+def index_caption_pages(
+    objects: list[DocumentObject],
+    page_texts: dict[int, str] | None = None,
+    *,
+    min_caption_count: int | None = None,
+) -> set[int]:
+    """목차·표목차·그림목차처럼 캡션 참조만 나열된 페이지 번호를 결정론적으로 판정한다.
+
+    (a) 페이지 본문이 목차 구조(is_index_page)이거나
+    (b) 캡션 프록시가 min_caption_count개 이상이고 native 표·이미지·차트·그림이 없으면 목록 페이지다.
+    지자체·키워드에 의존하지 않고 문서 구조만 본다(v8-1 S3-1).
+    """
+    threshold = (
+        int(min_caption_count)
+        if min_caption_count is not None
+        else int(getattr(config, "OCR_INDEX_CAPTION_MIN_COUNT", 5))
+    )
+    placeholders: dict[int, int] = {}
+    natives: dict[int, int] = {}
+    for obj in objects:
+        if obj.object_type not in {"table", "chart", "figure", "image"}:
+            continue
+        if obj.metadata.get("render_proxy"):
+            continue
+        if _is_caption_placeholder(obj):
+            placeholders[obj.page_number] = placeholders.get(obj.page_number, 0) + 1
+        else:
+            natives[obj.page_number] = natives.get(obj.page_number, 0) + 1
+    pages: set[int] = set()
+    for page_number, count in placeholders.items():
+        page_text = (page_texts or {}).get(page_number, "")
+        if page_text and is_index_page(page_text):
+            pages.add(page_number)
+        elif threshold > 0 and count >= threshold and natives.get(page_number, 0) == 0:
+            pages.add(page_number)
+    return pages
 
 
 def build_triage_plan(
@@ -385,46 +401,37 @@ def build_triage_plan(
     *,
     backend: str,
     confidence_threshold: float,
+    page_texts: dict[int, str] | None = None,
 ) -> list[TriageDecision]:
     decisions: list[TriageDecision] = []
+    index_pages = index_caption_pages(objects, page_texts)
     for obj in objects:
         confidence, reasons = native_confidence(obj)
         sample = obj.searchable_text().casefold()
         render_proxy = bool(obj.metadata.get("render_proxy"))
         negative_signals = sorted({token for token in _NEGATIVE_SIGNALS if token in sample})
         strong_signals = strong_data_signals(obj)
-        non_data_signals = explicit_non_data_signals(obj)
         reasons = [*reasons, *strong_signals]
 
         if render_proxy:
             action = "transport_only"
             reasons = [*reasons, "page_render_transport"]
+        elif _is_caption_placeholder(obj) and obj.page_number in index_pages:
+            # 목차의 "표 2-1 온실가스 배출 현황"은 데이터 용어를 포함하므로 강신호보다 우선한다.
+            action = "skip_index_caption"
+            reasons = [*reasons, "index_page_caption_reference"]
         elif obj.object_type == "text":
-            # 빈 페이지 텍스트 프록시는 실제 추출 성공이 아니다. 자동 OCR
-            # 승격은 별도 예산 정책에서 결정하고 여기서는 상태만 보존한다.
-            action = "native_keep" if (obj.text or "").strip() else "review_required"
-            if action == "review_required":
-                reasons.append("insufficient_evidence:empty_native_text")
+            action = "native_keep"
         elif obj.object_type == "table":
             action = "ocr_required" if confidence < confidence_threshold else "native_keep"
         elif obj.object_type == "chart":
             action = "ocr_required"
         elif obj.object_type in {"figure", "image"}:
-            if strong_signals:
-                action = "ocr_required"
-            elif non_data_signals:
-                action = "skip_non_data"
-                reasons = [*reasons, "no_strong_data_signal", *non_data_signals]
-            else:
-                action = "review_required"
-                reasons = [*reasons, "no_strong_data_signal", "insufficient_evidence:visual_content_unknown"]
-        elif negative_signals:
-            if non_data_signals:
-                action = "skip_non_data"
-                reasons.extend(non_data_signals)
-            else:
-                action = "review_required"
+            action = "ocr_required" if strong_signals else "skip_non_data"
+            if not strong_signals:
                 reasons = [*reasons, "no_strong_data_signal"]
+        elif negative_signals:
+            action = "skip_non_data"
         else:
             action = "native_keep"
 
@@ -438,15 +445,12 @@ def build_triage_plan(
         if action == "native_keep":
             final_status = "extracted"
             terminal_reason = "PyMuPDF 기본 추출 사용"
-        elif action == "skip_non_data":
+        elif action == "skip_index_caption":
             final_status = "not_relevant"
-            terminal_reason = "명시적 비데이터 캡션에 따른 사전 제외"
-        elif action == "transport_only":
+            terminal_reason = "목차·목록 페이지의 캡션 참조"
+        elif action in {"skip_non_data", "transport_only"}:
             final_status = "not_relevant"
-            terminal_reason = "렌더 전송 프록시 (별도 데이터 객체 아님)"
-        elif action == "review_required":
-            final_status = "needs_review"
-            terminal_reason = "판단 근거 부족: 자동 판독 대기열에 넣지 않고 검토 대상으로 보존"
+            terminal_reason = "비데이터 객체 또는 렌더 전송 프록시"
         else:
             final_status = "needs_review"
             terminal_reason = "OCR/VLM 판독 대기"
@@ -490,7 +494,6 @@ def build_triage_plan(
             context_only=bool(obj.metadata.get("context_only")),
             reasons=reasons,
             backend=backend if action == "ocr_required" else "",
-            status="deferred_classification" if action == "review_required" else "planned",
             final_status=final_status,
             terminal_reason=terminal_reason,
         ))
@@ -528,10 +531,6 @@ def apply_triage_metadata(
         if row:
             obj.metadata["native_confidence"] = row.get("native_confidence")
             obj.metadata["triage_action"] = row.get("action")
-            obj.metadata["initial_triage_action"] = row.get("initial_action") or row.get("action")
-            obj.metadata["promotion_reason"] = row.get("promotion_reason", "")
-            if row.get("toc"):
-                obj.metadata["toc"] = dict(row["toc"])
             obj.metadata["triage_reasons"] = row.get("reasons", [])
             obj.metadata["ocr_backend"] = row.get("backend", "")
             obj.metadata["ocr_status"] = row.get("status", "planned")
@@ -1485,11 +1484,26 @@ def reconstruct_candidate_regions(
         regions.append(CandidateRenderRegion(
             "fallback_full_page", tuple(bounds), "full_page_fallback"
         ))
-    elif getattr(config, "OCR_FULL_PAGE_CONTEXT_ENABLED", True):
+    elif getattr(config, "OCR_FULL_PAGE_CONTEXT_ENABLED", True) and _context_render_allowed(regions, bounds):
         regions.append(CandidateRenderRegion(
             "full_page_context", tuple(bounds), "page_context"
         ))
     return regions
+
+
+def _context_render_allowed(regions: list[CandidateRenderRegion], bounds: fitz.Rect) -> bool:
+    """패널 2개 이상이거나 객체 영역이 페이지 면적 비율 상한 미만일 때만 문맥 렌더를 붙인다."""
+    if any(region.variant == "panel" and region.panel_count >= 2 for region in regions):
+        return True
+    page_area = max(1.0, float(bounds.width) * float(bounds.height))
+    object_rects = [fitz.Rect(region.bbox) for region in regions if region.variant in {"object", "composite"}]
+    if not object_rects:
+        return True
+    union = _union_rects(object_rects)
+    if union is None:
+        return True
+    ratio = (float(union.width) * float(union.height)) / page_area
+    return ratio < float(getattr(config, "OCR_FULL_PAGE_CONTEXT_MAX_OBJECT_RATIO", 0.15))
 
 
 def _render_region_image(pdf_page: fitz.Page, rect: fitz.Rect) -> Image.Image:

@@ -9,7 +9,7 @@ import unicodedata
 from typing import Any, Sequence
 
 
-VISUAL_CONTRACT_VERSION = 5
+VISUAL_CONTRACT_VERSION = 4
 
 VISUAL_CHART_TYPES = frozenset({
     "막대", "꺾은선", "영역", "원", "표", "복합", "기타",
@@ -28,7 +28,6 @@ VISUAL_TARGET_SHEETS = frozenset({
     "mitigation_projects",
     "financial_plan",
     "foundation_measures",
-    "governance_feedback",
     "other",
 })
 
@@ -350,10 +349,8 @@ def normalize_visual_table_rows(
 
         item = _text(row.get("항목"))
         fields.setdefault("집계수준", "합계" if _is_total_label(item) else "세부")
-        if title and "합계그룹" not in fields:
-            fields["합계그룹"] = title
-            # A display fallback is not an explicit per-row table reference.
-            fields["_합계그룹자동생성"] = True
+        if title:
+            fields.setdefault("합계그룹", title)
 
         generated: list[dict[str, Any]] = []
         measures: list[tuple[str, str, str, float, str]] = []
@@ -409,11 +406,6 @@ def normalize_visual_table_rows(
                 for key in (
                     "구조역할", "상위항목", "관계", "순서", "단계",
                     "담당주체", "노드ID", "연결노드ID", "설명",
-                    # Null-valued functions are distinct facts, not duplicate
-                    # numeric cells. Keep qualifiers and evidence conflicts too.
-                    "정보유형", "거버넌스기구", "항목원문", "역할", "값원문",
-                    "구성요소원문", "구성경로원문", "표ID", "합계그룹",
-                    "담당부서", "담당 부서", "_reading",
                 )
                 if fields.get(key) not in (None, "")
             },

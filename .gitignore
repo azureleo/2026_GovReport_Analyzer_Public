@@ -33,7 +33,9 @@ excel_source_verification*.json
 .cache/
 
 # 로컬 실행·평가 산출물
-output/
+# 산출물은 무시하되 게이트 실측 원본(output/v8gate)은 추적한다(v9 통합).
+output/*
+!output/v8gate/
 tmp/
 .codex_analysis/
 *_run_manifest.json

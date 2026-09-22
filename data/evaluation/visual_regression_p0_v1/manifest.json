@@ -1,0 +1,93 @@
+{
+  "annotations_file": "annotations.jsonl",
+  "annotations_sha256": "1bc5fe0dc591b111fbcc1164b9b4f558604b34bb90dcdceb764a1cb325ef4f59",
+  "cases_source": {
+    "path": "cases.jsonl",
+    "sha256": "e734b488244c1799d99f3a07c5f95ba2d047af2c2fb6039a29d64c4673092185"
+  },
+  "counts": {
+    "cases": 7,
+    "negative": 1,
+    "positive": 6,
+    "source_pages": 5
+  },
+  "dataset_fingerprint": "a252894aca12b0e0f6b61509221a085e8f146f9352f6fb764e5220087f40ec4d",
+  "dataset_id": "seoul-visual-regression-p0-v1",
+  "generated_at": "2026-08-18T00:16:56.433796+00:00",
+  "locked": true,
+  "metric_contract": {
+    "evidence_match_accuracy": "근거ID 또는 번호+캡션+핵심값 정확 매칭률",
+    "object_status_accuracy": "사람 확정 최종 상태 일치율",
+    "render_contract_recall": "기대 렌더 변형 생성 비율",
+    "triage_false_negative_rate": "expected_triage=ocr_required 객체의 탈락 비율"
+  },
+  "objects_file": "objects.jsonl",
+  "objects_sha256": "f2ca32df46848708073dec684186a6d990d4b75552abe19be785527cb3c79d18",
+  "pages": [
+    {
+      "height_pdf": 841.0,
+      "page_image": "pages/p0071_full.png",
+      "page_image_sha256": "5614e9d674626ac15e9770b2433b2bf4546d248f78ed1d381dd1cf41b4b1b42f",
+      "page_text": "page_text/p0071.txt",
+      "page_text_sha256": "7318d5df600c7da4e9964065907501bf1ec6ba054c52995f52e09df6928cdb32",
+      "source_page": 71,
+      "subset_page": 1,
+      "width_pdf": 595.0
+    },
+    {
+      "height_pdf": 841.0,
+      "page_image": "pages/p0089_full.png",
+      "page_image_sha256": "0b7521b522dfb9ceddcef7026e5bafb2213997158d54d771b4702d21260fe4a7",
+      "page_text": "page_text/p0089.txt",
+      "page_text_sha256": "c762cfd7cc36e6276ccc982f85780b8fdc0aceae33d9923da6e7f1e276b0aed0",
+      "source_page": 89,
+      "subset_page": 2,
+      "width_pdf": 595.0
+    },
+    {
+      "height_pdf": 841.0,
+      "page_image": "pages/p0093_full.png",
+      "page_image_sha256": "e018666747bed35a13016c8f379dfd8d43768693b98ae8421b49d1081bdcc432",
+      "page_text": "page_text/p0093.txt",
+      "page_text_sha256": "bcbc7f7ca71d554beaa4d328b2e09de9d62bf243e8bfb2197576f30ddaa11330",
+      "source_page": 93,
+      "subset_page": 3,
+      "width_pdf": 595.0
+    },
+    {
+      "height_pdf": 841.0,
+      "page_image": "pages/p0414_full.png",
+      "page_image_sha256": "ddceb9b9373f0f294ce88670383e95eb65217a888cb4578eab2f77ddbfbd61de",
+      "page_text": "page_text/p0414.txt",
+      "page_text_sha256": "70e209be6d9a10c958317438445aa4bcd87bd725df3944e9f43fdbb570bb8166",
+      "source_page": 414,
+      "subset_page": 4,
+      "width_pdf": 595.0
+    },
+    {
+      "height_pdf": 841.0,
+      "page_image": "pages/p0441_full.png",
+      "page_image_sha256": "d458419cabc1a33da866ae3dd37c99fb722d2d7dcfa2462fc8b9aa98cd3b5d5d",
+      "page_text": "page_text/p0441.txt",
+      "page_text_sha256": "1804d4e5824096866bc743a90e9786726c9aa1d810367f3167b353fbb24afb5a",
+      "source_page": 441,
+      "subset_page": 5,
+      "width_pdf": 595.0
+    }
+  ],
+  "render": {
+    "color_space": "rgb",
+    "dpi": 108,
+    "format": "png"
+  },
+  "review_status": "reviewed",
+  "role": "regression",
+  "schema_version": "visual-regression-fixture-v1",
+  "source": {
+    "page_count": 515,
+    "path": "../../../서울특별시_탄소중립계획.pdf",
+    "sha256": "9d63dae845099ccb8349e7b370e314b02f6402a4fa712568f6af7d43f65ed207"
+  },
+  "subset_pdf": "source_subset.pdf",
+  "subset_pdf_sha256": "c67017112c1f9474938d9d955545eb10d285d04113662ead86f4ce14aa8cfd9b"
+}

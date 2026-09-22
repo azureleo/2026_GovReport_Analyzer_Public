@@ -18,7 +18,6 @@ def test_main_creates_missing_output_parent_before_supervisor(monkeypatch, tmp_p
     output_path = tmp_path / "missing" / "out.xlsx"
 
     class FakeSupervisor:
-        last_run_outcome = {"status": "complete", "exit_code": 0, "file_saved": True}
         def run(self, *, input_path, output_path, hwp_path, max_pipeline_retries, include_images):
             Path(output_path).write_text("saved", encoding="utf-8")
             return Path(output_path)
@@ -33,7 +32,7 @@ def test_main_creates_missing_output_parent_before_supervisor(monkeypatch, tmp_p
     # Then: Supervisor 진입 전에 부모를 만들고 정상 저장까지 진행한다.
     assert exit_code == 0
     assert output_path.read_text(encoding="utf-8") == "saved"
-    assert "결과 파일 저장" in capsys.readouterr().out
+    assert "완료! 결과 파일" in capsys.readouterr().out
 
 
 def test_main_rejects_unwritable_output_parent_before_supervisor(monkeypatch, tmp_path, capsys) -> None:

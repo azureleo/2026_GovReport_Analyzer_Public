@@ -85,6 +85,9 @@ LOCAL_AGENT_MODEL = os.environ.get("LOCAL_AGENT_MODEL", "").strip()
 # 정상 추출 호출은 보통 1~2분 내 끝난다. 900초 기본값은 hang을 15분씩 방치해
 # 로컬 에이전트 실행을 수 시간 지연시켰으므로, 필요 시 env로만 되돌린다.
 LOCAL_AGENT_TIMEOUT = _env_int("LOCAL_AGENT_TIMEOUT", 300)
+# vision 호출은 이미지 페이로드·프롬프트가 커 텍스트보다 오래 걸린다. 로컬 에이전트의
+# vision 단계(stage="vision")에만 별도 타임아웃을 준다(v8-1 S3-3).
+LOCAL_AGENT_VISION_TIMEOUT = _env_int("LOCAL_AGENT_VISION_TIMEOUT", 600)
 # 타임아웃은 quota로 추정하지 않는다. 최초 호출 뒤 허용할 추가 재시도 횟수와
 # 재시도 간격을 별도로 제한해 한 배치가 수십 분씩 점유하지 않게 한다.
 LOCAL_AGENT_TIMEOUT_RETRIES = _env_int("LOCAL_AGENT_TIMEOUT_RETRIES", 1)
@@ -102,7 +105,17 @@ EXTRACTION_TIMEOUT_RECOVERY_BUDGET_SECONDS = _env_int(
 # 타임아웃뿐 아니라 최종 호출 실패·JSON 파싱 실패도 작은 배치에서 복구한다.
 EXTRACTION_SPLIT_ON_FAILURE = _env_bool("EXTRACTION_SPLIT_ON_FAILURE", True)
 # 일반 호출의 최대 배치 문자 수. 초과 배치는 호출 전에 페이지/문서객체 단위로 분할한다.
+# 이 상한은 로컬 에이전트(codex/claude) 타임아웃 완화용이다. API 백엔드(gemini/openai)는
+# 별도 상한 EXTRACTION_MAX_BATCH_CHARS_API를 쓰며 기본 0(=상한 없음, BATCH_SIZE 페이지
+# 묶음 그대로) — 짧은 배치가 요약표·본문표·부록표의 같은 사실을 표기 변형으로 중복
+# 산출하는 과잉 추출을 막는다(v8-1 S2-3). 실패 복구 자식 상한은 양쪽 공통이다.
 EXTRACTION_MAX_BATCH_CHARS = _env_int("EXTRACTION_MAX_BATCH_CHARS", 18000)
+EXTRACTION_MAX_BATCH_CHARS_API = _env_int("EXTRACTION_MAX_BATCH_CHARS_API", 0)
+# 배치당 표 셀 수 상한(0 = 비활성). 행렬형 표(연도×부문)는 셀 하나가 출력 행 하나로
+# 펼쳐져, 한 배치에 표 셀이 몰리면 로컬 에이전트가 출력 예산 때문에 표를 요약해 버린다
+# (v8-1 서울 실측: 셀 ~640 배치는 완전 전사, ~1,400+ 배치는 20~50행으로 요약).
+# 문서의 표 구조만 사용하므로 지자체 불변. 문자 상한과 독립적으로 배치를 닫는다.
+EXTRACTION_MAX_BATCH_TABLE_CELLS = _env_int("EXTRACTION_MAX_BATCH_TABLE_CELLS", 0)
 # 실패 복구 자식은 일반 배치보다 작게 유지한다.
 EXTRACTION_RECOVERY_MAX_BATCH_CHARS = _env_int("EXTRACTION_RECOVERY_MAX_BATCH_CHARS", 12000)
 # 단일 페이지의 큰 표는 헤더를 반복하면서 이 행 수 단위로 잘라 정규화한다.
@@ -119,8 +132,6 @@ GUIDELINE_STRUCTURED_INJECTION = _env_bool("GUIDELINE_STRUCTURED_INJECTION", Tru
 GUIDELINE_PROMPT_MAX_CHARS = _env_int("GUIDELINE_PROMPT_MAX_CHARS", 3000)
 APPENDIX4_MATCH_THRESHOLD = _env_float("APPENDIX4_MATCH_THRESHOLD", 0.55)
 APPENDIX3_MATCH_THRESHOLD = _env_float("APPENDIX3_MATCH_THRESHOLD", APPENDIX4_MATCH_THRESHOLD)
-# 일반 실행은 기존 참조 조회를 유지한다. 격리 검증 프로세스만 False로 설정한다.
-REFERENCE_ENRICHMENT_ENABLED = _env_bool("REFERENCE_ENRICHMENT_ENABLED", True)
 CODEBOOK_SHEET_ENABLED = _env_bool("CODEBOOK_SHEET_ENABLED", True)
 DATA_STATUS_ENABLED = _env_bool("DATA_STATUS_ENABLED", True)
 MIN_DOCUMENT_TEXT_CHARS = _env_int("MIN_DOCUMENT_TEXT_CHARS", 500)
@@ -138,6 +149,9 @@ SOURCE_OBJECT_INVENTORY_ENABLED = _env_bool("SOURCE_OBJECT_INVENTORY_ENABLED", T
 SOURCE_OBJECT_PARTIAL_WEIGHT = _env_float("SOURCE_OBJECT_PARTIAL_WEIGHT", 0.5)
 # 표 번호·캡션·섹션을 이용해 결과 행이 올바른 시트에 배치됐는지 별도로 검증한다.
 # 자동 이동은 계획 시작 이후의 배출현황 행이 명시적인 전망표에 놓인 경우로 제한한다.
+# 자동 이동은 축 필드(03 배출유형·04 직간접구분)가 빈 전망 연도행에만 적용한다(v8-1 S2-5):
+# 축이 채워진 행은 인벤토리 축을 가진 표(예: '관리 권한 내 배출량 전망')에서 온 것이라
+# 골든 계약(v7-4 — 05에 지역전체/관리권한 축 필드 없음)대로 03/04에 남긴다.
 SEMANTIC_ROUTING_ENABLED = _env_bool("SEMANTIC_ROUTING_ENABLED", True)
 SEMANTIC_ROUTING_AUTO_RECLASSIFY = _env_bool("SEMANTIC_ROUTING_AUTO_RECLASSIFY", True)
 SEMANTIC_ROUTING_MIN_SCORE = _env_float("SEMANTIC_ROUTING_MIN_SCORE", 5.0)
@@ -306,28 +320,6 @@ VISUAL_MERGE_LABELED_ENABLED = _env_bool("VISUAL_MERGE_LABELED_ENABLED", True)
 # 객체 인벤토리가 연결된 운영 경로에서는 단일 근거 ID가 단일 extracted 객체와
 # 정확히 일치한 시각 후보만 본문 시트에 병합한다. 나머지는 16번 시트에 격리한다.
 VISUAL_EVIDENCE_MERGE_ENABLED = _env_bool("VISUAL_EVIDENCE_MERGE_ENABLED", True)
-# 02_지역여건 시각 후보에 값·연도·정확 근거가 이미 있을 때만 캡션과 차트 문맥으로
-# 누락된 범주를 보완한다. 애매한 문맥은 기존처럼 needs_review에 남긴다.
-REGIONAL_VISUAL_ENRICHMENT_ENABLED = _env_bool(
-    "REGIONAL_VISUAL_ENRICHMENT_ENABLED", True
-)
-VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED = _env_bool(
-    "VISUAL_REFERENCE_GATE_REFINEMENT_ENABLED", True
-)
-# 운반된 근거 ID만 신뢰하지 않고 표·그림 번호, 원본/물리 객체 ID, 패널,
-# 좌표, 캡션 순서로 하나의 원문 객체를 확정한다. 복수 객체는 자동 병합하지 않는다.
-VISUAL_EXACT_OBJECT_RESOLUTION_ENABLED = _env_bool(
-    "VISUAL_EXACT_OBJECT_RESOLUTION_ENABLED", True
-)
-VISUAL_FIELD_COMPOSITION_ENABLED = _env_bool(
-    "VISUAL_FIELD_COMPOSITION_ENABLED", True
-)
-# G4 완화는 시각값의 직접 통계 전환 효과가 확인된 시트에만 적용한다. 다른 시트는
-# 기존 참고 키워드 판정을 유지해 이행평가·설비현황 등이 사업 목록으로 유입되지 않게 한다.
-VISUAL_REFERENCE_GATE_RELAXED_SHEETS = set(_env_list(
-    "VISUAL_REFERENCE_GATE_RELAXED_SHEETS",
-    ["regional_conditions"],
-))
 # 운영 Vision 결과를 모델 호출 없이 병합 정책 A/B에 재사용할 수 있도록
 # 정제 직전의 최소 입력을 gzip JSON 스냅샷으로 보존한다.
 VISUAL_MERGE_SNAPSHOT_ENABLED = _env_bool("VISUAL_MERGE_SNAPSHOT_ENABLED", True)
@@ -444,10 +436,8 @@ EXCEL_HEADERS = {
         "디지타이징필요", "관련시트",
         "참고자료여부", "참고자료근거", "시각구조유형",
         "음성재검증상태", "음성재검증근거", "자동병합정책",
-        "근거ID", "근거매칭상태", "근거분리방식", "원본객체ID",
-        "물리객체ID", "렌더그룹ID", "패널인덱스", "패널수", "근거좌표", "렌더변형",
+        "근거ID", "근거매칭상태", "물리객체ID", "렌더변형",
         "렌더변형목록", "물리중복통합수", "병합상태", "병합차단사유",
-        "필드조합상태", "필드조합목록", "필드조합근거", "필드조합충돌",
     ],
     "17_보조검수후보": [
         "지자체명", "대상시트", "후보유형", "신뢰도", "근거페이지",
@@ -558,11 +548,8 @@ OPTIONAL_EXCEL_SHEETS = {
 # 사용자용 작성 데이터 집계에는 포함하지 않는다.
 INTERNAL_OBJECT_KEYS = {
     "object_triage", "ocr_document_objects", "document_objects",
-    "reduction_target_context", "semantic_contract_review", "reading_pipeline_audit",
+    "reduction_target_context", "semantic_contract_review",
 }
-
-# Production A/B rule bridge. Pure local transformation; no extra LLM calls.
-READING_PIPELINE_ENABLED = _env_bool("READING_PIPELINE_ENABLED", True)
 
 # 행 단위 원문 대조를 위한 페이지 근거. 헤더에는 항상 맨 뒤에 추가하되,
 # 실제 엑셀 출력에서만 PROVENANCE_ENABLED=0으로 v3 스키마를 복원할 수 있다.
@@ -577,28 +564,6 @@ for _sheet_name in _PROVENANCE_DATA_SHEETS:
         EXCEL_HEADERS[_sheet_name].append("출처페이지")
     if "데이터상태" not in EXCEL_HEADERS[_sheet_name]:
         EXCEL_HEADERS[_sheet_name].append("데이터상태")
-
-# 정규화 전 부문 표현을 Excel에도 보존한다. 기존 열 위치는 유지한다.
-RAW_SECTOR_EXCEL_COLUMNS = {
-    "03_배출현황_지역": "부문원문",
-    "04_배출현황_관리권한": "관리부문원문",
-    "06_감축목표": "부문원문",
-    "08_감축사업목록": "부문원문",
-}
-for _sheet_name, _raw_column in RAW_SECTOR_EXCEL_COLUMNS.items():
-    if _raw_column not in EXCEL_HEADERS[_sheet_name]:
-        EXCEL_HEADERS[_sheet_name].append(_raw_column)
-
-# Append-only schema extension: retain all existing Excel cell positions.
-from utils.reading_financial_period import EXTRA_COLUMNS as _READING_EXTRA_COLUMNS
-from utils.reading_context_facts import COLUMNS as _READING_FACT_COLUMNS
-_READING_EXTRA_COLUMNS = {k: list(v) for k, v in _READING_EXTRA_COLUMNS.items()}
-for _key, _columns in _READING_FACT_COLUMNS.items():
-    _READING_EXTRA_COLUMNS.setdefault(_key, []).extend(_columns)
-for _sheet_key, _extra_columns in _READING_EXTRA_COLUMNS.items():
-    for _column in _extra_columns:
-        if _column not in EXCEL_HEADERS[SHEET_KEY_TO_NAME[_sheet_key]]:
-            EXCEL_HEADERS[SHEET_KEY_TO_NAME[_sheet_key]].append(_column)
 
 # PDF 페이지 배치 처리 크기.
 # 너무 크면 출력 JSON이 길어져 파싱 실패가 늘 수 있어 안정성 위주로 둔다.
@@ -703,10 +668,6 @@ PARALLEL_PROCESSING_ENABLED = _env_bool("PARALLEL_PROCESSING_ENABLED", True)
 # 같은 시트 계약·페이지 집합·주입 프롬프트·payload인 텍스트 작업은 enqueue 전에 제거한다.
 # 서로 다른 시트나 복구 청크는 fingerprint가 달라 합쳐지지 않는다.
 TEXT_QUEUE_DEDUP_ENABLED = _env_bool("TEXT_QUEUE_DEDUP_ENABLED", True)
-# Separate experimental axes. Audit is non-mutating until input retention is reviewed.
-TEXT_ROUTING_MODE = os.environ.get("TEXT_ROUTING_MODE", "audit").strip().lower()
-TEXT_INPUT_MODE = os.environ.get("TEXT_INPUT_MODE", "audit").strip().lower()
-TEXT_CLUSTER_MEMBER_RETRIES = _env_int("TEXT_CLUSTER_MEMBER_RETRIES", 1)
 # 텍스트 추출(extractor/gap_fill) 동시 호출 수.
 TEXT_WORKERS = _env_int("TEXT_WORKERS", 4)
 # 이미지 vision 동시 호출 수. vision은 호출당 페이로드가 커 보수적으로 둔다.
@@ -732,18 +693,19 @@ IMAGE_TRIAGE_MIN_SCORE = 5
 IMAGE_TRIAGE_KEEP_RENDERED_CONTEXT = True
 # DePlot 아이디어를 차용해 그래프/차트 이미지를 표 형태 JSON으로 먼저 변환
 IMAGE_CHART_TABLE_EXTRACTION = True
-# 전수 이미지 분석 시 여러 이미지를 한 번의 로컬 에이전트 호출로 묶는다.
+# 전수 이미지 분석 시 여러 이미지를 한 번의 호출로 묶는다. API 백엔드 기본 8,
+# 로컬 에이전트(codex/claude) 기본 4 — 무거운 vision 프롬프트로 배치당 타임아웃이
+# 잦아 완주가 불가했던 문제의 완화(v8-1 S3-3).
 IMAGE_ANALYSIS_BATCH_SIZE = _env_int("IMAGE_ANALYSIS_BATCH_SIZE", 8)
-# off: 기존 경로 / audit: 판정 기록만 / exclude: 확인된 목차만 Vision 호출 전 제외.
-# 텍스트 배정·본문·실제 표 데이터는 변경하지 않는다.
-VISION_TOC_MODE = os.environ.get("VISION_TOC_MODE", "exclude").strip().lower()
+IMAGE_ANALYSIS_BATCH_SIZE_LOCAL_AGENT = _env_int("IMAGE_ANALYSIS_BATCH_SIZE_LOCAL_AGENT", 4)
 # 비전 배치도 텍스트 배치와 같은 실행 원장에 저장하고, 실패 시 이미지 단위로 분할한다.
 VISION_CHECKPOINT_ENABLED = _env_bool("VISION_CHECKPOINT_ENABLED", True)
 VISION_SPLIT_ON_FAILURE = _env_bool("VISION_SPLIT_ON_FAILURE", True)
 VISION_RECOVERY_MAX_SPLIT_DEPTH = _env_int("VISION_RECOVERY_MAX_SPLIT_DEPTH", 6)
-# 루트 호출도 1회로 계산한다. 기본 7회는 최대 분할 깊이 6과 같은 상한이다.
+# 루트 호출도 1회로 계산한다. 기본 3회 — 계속 실패하는 객체 하나가 최대 7회×타임아웃을
+# 점유하던 것을 막는다(v8-1 S3-3). 상한 도달 객체는 needs_review로 원장에 남는다.
 VISION_RECOVERY_MAX_OBJECT_ATTEMPTS = _env_int(
-    "VISION_RECOVERY_MAX_OBJECT_ATTEMPTS", 7
+    "VISION_RECOVERY_MAX_OBJECT_ATTEMPTS", 3
 )
 # 강한 캡션·수치·단위 신호가 있는데도 비데이터로 판정된 객체만 전용 프롬프트로
 # 근거 ID당 한 번 재확인한다. 0은 실행 전체 객체 수 상한 없음이다.
@@ -793,14 +755,6 @@ IMAGE_TRIAGE_EXCLUDE_REFERENCE_CONTEXT = _env_bool(
 # 데이터 차트만 보완한다. 백엔드는 vlm(기존 이미지 에이전트),
 # unlimited_ocr(사전 생성 Markdown/JSONL 디렉터리), none 중 하나다.
 SELECTIVE_OCR_ENABLED = _env_bool("SELECTIVE_OCR_ENABLED", True)
-# Opt-in bounded reading of uncertain images. Zero budgets mean no extra calls.
-VISION_REVIEW_ENABLED = _env_bool("VISION_REVIEW_ENABLED", False)
-VISION_REVIEW_MAX_OBJECTS = _env_int("VISION_REVIEW_MAX_OBJECTS", 16)
-VISION_REVIEW_MAX_PER_PAGE = _env_int("VISION_REVIEW_MAX_PER_PAGE", 1)
-VISION_REVIEW_MAX_CALLS = _env_int("VISION_REVIEW_MAX_CALLS", 16)
-VISION_REVIEW_MAX_SECONDS = _env_float("VISION_REVIEW_MAX_SECONDS", 600)
-VISION_REVIEW_CALL_TIMEOUT = _env_float("VISION_REVIEW_CALL_TIMEOUT", 120)
-VISION_EXPECTED_CANDIDATE_SHA256 = os.environ.get("VISION_EXPECTED_CANDIDATE_SHA256", "").strip()
 # 동일 표·차트의 native/캡션/OCR/VLM 표현을 Triage 전에 하나의 물리 객체로
 # 통합한다. 원래 객체 ID는 alias로 보존하고 서로 다른 패널은 합치지 않는다.
 PHYSICAL_OBJECT_MERGE_ENABLED = _env_bool("PHYSICAL_OBJECT_MERGE_ENABLED", True)
@@ -815,7 +769,14 @@ OCR_RENDER_DPI = _env_int("OCR_RENDER_DPI", 200)
 OCR_RENDER_CACHE_ENABLED = _env_bool("OCR_RENDER_CACHE_ENABLED", True)
 # 캡션만 검출된 객체는 페이지 전체 대신 인접 이미지·표·벡터 영역을 먼저 복원한다.
 OCR_SPATIAL_RECONSTRUCTION_ENABLED = _env_bool("OCR_SPATIAL_RECONSTRUCTION_ENABLED", True)
+# 전체 페이지 문맥 렌더는 (a) 패널이 2개 이상이거나 (b) 객체 영역이 페이지 면적의
+# OCR_FULL_PAGE_CONTEXT_MAX_OBJECT_RATIO 미만일 때만 추가한다(v8-1 S3-2 — 프록시마다
+# 문맥 렌더가 붙어 vision 후보가 두 배로 늘던 문제).
 OCR_FULL_PAGE_CONTEXT_ENABLED = _env_bool("OCR_FULL_PAGE_CONTEXT_ENABLED", True)
+OCR_FULL_PAGE_CONTEXT_MAX_OBJECT_RATIO = _env_float("OCR_FULL_PAGE_CONTEXT_MAX_OBJECT_RATIO", 0.15)
+# 목차·표목차·그림목차 페이지의 캡션 참조는 판독 대상에서 제외한다(v8-1 S3-1).
+# 같은 페이지에 캡션 프록시가 이 수 이상이고 native 표·이미지·차트가 없으면 목록 페이지로 본다.
+OCR_INDEX_CAPTION_MIN_COUNT = _env_int("OCR_INDEX_CAPTION_MIN_COUNT", 5)
 OCR_MULTI_PANEL_GAP = _env_int("OCR_MULTI_PANEL_GAP", 24)
 OCR_CAPTION_REGION_MAX_HEIGHT_RATIO = _env_float(
     "OCR_CAPTION_REGION_MAX_HEIGHT_RATIO", 0.45

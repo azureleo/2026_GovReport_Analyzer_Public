@@ -130,7 +130,14 @@ def parse_html_table(table_html: str) -> list[list[str]]:
     return parser.rows
 
 
-def table_to_markdown(rows: list[list[str]], max_rows: int = 35, max_cols: int = 12) -> str:
+def table_to_markdown(
+    rows: list[list[str]],
+    max_rows: int = 35,
+    max_cols: int = 12,
+    header_rows: int = 1,
+) -> str:
+    """표 행을 마크다운으로 만든다. header_rows가 2 이상이면 첫 줄만 헤더 구분선 위에
+    두고 나머지 헤더 줄은 구분선 바로 아래에 그대로 둔다(다단 헤더 정보 무손실)."""
     if not rows:
         return ""
     width = min(max(len(row) for row in rows), max_cols)
@@ -142,6 +149,7 @@ def table_to_markdown(rows: list[list[str]], max_rows: int = 35, max_cols: int =
         return values + [""] * (width - len(values))
 
     trimmed = [norm(row) for row in rows[:max_rows]]
+    header_rows = max(1, min(int(header_rows), len(trimmed)))
     header = trimmed[0]
     body = trimmed[1:]
     lines = [
@@ -153,6 +161,39 @@ def table_to_markdown(rows: list[list[str]], max_rows: int = 35, max_cols: int =
         omitted = [f"... {len(rows) - max_rows} more rows omitted"] + [""] * (width - 1)
         lines.append("| " + " | ".join(omitted) + " |")
     return "\n".join(lines)
+
+
+_HEADER_NUMERIC_CELL_RE = re.compile(r"^[-+]?\d+(?:,\d{3})*(?:\.\d+)?\s*(?:%|％)?$")
+_HEADER_YEAR_CELL_RE = re.compile(r"^(?:19|20)\d{2}\s*(?:년)?(?:\s*[~～\-–—]\s*(?:19|20)?\d{2}\s*년?)?$")
+TABLE_HEADER_MAX_ROWS = 3
+
+
+def _is_header_like_row(row: list[str]) -> bool:
+    """연도 셀은 허용하되 그 밖의 숫자 셀이 하나도 없는 행을 헤더로 본다."""
+    cells = [str(cell or "").strip() for cell in row]
+    if not any(cells):
+        return False
+    for cell in cells:
+        if not cell or _HEADER_YEAR_CELL_RE.fullmatch(cell):
+            continue
+        if _HEADER_NUMERIC_CELL_RE.fullmatch(cell.replace(" ", "")):
+            return False
+    return True
+
+
+def table_header_row_count(rows: list[list[str]], max_rows: int = TABLE_HEADER_MAX_ROWS) -> int:
+    """표 앞부분의 연속 헤더 행 수(1 이상, max_rows 이하)를 결정론적으로 판정한다."""
+    if not rows:
+        return 0
+    count = 0
+    for row in rows[:max_rows]:
+        if not _is_header_like_row(row):
+            break
+        count += 1
+    if count >= len(rows):
+        # 전부 헤더처럼 보이면(수치 없는 표) 첫 행만 헤더로 둔다.
+        count = 1
+    return max(1, count)
 
 
 def _page_lines(text: str) -> list[str]:
@@ -381,17 +422,22 @@ def render_table_object_chunks(
     rows_per_chunk: int = 20,
     max_chars: int | None = None,
 ) -> list[str]:
-    """큰 표를 헤더 반복 행 청크로 만들어 한 호출의 출력·입력 크기를 제한한다."""
+    """큰 표를 헤더 블록 반복 행 청크로 만들어 한 호출의 출력·입력 크기를 제한한다.
+
+    다단 헤더(예: `구분|직접배출|간접배출` + `연도|2018|2019`)는 헤더 블록 전체를
+    모든 청크에 반복해 행 구분 축이 2번째 청크부터 사라지지 않게 한다.
+    """
     if obj.object_type != "table" or not obj.rows:
         return []
     rows_per_chunk = max(2, int(rows_per_chunk))
-    header = list(obj.rows[0])
-    body = list(obj.rows[1:])
+    header_count = table_header_row_count(obj.rows)
+    header_block = [list(row) for row in obj.rows[:header_count]]
+    body = [list(row) for row in obj.rows[header_count:]]
     body_chunks = [body[i:i + rows_per_chunk - 1] for i in range(0, len(body), rows_per_chunk - 1)]
     if not body_chunks:
         body_chunks = [[]]
     def render(chunk: list[list[str]], index: int, total: int) -> str:
-        rows = [header, *chunk]
+        rows = [*header_block, *chunk]
         return "\n".join([
             "[문서객체: 표 우선 데이터]",
             f"object_id: {obj.object_id}",
@@ -402,8 +448,10 @@ def render_table_object_chunks(
             f"caption: {obj.caption or 'unknown'}",
             f"section: {obj.section or 'unknown'}",
             f"nearby_text: {obj.nearby_text or 'unknown'}",
+            f"header_rows: {header_count}",
+            "key_fields_hint: 행 구분 필드(구분·유형·시나리오 등)는 위 헤더 행과 caption·section에서 판정할 것",
             "table_markdown:",
-            table_to_markdown(rows, max_rows=max(len(rows), 2)),
+            table_to_markdown(rows, max_rows=max(len(rows), 2), header_rows=header_count),
         ])
 
     # 행 수 기준 청크가 긴 셀 때문에 문자 상한을 넘으면 행 묶음을 다시 반분한다.

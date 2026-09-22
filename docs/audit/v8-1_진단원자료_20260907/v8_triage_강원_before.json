@@ -1,0 +1,145 @@
+{
+ "label": "강원_v8base",
+ "pages": 346,
+ "raw_objects": 9469,
+ "physical_objects": 9302,
+ "dups": 167,
+ "by_type": {
+  "text": 8589,
+  "image": 122,
+  "table": 545,
+  "chart": 46
+ },
+ "action_by_type": {
+  "text:native_keep": 8589,
+  "image:transport_only": 63,
+  "table:native_keep": 388,
+  "table:ocr_required": 157,
+  "chart:ocr_required": 46,
+  "image:ocr_required": 54,
+  "image:skip_non_data": 5
+ },
+ "ocr_required": 257,
+ "required_reason_top": [
+  [
+   "strong:numbered_caption",
+   231
+  ],
+  [
+   "strong:numeric_value",
+   193
+  ],
+  [
+   "strong:table_structure",
+   157
+  ],
+  [
+   "native_table_missing",
+   123
+  ],
+  [
+   "negative_overridden_by_strong_or_structured_signal",
+   105
+  ],
+  [
+   "negative:목차",
+   102
+  ],
+  [
+   "strong:year_or_period",
+   57
+  ],
+  [
+   "visual_requires_classification",
+   54
+  ],
+  [
+   "chart_requires_digitization",
+   46
+  ],
+  [
+   "strong:chart_structure",
+   46
+  ],
+  [
+   "strong:data_terms:표",
+   36
+  ],
+  [
+   "text_strategy_table",
+   18
+  ],
+  [
+   "strong:quantified_unit",
+   15
+  ],
+  [
+   "strong:data_terms:표,현황",
+   12
+  ],
+  [
+   "strong:data_terms:배출,전망,추이",
+   10
+  ],
+  [
+   "strong:data_terms:변화,표",
+   9
+  ],
+  [
+   "strong:data_terms:감축,표",
+   8
+  ],
+  [
+   "strong:data_terms:배출,비중",
+   8
+  ],
+  [
+   "strong:data_terms:감축,목표,표",
+   7
+  ],
+  [
+   "strong:data_terms:감축,로드맵,표",
+   6
+  ],
+  [
+   "strong:data_terms:배출,전망,표",
+   6
+  ],
+  [
+   "strong:context_terms:배출,비중,전망,추이,표",
+   6
+  ],
+  [
+   "low_cell_fill:0.67",
+   6
+  ],
+  [
+   "strong:data_terms:에너지,표,현황",
+   5
+  ],
+  [
+   "strong:data_terms:에너지,표",
+   5
+  ]
+ ],
+ "required_table_conf_buckets": {
+  "0.1": 123,
+  "0.7": 16,
+  "0.6": 18
+ },
+ "required_caption_only": 46,
+ "required_missing_native": 119,
+ "render_regions_total": 263,
+ "render_variants": {
+  "fallback_full_page": 159,
+  "object": 98,
+  "full_page_context": 6
+ },
+ "page_images_total": 167,
+ "page_render_images": 63,
+ "pages_over_18000": 0,
+ "pages_over_12000": 8,
+ "max_page_chars": 15331,
+ "pages_with_tables": 330,
+ "seconds": 31.0
+}

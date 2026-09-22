@@ -1,0 +1,151 @@
+Consider using the pymupdf_layout package for a greatly improved page layout analysis.
+{
+ "label": "서울_v8",
+ "pages": 515,
+ "raw_objects": 13048,
+ "physical_objects": 12626,
+ "dups": 422,
+ "by_type": {
+  "text": 11001,
+  "image": 468,
+  "table": 923,
+  "chart": 233,
+  "figure": 1
+ },
+ "action_by_type": {
+  "text:native_keep": 11001,
+  "image:transport_only": 232,
+  "table:native_keep": 493,
+  "table:ocr_required": 430,
+  "chart:ocr_required": 233,
+  "image:skip_non_data": 56,
+  "image:ocr_required": 180,
+  "figure:ocr_required": 1
+ },
+ "ocr_required": 844,
+ "required_reason_top": [
+  [
+   "strong:numbered_caption",
+   810
+  ],
+  [
+   "strong:table_structure",
+   430
+  ],
+  [
+   "native_table_missing",
+   354
+  ],
+  [
+   "negative_overridden_by_strong_or_structured_signal",
+   345
+  ],
+  [
+   "chart_requires_digitization",
+   233
+  ],
+  [
+   "strong:chart_structure",
+   233
+  ],
+  [
+   "negative:목차",
+   204
+  ],
+  [
+   "visual_requires_classification",
+   181
+  ],
+  [
+   "strong:numeric_value",
+   154
+  ],
+  [
+   "strong:data_terms:표",
+   114
+  ],
+  [
+   "strong:year_or_period",
+   97
+  ],
+  [
+   "negative:사진",
+   71
+  ],
+  [
+   "strong:data_terms:감축,표",
+   57
+  ],
+  [
+   "strong:data_terms:추진계획,표",
+   57
+  ],
+  [
+   "strong:quantified_unit",
+   45
+  ],
+  [
+   "negative:목차,사진,행사",
+   36
+  ],
+  [
+   "text_strategy_table",
+   31
+  ],
+  [
+   "negative:공모전,모집,목차",
+   28
+  ],
+  [
+   "strong:data_terms:배출",
+   19
+  ],
+  [
+   "strong:context_terms:시설,에너지,현황",
+   19
+  ],
+  [
+   "strong:data_terms:에너지",
+   18
+  ],
+  [
+   "strong:context_terms:감축,로드맵,면적,목표,배출",
+   18
+  ],
+  [
+   "strong:data_terms:표,현황",
+   17
+  ],
+  [
+   "strong:context_terms:감축,로드맵,목표,추진계획,취약",
+   14
+  ],
+  [
+   "strong:data_terms:에너지,추이",
+   14
+  ]
+ ],
+ "required_table_conf_buckets": {
+  "0.1": 354,
+  "0.6": 29,
+  "0.7": 45,
+  "0.5": 2
+ },
+ "required_caption_only": 234,
+ "required_missing_native": 354,
+ "render_regions_total": 1466,
+ "render_variants": {
+  "object": 821,
+  "full_page_context": 588,
+  "panel": 34,
+  "composite": 17,
+  "fallback_full_page": 6
+ },
+ "page_images_total": 664,
+ "page_render_images": 232,
+ "pages_over_18000": 0,
+ "pages_over_12000": 29,
+ "max_page_chars": 17868,
+ "pages_with_tables": 469,
+ "seconds": 69.9
+}

@@ -7,7 +7,7 @@ import openpyxl
 import pytest
 
 import config
-from scripts.golden_score_contract import 계약헤더
+from scripts.benchmark_golden_contract import 계약헤더
 from utils.benchmark_evaluation import (
     EvaluationContractError,
     evaluate_benchmark,
