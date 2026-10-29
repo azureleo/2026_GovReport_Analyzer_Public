@@ -16,21 +16,28 @@ import config
 
 
 FAILED_BATCH_STATUSES = frozenset({"call_fail", "parse_fail", "partial", "unresolved"})
-_VOLATILE_ROW_FIELDS = frozenset({"_row_id", "_entity_id"})
+# 추출 원천 태그(표객체/본문청크)는 병합 우선순위 판정에만 쓰고 행 동일성·체크포인트
+# 해시에서는 제외한다(같은 사실이 원천만 달라 다른 행으로 남지 않게).
+EXTRACTION_SOURCE_FIELD = "_추출원천"
+EXTRACTION_SOURCE_TABLE_OBJECT = "표객체"
+EXTRACTION_SOURCE_TEXT_CHUNK = "본문청크"
+_VOLATILE_ROW_FIELDS = frozenset({"_row_id", "_entity_id", EXTRACTION_SOURCE_FIELD,
+    "_extraction_sources", "_merge_conflicts", "_merge_conflict", "_axis_validation",
+    "_semantic_routing", "_forecast_scope_review", "_forecast_routing_review"})
 
 _ENTITY_FIELDS: dict[str, tuple[str, ...]] = {
     "document_meta": ("지자체명", "계획명"),
     "plan_overview": ("지자체명", "개요유형", "항목명", "일자"),
     "regional_conditions": ("지자체명", "지표범주", "지표명", "연도"),
-    "emissions_regional": ("지자체명", "배출유형", "부문", "세부부문", "연도"),
-    "emissions_management": ("지자체명", "관리부문", "직간접구분", "연도"),
-    "emissions_forecast": ("지자체명", "시나리오", "부문", "연도"),
-    "reduction_targets": ("지자체명", "목표수준", "목표범위", "부문", "기준연도", "목표연도"),
+    "emissions_regional": ("지자체명", "배출유형", "부문", "세부부문", "연도", "단위"),
+    "emissions_management": ("지자체명", "관리부문", "세부부문", "직간접구분", "연도", "단위"),
+    "emissions_forecast": ("지자체명", "전망범위", "시나리오", "부문", "세부부문", "연도", "단위"),
+    "reduction_targets": ("지자체명", "목표수준", "목표범위", "부문", "기준연도", "목표연도", "단위"),
     "vision_strategy": ("지자체명", "전략수준", "전략명"),
     "mitigation_projects": ("지자체명", "관리번호", "사업명", "부문"),
     "annual_implementation": ("지자체명", "관리번호", "사업명", "연도"),
-    "quantitative_reductions": ("지자체명", "관리번호", "사업명", "연도", "기간시작", "기간종료", "시간기준"),
-    "financial_plan": ("지자체명", "관리번호", "사업명", "재원구분", "연도", "기간시작", "기간종료", "시간기준", "집계대상원문", "부문"),
+    "quantitative_reductions": ("지자체명", "관리번호", "사업명", "연도"),
+    "financial_plan": ("지자체명", "관리번호", "사업명", "재원구분", "연도"),
     "foundation_measures": ("지자체명", "대응기반영역", "과제명"),
     "governance_feedback": ("지자체명", "거버넌스기구", "역할"),
     "monitoring_performance": ("지자체명", "점검연도", "관리번호", "사업명"),
@@ -94,7 +101,6 @@ def _implementation_hash() -> str:
     paths = [
         project_root / "config.py",
         project_root / "main.py",
-        project_root / "data" / "reading_mapping_rules_v1.json",
     ]
     for package in ("agents", "utils"):
         paths.extend(sorted((project_root / package).rglob("*.py")))
@@ -137,8 +143,6 @@ def stable_row_id(sheet_key: str, row: dict[str, Any]) -> str:
 
 def stable_entity_id(sheet_key: str, row: dict[str, Any]) -> str:
     fields = _ENTITY_FIELDS.get(sheet_key, ())
-    if row.get('정보유형'):
-        fields = (*fields, '정보유형', '항목원문', '상위기관원문', '구성경로원문', '감축원단위명', '감축원단위단위', '집계대상원문')
     values = {field: row.get(field) for field in fields if row.get(field) not in (None, "")}
     minimum = 1 if sheet_key == "document_meta" else 2
     if len(values) < minimum:
@@ -160,42 +164,69 @@ def _source_page_key(row: dict[str, Any]) -> tuple[int, str]:
     return (min(numbers) if numbers else 10**9, _canonical_json(canonical_row_payload(row)))
 
 
+def _row_pages(row: dict[str, Any]) -> frozenset[int]:
+    value = row.get("출처페이지")
+    numbers: set[int] = set()
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            try:
+                numbers.add(int(item))
+            except (TypeError, ValueError):
+                continue
+    elif value not in (None, ""):
+        numbers = {int(token) for token in re.findall(r"\d+", str(value))}
+    return frozenset(numbers)
+
+
+def _preferred_source_rank(row: dict[str, Any], prefer: tuple[str, ...]) -> int | None:
+    source = str(row.get(EXTRACTION_SOURCE_FIELD) or "").strip()
+    return prefer.index(source) if source in prefer else None
+
+
 def merge_rows_stably(
     sheet_key: str,
     existing: Iterable[dict[str, Any]],
     incoming: Iterable[dict[str, Any]],
+    *,
+    prefer: tuple[str, ...] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """정확히 같은 행은 제거하고, 같은 엔터티의 값 충돌은 둘 다 보존한다."""
-    merged: dict[str, dict[str, Any]] = {}
-    entities: dict[str, str] = {}
-    conflicts: list[dict[str, str]] = []
-    def add_row(source: dict[str, Any], *, report_conflict: bool) -> None:
-        if not isinstance(source, dict):
-            return
-        row = dict(source)
-        row_id = stable_row_id(sheet_key, row)
-        if row_id in merged:
-            return
-        entity_id = stable_entity_id(sheet_key, row)
-        previous_row_id = entities.get(entity_id) if entity_id else None
-        if report_conflict and previous_row_id and previous_row_id != row_id:
-            conflicts.append({
-                "sheet_key": sheet_key,
-                "entity_id": entity_id,
-                "kept_row_id": previous_row_id,
-                "incoming_row_id": row_id,
-            })
-        elif entity_id:
-            entities[entity_id] = row_id
-        merged[row_id] = row
+    """Merge equal facts, preserving both conflicting values regardless of source rank.
 
-    for source in existing:
-        add_row(source, report_conflict=False)
-    for source in incoming:
-        add_row(source, report_conflict=True)
-    rows = sorted(merged.values(), key=_source_page_key)
-    conflicts.sort(key=lambda item: (item["sheet_key"], item["entity_id"], item["incoming_row_id"]))
-    return rows, conflicts
+    Source preference is retained as an API compatibility argument, never authority
+    to discard a different value. An entity is scoped by scenario, subsector and unit.
+    """
+    from agents.organizer_agent import _merge_row_evidence, _PROVENANCE_FIELDS
+    provenance = _PROVENANCE_FIELDS
+    facts: dict[str, dict[str, Any]] = {}
+    entities: dict[str, list[str]] = {}
+    conflicts: list[dict[str, str]] = []
+    source_rows = [dict(row) for row in [*existing, *incoming] if isinstance(row, dict)]
+    for row in sorted(source_rows, key=_source_page_key):
+        fact = {key: value for key, value in canonical_row_payload(row).items()
+                if key not in provenance and value not in (None, "")}
+        if sheet_key == "emissions_forecast":
+            # Legacy checkpoints lack this optional field; absent and blank agree.
+            fact.setdefault("전망범위", "")
+        fact_id = sha256_json({"sheet_key": sheet_key, "fact": fact})
+        if fact_id in facts:
+            _merge_row_evidence(facts[fact_id], row)
+            continue
+        entity_id = stable_entity_id(sheet_key, row)
+        for previous_id in entities.get(entity_id, []) if entity_id else []:
+            previous = facts[previous_id]
+            conflicts.append({
+                "sheet_key": sheet_key, "entity_id": entity_id,
+                "kept_row_id": stable_row_id(sheet_key, previous),
+                "incoming_row_id": stable_row_id(sheet_key, row),
+                "resolution": "both_preserved_for_review",
+                "reason": "same_entity_different_payload",
+            })
+        if entity_id:
+            entities.setdefault(entity_id, []).append(fact_id)
+        facts[fact_id] = row
+    return sorted(facts.values(), key=_source_page_key), sorted(
+        conflicts, key=lambda item: (item["sheet_key"], item["entity_id"], item["incoming_row_id"])
+    )
 
 
 def _has_checkpoint_payload(result: Any) -> bool:
@@ -247,19 +278,18 @@ def _coalesce_batch_record(
     if (
         previous.get("status") not in FAILED_BATCH_STATUSES
         or incoming.get("status") not in FAILED_BATCH_STATUSES
-        or not (_has_checkpoint_payload(previous.get("result")) or previous.get("member_statuses"))
+        or not _has_checkpoint_payload(previous.get("result"))
     ):
         return incoming
 
     record = dict(incoming)
-    record["member_statuses"] = {**previous.get("member_statuses", {}), **incoming.get("member_statuses", {})}
     record["result"] = _merge_checkpoint_payloads(
         str(incoming.get("kind") or previous.get("kind") or ""),
         [str(value) for value in (incoming.get("sheet_keys") or previous.get("sheet_keys") or [])],
         previous.get("result"),
         incoming.get("result"),
     )
-    if not _has_checkpoint_payload(record["result"]) and not record.get("member_statuses"):
+    if not _has_checkpoint_payload(record["result"]):
         return incoming
 
     record["status"] = "partial"
@@ -338,21 +368,16 @@ class RunState:
             "route_min_score": getattr(config, "DOCUMENT_ROUTE_MIN_SCORE", None),
             "route_context_pages": getattr(config, "DOCUMENT_ROUTE_CONTEXT_PAGES", None),
             "text_workers": getattr(config, "TEXT_WORKERS", None),
+            "table_object_enabled": getattr(config, "EXTRACTION_OBJECT_BATCHING_ENABLED", False),
+            "batch_max_chars": getattr(config, "MAX_BATCH_CHARS", None),
+            "table_max_cells": getattr(config, "MAX_BATCH_TABLE_CELLS", None),
+            "table_rows_per_chunk": getattr(config, "TABLE_OBJECT_ROWS_PER_CHUNK", None),
+            "selective_ocr_enabled": getattr(config, "SELECTIVE_OCR_ENABLED", False),
             "temperature": getattr(config, "LLM_TEMPERATURE", None),
             "cache_version": getattr(config, "LLM_CACHE_VERSION", ""),
-            "reading_pipeline_enabled": getattr(config, "READING_PIPELINE_ENABLED", True),
             "text_backend": execution_info.get("text_backend", ""),
             "text_model": execution_info.get("text_model", ""),
-            "vision_backend": execution_info.get("vision_backend", ""),
-            "vision_model": execution_info.get("vision_model", ""),
         }
-        from utils.vision_review import policy_snapshot
-        config_snapshot["vision_review_policy"] = policy_snapshot()
-        from utils.vision_toc import policy_snapshot as toc_policy_snapshot
-        config_snapshot["vision_toc_policy"] = toc_policy_snapshot()
-        from utils.text_optimization import policy_snapshot as text_policy_snapshot
-        config_snapshot["text_optimization_policy"] = text_policy_snapshot()
-        config_snapshot["sheet_clusters"] = getattr(config, "EXTRACTION_SHEET_CLUSTERS", [])
         manifest = {
             "created_at": _utc_now(),
             "input_path": str(input_path.resolve()),
@@ -371,6 +396,7 @@ class RunState:
             "prompt": manifest["prompt_sha256"],
             "implementation": manifest["implementation_sha256"],
             "config": config_snapshot,
+            "execution_info": execution_info,
         })
         run_id = fingerprint[:24]
         return cls(
@@ -479,7 +505,6 @@ class RunState:
         error: str = "",
         split_depth: int = 0,
         recovered: bool = False,
-        member_statuses: dict[str, str] | None = None,
     ) -> None:
         incoming = {
             "batch_id": batch_id,
@@ -491,7 +516,6 @@ class RunState:
             "error": str(error)[:1000],
             "split_depth": int(split_depth),
             "recovered": bool(recovered),
-            "member_statuses": dict(member_statuses or {}),
             "updated_at": _utc_now(),
         }
         with self._lock:

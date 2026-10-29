@@ -1,34 +1,18 @@
-"""
-문서 객체 계층.
-
-기존 PageContent(text/tables/images) 위에 표, 텍스트, 이미지 객체 ID와 메타데이터를
-부여한다. 1차 목표는 표를 HTML 문자열이 아니라 caption/section/근처 본문이 붙은
-DocumentObject로 만들어 LLM 추출 전에 우선 컨텍스트로 제공하는 것이다.
-"""
+"""Document objects selectively ported from V9, retaining main's page contract."""
 
 from __future__ import annotations
 
-import html
-import re
-from dataclasses import asdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from html.parser import HTMLParser
+import math
+import re
 from typing import Any
 
 from utils.pdf_reader import PageContent
 
 
-_HEADING_RE = re.compile(
-    r"^\s*((제\s*\d+\s*[장절])|(\d+(?:\.\d+){0,3})|([ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+[.\s]))\s*(.+)$"
-)
-_TABLE_CAPTION_RE = re.compile(r"(?:\[?\s*)?(표)\s*([0-9ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+(?:[-–]\d+)?)\s*[\]\)]?\s*(.*)")
-_FIGURE_CAPTION_RE = re.compile(r"(?:\[?\s*)?(그림|Figure|Fig\.?)\s*([0-9ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+(?:[-–]\d+)?)\s*[\]\)]?\s*(.*)", re.I)
-
-
 @dataclass
 class DocumentObject:
-    """페이지 내부의 추출 가능한 의미 단위."""
-
     object_id: str
     object_type: str
     page_number: int
@@ -44,428 +28,307 @@ class DocumentObject:
 
     def compact_text(self, max_chars: int = 1000) -> str:
         value = re.sub(r"\s+", " ", self.text or self.nearby_text or "").strip()
-        if len(value) > max_chars:
-            return value[: max_chars - 1].rstrip() + "…"
-        return value
+        return value if len(value) <= max_chars else value[:max(0, max_chars - 1)] + "…"
 
     def searchable_text(self) -> str:
-        cells = " ".join(str(cell or "") for row in self.rows for cell in row)
-        return " ".join(
-            part for part in (self.number, self.caption, self.text, cells, self.nearby_text)
-            if part
-        )
+        return " ".join(filter(None, [
+            self.number, self.caption, self.section, self.text,
+            " ".join(cell for row in self.rows for cell in row), self.nearby_text,
+        ]))
 
-    def to_dict(self) -> dict[str, Any]:
-        value = asdict(self)
+    def to_dict(self) -> dict:
+        result = asdict(self)
         if self.bbox is not None:
-            value["bbox"] = list(self.bbox)
-        return value
+            result["bbox"] = list(self.bbox)
+        return result
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "DocumentObject":
-        data = dict(value)
-        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
-        if data.get("engine") and not metadata.get("engine"):
-            metadata["engine"] = data.get("engine")
-        if data.get("confidence") and not metadata.get("confidence"):
-            metadata["confidence"] = data.get("confidence")
-        bbox = data.get("bbox") or data.get("bbox_pdf")
-        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-            data["bbox"] = tuple(float(item) for item in bbox)
-        else:
-            data["bbox"] = None
-        data["rows"] = [
-            [str(cell or "") for cell in row]
-            for row in data.get("rows", [])
-            if isinstance(row, list)
-        ]
-        data["metadata"] = metadata
-        allowed = {
-            "object_id", "object_type", "page_number", "sequence", "text", "rows",
-            "caption", "number", "section", "nearby_text", "bbox", "metadata",
-        }
-        return cls(**{key: item for key, item in data.items() if key in allowed})
-
-
-class _HTMLTableParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.rows: list[list[str]] = []
-        self._row: list[str] | None = None
-        self._cell: list[str] | None = None
-        self._in_cell = False
-
-    def handle_starttag(self, tag: str, attrs):
-        tag = tag.lower()
-        if tag == "tr":
-            self._row = []
-        elif tag in {"td", "th"}:
-            self._cell = []
-            self._in_cell = True
-
-    def handle_data(self, data: str):
-        if self._in_cell and self._cell is not None:
-            self._cell.append(data)
-
-    def handle_endtag(self, tag: str):
-        tag = tag.lower()
-        if tag in {"td", "th"} and self._row is not None:
-            value = html.unescape(" ".join(self._cell or []))
-            value = re.sub(r"\s+", " ", value).strip()
-            self._row.append(value)
-            self._cell = None
-            self._in_cell = False
-        elif tag == "tr" and self._row is not None:
-            if any(cell for cell in self._row):
-                self.rows.append(self._row)
-            self._row = None
-
-
-def parse_html_table(table_html: str) -> list[list[str]]:
-    parser = _HTMLTableParser()
-    try:
-        parser.feed(table_html or "")
-    except Exception:
-        return []
-    return parser.rows
-
-
-def table_to_markdown(rows: list[list[str]], max_rows: int = 35, max_cols: int = 12) -> str:
-    if not rows:
-        return ""
-    width = min(max(len(row) for row in rows), max_cols)
-    if width <= 0:
-        return ""
-
-    def norm(row: list[str]) -> list[str]:
-        values = [(cell or "").replace("|", "/").strip() for cell in row[:width]]
-        return values + [""] * (width - len(values))
-
-    trimmed = [norm(row) for row in rows[:max_rows]]
-    header = trimmed[0]
-    body = trimmed[1:]
-    lines = [
-        "| " + " | ".join(header) + " |",
-        "| " + " | ".join(["---"] * width) + " |",
-    ]
-    lines.extend("| " + " | ".join(row) + " |" for row in body)
-    if len(rows) > max_rows:
-        omitted = [f"... {len(rows) - max_rows} more rows omitted"] + [""] * (width - 1)
-        lines.append("| " + " | ".join(omitted) + " |")
-    return "\n".join(lines)
-
-
-def _page_lines(text: str) -> list[str]:
-    return [line.strip() for line in (text or "").splitlines() if line.strip()]
-
-
-def _infer_section(lines: list[str], fallback: str = "") -> str:
-    for line in lines[:40]:
-        match = _HEADING_RE.match(line)
-        if match:
-            value = re.sub(r"\s+", " ", line).strip()
-            if 4 <= len(value) <= 80:
-                return value
-    return fallback
-
-
-def _caption_candidates(lines: list[str], pattern: re.Pattern) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
-    for line in lines:
-        match = pattern.search(line)
-        if not match:
-            continue
-        number = f"{match.group(1)} {match.group(2)}"
-        tail = match.group(3).strip()
-        caption = f"{number} {tail}".strip()
-        out.append((number, caption))
-    return out
+    def from_dict(cls, value: dict) -> "DocumentObject":
+        if not isinstance(value, dict):
+            raise ValueError("DocumentObject must be a JSON object")
+        data = {key: item for key, item in value.items() if key in cls.__dataclass_fields__}
+        data["metadata"] = dict(data.get("metadata") or {})
+        for key in ("engine", "confidence", "evidence_id"):
+            if key in value:
+                data["metadata"].setdefault(key, value[key])
+        data["bbox"] = _record_bbox(value.get("bbox") or value.get("bbox_pdf"))
+        for required in ("object_id", "object_type", "page_number"):
+            if required not in data:
+                raise ValueError(f"missing {required}")
+        data["page_number"] = int(data["page_number"])
+        if data["page_number"] < 1 or not str(data["object_id"]).strip():
+            raise ValueError("invalid object ID/page number")
+        data.setdefault("sequence", 1)
+        raw_rows = data.get("rows") or []
+        if not isinstance(raw_rows, list) or any(not isinstance(row, list) for row in raw_rows):
+            raise ValueError("table rows must be arrays")
+        data["rows"] = [[str(cell) if cell is not None else "" for cell in row] for row in raw_rows]
+        return cls(**data)
 
 
 def _record_bbox(value: Any) -> tuple[float, float, float, float] | None:
-    if isinstance(value, (list, tuple)) and len(value) == 4:
-        try:
-            return tuple(float(item) for item in value)
-        except (TypeError, ValueError):
+    try:
+        if not isinstance(value, (tuple, list)) or len(value) != 4:
             return None
-    return None
+        x0, y0, x1, y1 = (float(item) for item in value)
+        if not all(math.isfinite(item) for item in (x0, y0, x1, y1)) or x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1, y1
+    except (TypeError, ValueError):
+        return None
 
 
-def _caption_records(page: PageContent, pattern: re.Pattern) -> list[tuple[str, str, tuple[float, float, float, float] | None]]:
-    records: list[tuple[str, str, tuple[float, float, float, float] | None]] = []
-    for block in page.text_blocks or []:
-        block_text = str(block.get("text") or "")
-        for line in _page_lines(block_text):
-            match = pattern.search(line)
-            if not match:
-                continue
-            number = f"{match.group(1)} {match.group(2)}"
-            tail = match.group(3).strip()
-            records.append((number, f"{number} {tail}".strip(), _record_bbox(block.get("bbox"))))
-    if records:
-        return records
-    return [(number, caption, None) for number, caption in _caption_candidates(_page_lines(page.text), pattern)]
+class _HTMLTableParser(HTMLParser):
+    """Expand spans into a rectangular grid while preserving header blocks."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.raw_rows: list[list[tuple[str, int, int, bool]]] = []
+        self.header_flags: list[bool] = []
+        self._row = None
+        self._cell = None
+        self._attrs = {}
+        self._header = False
+        self._thead = False
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "thead":
+            self._thead = True
+        elif tag == "tr":
+            self._row = []
+            self._header = self._thead
+        elif tag in {"th", "td"} and self._row is not None:
+            self._cell = []
+            self._attrs = dict(attrs)
+            self._header = self._header or tag == "th"
+        elif tag == "br" and self._cell is not None:
+            self._cell.append(" ")
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in {"td", "th"} and self._cell is not None and self._row is not None:
+            def span(name):
+                try:
+                    return min(1000, max(1, int(self._attrs.get(name) or 1)))
+                except ValueError:
+                    return 1
+            self._row.append((re.sub(r"\s+", " ", "".join(self._cell)).strip(),
+                              span("rowspan"), span("colspan"), tag == "th"))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            self.raw_rows.append(self._row)
+            self.header_flags.append(self._thead or bool(self._row) and all(cell[3] for cell in self._row))
+            self._row = None
+        elif tag == "thead":
+            self._thead = False
+
+    def expanded_rows(self):
+        cells = {}
+        width = 0
+        for r, row in enumerate(self.raw_rows):
+            col = 0
+            for value, rowspan, colspan, _ in row:
+                while (r, col) in cells:
+                    col += 1
+                # Keep malformed overlapping spans from shifting later columns silently.
+                if any((r, c) in cells for c in range(col, col + colspan)):
+                    raise ValueError("overlapping table spans")
+                for rr in range(r, r + rowspan):
+                    for cc in range(col, col + colspan):
+                        if (rr, cc) in cells:
+                            raise ValueError("overlapping table spans")
+                        cells[rr, cc] = value
+                col += colspan
+                width = max(width, col)
+        height = max((r + 1 for r, _ in cells), default=0)
+        return [[cells.get((r, c), "") for c in range(width)] for r in range(height)]
 
 
-_CHART_SIGNALS = (
-    "그래프", "차트", "추이", "전망", "배출량", "감축", "목표", "비율",
-    "에너지", "온실가스", "시계열", "현황", "%", "tco2", "co2eq",
-)
+def parse_html_table_structure(table_html: str) -> tuple[list[list[str]], int]:
+    parser = _HTMLTableParser()
+    parser.feed(table_html or "")
+    rows = parser.expanded_rows()
+    headers = 0
+    for flag in parser.header_flags:
+        if not flag:
+            break
+        headers += 1
+    return rows, min(headers, len(rows))
 
 
-def _figure_object_type(page: PageContent, caption: str) -> str:
-    sample = f"{caption} {page.text[:1200]}".casefold()
-    if any(signal in sample for signal in _CHART_SIGNALS):
-        return "chart"
-    drawing_count = int((page.metadata or {}).get("drawing_count", 0) or 0)
-    return "chart" if drawing_count >= 60 else "figure"
+def parse_html_table(table_html: str) -> list[list[str]]:
+    return parse_html_table_structure(table_html)[0]
 
 
-def _nearby_text(lines: list[str], limit: int = 900) -> str:
-    text = " ".join(lines[:20])
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:limit]
+_NUMERIC = re.compile(r"^[-+]?\d+(?:,\d{3})*(?:\.\d+)?\s*[%％]?$")
+_YEAR = re.compile(r"^(?:19|20)\d{2}\s*년?$")
+
+
+def table_header_row_count(rows: list[list[str]], max_rows: int = 3) -> int:
+    if not rows:
+        return 0
+    count = 0
+    for row in rows[:max_rows]:
+        if any(_NUMERIC.fullmatch(str(cell).replace(" ", "")) and not _YEAR.fullmatch(str(cell).strip())
+               for cell in row if cell):
+            break
+        count += 1
+    return 1 if count >= len(rows) else max(1, count)
+
+
+def table_to_markdown(rows: list[list[str]], max_rows: int = 35,
+                      max_cols: int | None = None, header_rows: int = 1) -> str:
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    if max_cols is not None:
+        width = min(width, max_cols)
+    if not width:
+        return ""
+    def line(row):
+        cells = [str(cell or "").replace("|", "/").replace("\n", " ").strip() for cell in row[:width]]
+        cells += [""] * (width - len(cells))
+        return "| " + " | ".join(cells) + " |"
+    selected = rows[:max_rows]
+    lines = [line(selected[0]), "| " + " | ".join(["---"] * width) + " |"]
+    lines.extend(line(row) for row in selected[1:])
+    if len(rows) > max_rows:
+        lines.append(line([f"... {len(rows) - max_rows} more rows omitted"]))
+    return "\n".join(lines)
+
+
+_CAPTION = re.compile(r"(표|그림|Figure|Fig\.?)\s*([0-9ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+(?:[-–]\d+)?)\s*[\]\)>]?\s*(.*)", re.I)
+_HEADING = re.compile(r"^\s*(?:제\s*\d+\s*[장절]|\d+(?:\.\d+){0,3}[.)]?|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+[.\s])")
+
+
+def _captions(page):
+    result = []
+    for block in page.text_blocks or [{"text": page.text}]:
+        for line in str(block.get("text") or "").splitlines():
+            match = _CAPTION.search(line)
+            if match:
+                number = f"{match.group(1)} {match.group(2)}"
+                result.append((number, f"{number} {match.group(3)}".strip(), _record_bbox(block.get("bbox"))))
+    return result
 
 
 def build_document_objects(pages: list[PageContent]) -> list[DocumentObject]:
-    """PageContent 목록을 DocumentObject 목록으로 변환."""
-    objects: list[DocumentObject] = []
-    current_section = ""
-
+    from utils.object_routing import is_index_page
+    if hasattr(pages, "pages"):
+        pages = pages.pages
+    objects = []
+    section = ""
     for page in pages:
-        lines = _page_lines(page.text)
-        current_section = _infer_section(lines, current_section)
-        nearby = _nearby_text(lines)
-
-        text_blocks = page.text_blocks or []
-        if text_blocks:
-            for index, block in enumerate(text_blocks, start=1):
-                objects.append(DocumentObject(
-                    object_id=f"p{page.page_number}_text_{index}",
-                    object_type="text",
-                    page_number=page.page_number,
-                    sequence=index,
-                    text=str(block.get("text") or ""),
-                    section=current_section,
-                    nearby_text=nearby,
-                    bbox=_record_bbox(block.get("bbox")),
-                    metadata={
-                        "engine": "pymupdf",
-                        "block_id": block.get("block_id"),
-                        "line_count": block.get("line_count"),
-                        "char_count": block.get("char_count"),
-                    },
-                ))
-        else:
-            objects.append(DocumentObject(
-                object_id=f"p{page.page_number}_text_1",
-                object_type="text",
-                page_number=page.page_number,
-                sequence=1,
-                text=page.text or "",
-                section=current_section,
-                nearby_text=nearby,
-                bbox=(0.0, 0.0, page.width, page.height) if page.width and page.height else None,
-                metadata={"engine": "pymupdf", "fallback_page_text": True},
-            ))
-
-        table_captions = _caption_records(page, _TABLE_CAPTION_RE)
-        table_records = page.table_records or [
-            {"html": table_html, "bbox": None, "strategy": "legacy"}
-            for table_html in (page.tables or [])
-        ]
-        for index, table_record in enumerate(table_records, start=1):
-            table_html = str(table_record.get("html") or "")
-            rows = parse_html_table(table_html)
-            number, caption, caption_bbox = (
-                table_captions[min(index - 1, len(table_captions) - 1)]
-                if table_captions else ("", "", None)
-            )
-            objects.append(DocumentObject(
-                object_id=f"p{page.page_number}_table_{index}",
-                object_type="table",
-                page_number=page.page_number,
-                sequence=index,
-                text=table_html,
-                rows=rows,
-                caption=caption,
-                number=number,
-                section=current_section,
-                nearby_text=nearby,
-                bbox=_record_bbox(table_record.get("bbox")),
-                metadata={
-                    "engine": "pymupdf",
-                    "row_count": len(rows),
-                    "column_count": max((len(r) for r in rows), default=0),
-                    "cell_count": sum(len(row) for row in rows),
-                    "extraction_strategy": table_record.get("strategy", ""),
-                    "caption_bbox": list(caption_bbox) if caption_bbox else None,
-                },
-            ))
-        # 캡션은 있는데 PyMuPDF 표 객체가 없으면 누락 후보를 명시적으로 남긴다.
-        # 이 객체가 선택적 OCR/VLM 단계의 재분석 대상이 된다.
-        for index in range(len(table_records) + 1, len(table_captions) + 1):
-            number, caption, caption_bbox = table_captions[index - 1]
-            objects.append(DocumentObject(
-                object_id=f"p{page.page_number}_table_{index}",
-                object_type="table",
-                page_number=page.page_number,
-                sequence=index,
-                caption=caption,
-                number=number,
-                section=current_section,
-                nearby_text=nearby,
-                bbox=caption_bbox,
-                metadata={
-                    "engine": "pymupdf",
-                    "row_count": 0,
-                    "column_count": 0,
-                    "missing_native": True,
-                    "caption_bbox": list(caption_bbox) if caption_bbox else None,
-                },
-            ))
-
-        figure_captions = _caption_records(page, _FIGURE_CAPTION_RE)
-        # 벡터 차트는 page.images에 나타나지 않을 수 있다. 캡션 자체를 독립 객체로
-        # 등록해야 원문 객체 인벤토리가 이런 그래프를 누락하지 않는다.
-        for index, (number, caption, caption_bbox) in enumerate(figure_captions, start=1):
-            object_type = _figure_object_type(page, caption)
-            objects.append(DocumentObject(
-                object_id=f"p{page.page_number}_{object_type}_{index}",
-                object_type=object_type,
-                page_number=page.page_number,
-                sequence=index,
-                caption=caption,
-                number=number,
-                section=current_section,
-                nearby_text=nearby,
-                bbox=caption_bbox,
-                metadata={
-                    "engine": "pymupdf",
-                    "caption_only": True,
-                    "drawing_count": int((page.metadata or {}).get("drawing_count", 0) or 0),
-                },
-            ))
-        for index, image in enumerate(page.images or [], start=1):
-            number, caption, _caption_bbox = (
-                figure_captions[min(index - 1, len(figure_captions) - 1)]
-                if figure_captions else ("", image.get("caption", ""), None)
-            )
-            objects.append(DocumentObject(
-                object_id=f"p{page.page_number}_image_{index}",
-                object_type="image",
-                page_number=page.page_number,
-                sequence=index,
-                caption=caption,
-                number=number,
-                section=current_section,
-                nearby_text=nearby,
-                bbox=_record_bbox(image.get("bbox")),
-                metadata={
-                    "engine": "pymupdf",
-                    "width": image.get("width"),
-                    "height": image.get("height"),
-                    "caption": image.get("caption", ""),
-                    "source_kind": image.get("source_kind", "embedded"),
-                    "xref": image.get("xref"),
+        page_engine = str(page.metadata.get("engine") or "pymupdf")
+        lines = [line.strip() for line in page.text.splitlines() if line.strip()]
+        section = next((line[:100] for line in lines[:40] if _HEADING.match(line)), section)
+        nearby = " ".join(lines[:20])[:900]
+        is_index = is_index_page(page.text)
+        for index, block in enumerate(page.text_blocks or [{"text": page.text}], 1):
+            objects.append(DocumentObject(f"p{page.page_number}_text_{index}", "text", page.page_number, index,
+                text=str(block.get("text") or ""), section=section, nearby_text=nearby,
+                bbox=_record_bbox(block.get("bbox")),
+                metadata={"engine": page_engine, "index_reference": is_index}))
+        captions = [] if is_index else _captions(page)
+        table_captions = [item for item in captions if item[0].startswith("표")]
+        records = page.table_records or [{"html": table} for table in page.tables]
+        for index, record in enumerate(records, 1):
+            parse_error = ""
+            try:
+                rows, explicit_headers = parse_html_table_structure(str(record.get("html") or ""))
+            except ValueError as exc:
+                rows, explicit_headers = [], 0
+                parse_error = str(exc)
+            caption = table_captions[index - 1] if index <= len(table_captions) else ("", "", None)
+            objects.append(DocumentObject(f"p{page.page_number}_table_{index}", "table", page.page_number, index,
+                rows=rows, caption=caption[1], number=caption[0], section=section,
+                nearby_text=nearby, bbox=_record_bbox(record.get("bbox")),
+                metadata={"engine": str(record.get("engine") or page_engine),
+                          "header_row_count": explicit_headers or table_header_row_count(rows),
+                          "cell_count": sum(len(row) for row in rows), "index_reference": is_index,
+                          "table_parse_error": parse_error,
+                          "raw_html": str(record.get("html") or "") if parse_error else ""}))
+        for index, image in enumerate(page.images, 1):
+            objects.append(DocumentObject(f"p{page.page_number}_image_{index}", "image", page.page_number, index,
+                caption=str(image.get("caption") or ""), section=section, nearby_text=nearby,
+                bbox=_record_bbox(image.get("bbox")), metadata={
+                    "engine": page_engine, "source_kind": image.get("source_kind", "embedded"),
                     "render_proxy": image.get("source_kind") == "page_render",
-                },
-            ))
-
+                    "index_reference": is_index, "width": image.get("width"), "height": image.get("height"),
+                }))
+        for index, (number, caption, bbox) in enumerate(captions, 1):
+            kind = "table" if number.startswith("표") else "chart"
+            if kind == "table" and records:
+                continue
+            objects.append(DocumentObject(f"p{page.page_number}_{kind}_caption_{index}", kind, page.page_number, index,
+                caption=caption, number=number, section=section, nearby_text=nearby, bbox=bbox,
+                metadata={"engine": page_engine, "caption_only": True, "missing_native": True}))
+    for obj in objects:
+        obj.metadata.setdefault("evidence_id", f"ev-{obj.object_id}")
+        obj.metadata.setdefault("physical_object_id", f"physical:{obj.object_id}")
     return objects
 
 
-def render_table_object_chunks(
-    obj: DocumentObject,
-    *,
-    rows_per_chunk: int = 20,
-    max_chars: int | None = None,
-) -> list[str]:
-    """큰 표를 헤더 반복 행 청크로 만들어 한 호출의 출력·입력 크기를 제한한다."""
+def render_table_object_chunks(obj: DocumentObject, *, rows_per_chunk: int = 20,
+                                max_chars: int | None = None, max_cells: int | None = None) -> list[str]:
+    """Repeat every header; reject a single oversized row instead of dropping cells."""
     if obj.object_type != "table" or not obj.rows:
         return []
-    rows_per_chunk = max(2, int(rows_per_chunk))
-    header = list(obj.rows[0])
-    body = list(obj.rows[1:])
-    body_chunks = [body[i:i + rows_per_chunk - 1] for i in range(0, len(body), rows_per_chunk - 1)]
-    if not body_chunks:
-        body_chunks = [[]]
-    def render(chunk: list[list[str]], index: int, total: int) -> str:
-        rows = [header, *chunk]
+    headers = int(obj.metadata.get("header_row_count") or obj.metadata.get("header_rows") or table_header_row_count(obj.rows))
+    headers = max(1, min(headers, len(obj.rows)))
+    width = max(len(row) for row in obj.rows)
+    rectangular = [list(row) + [""] * (width - len(row)) for row in obj.rows]
+    header = rectangular[:headers]
+    body = rectangular[headers:]
+    def render(chunk, index, total):
+        rows = header + chunk
         return "\n".join([
-            "[문서객체: 표 우선 데이터]",
-            f"object_id: {obj.object_id}",
-            f"object_chunk: {index}/{total}",
-            f"type: {obj.object_type}",
-            f"page: {obj.page_number}",
-            f"number: {obj.number or 'unknown'}",
-            f"caption: {obj.caption or 'unknown'}",
-            f"section: {obj.section or 'unknown'}",
-            f"nearby_text: {obj.nearby_text or 'unknown'}",
-            "table_markdown:",
-            table_to_markdown(rows, max_rows=max(len(rows), 2)),
+            f"=== 페이지 {obj.page_number} ===", "[문서객체: 표 우선 데이터]",
+            f"object_id: {obj.object_id}", f"evidence_id: {obj.metadata.get('evidence_id', '')}",
+            f"object_chunk: {index}/{total}", f"caption: {obj.caption}",
+            f"section: {obj.section}", f"nearby_text: {obj.nearby_text}",
+            f"header_rows: {headers}", "table_markdown:",
+            table_to_markdown(rows, max_rows=len(rows), header_rows=headers),
         ])
-
-    # 행 수 기준 청크가 긴 셀 때문에 문자 상한을 넘으면 행 묶음을 다시 반분한다.
-    if max_chars is not None:
-        max_chars = max(1000, int(max_chars))
-        pending = list(body_chunks)
-        bounded: list[list[list[str]]] = []
-        while pending:
-            chunk = pending.pop(0)
-            if len(chunk) > 1 and len(render(chunk, 1, 1)) > max_chars:
-                midpoint = max(1, len(chunk) // 2)
-                pending[0:0] = [chunk[:midpoint], chunk[midpoint:]]
-            else:
-                bounded.append(chunk)
-        body_chunks = bounded
-
-    return [
-        render(chunk, index, len(body_chunks))
-        for index, chunk in enumerate(body_chunks, start=1)
-    ]
-
-
-def objects_for_pages(
-    objects: list[DocumentObject],
-    pages: list[PageContent],
-    object_type: str | None = None,
-) -> list[DocumentObject]:
-    page_nums = {page.page_number for page in pages}
-    selected = [obj for obj in objects if obj.page_number in page_nums]
-    if object_type:
-        selected = [obj for obj in selected if obj.object_type == object_type]
-    return selected
+    chunks = []
+    chunk = []
+    for row in body:
+        candidate = chunk + [row]
+        rows = header + candidate
+        over = (len(candidate) + headers > max(headers + 1, int(rows_per_chunk))
+                or (max_cells is not None and sum(len(r) for r in rows) > max_cells)
+                or (max_chars is not None and len(render(candidate, 1, max(1, len(body)))) > max_chars))
+        if over and chunk:
+            chunks.append(chunk)
+            chunk = [row]
+        else:
+            chunk = candidate
+        if (max_cells is not None and sum(len(r) for r in header + chunk) > max_cells
+                or max_chars is not None and len(render(chunk, 1, max(1, len(body)))) > max_chars):
+            raise ValueError(f"object {obj.object_id}: header/single row exceeds configured batch limit")
+    if chunk or not chunks:
+        chunks.append(chunk)
+    rendered = [render(chunk, i, len(chunks)) for i, chunk in enumerate(chunks, 1)]
+    if max_chars is not None and any(len(text) > max_chars for text in rendered):
+        raise ValueError(f"object {obj.object_id}: chunk marker exceeds character limit")
+    return rendered
 
 
-def render_table_objects_for_prompt(
-    objects: list[DocumentObject],
-    *,
-    max_objects: int = 8,
-    max_rows: int = 35,
-) -> str:
-    table_objects = [obj for obj in objects if obj.object_type == "table" and obj.rows]
-    if not table_objects:
-        return ""
+def objects_for_pages(objects, pages, object_type=None):
+    numbers = {page.page_number for page in pages}
+    return [obj for obj in objects if obj.page_number in numbers and (not object_type or obj.object_type == object_type)]
 
-    parts = ["[문서객체: 표 우선 데이터]"]
-    for obj in table_objects[:max_objects]:
-        nearby = re.sub(r"\s+", " ", obj.nearby_text or "").strip()
-        if len(nearby) > 500:
-            nearby = nearby[:499].rstrip() + "…"
-        parts.append(
-            "\n".join([
-                f"object_id: {obj.object_id}",
-                f"type: {obj.object_type}",
-                f"page: {obj.page_number}",
-                f"number: {obj.number or 'unknown'}",
-                f"caption: {obj.caption or 'unknown'}",
-                f"section: {obj.section or 'unknown'}",
-                f"nearby_text: {nearby or 'unknown'}",
-                "table_markdown:",
-                table_to_markdown(obj.rows, max_rows=max_rows),
-            ])
-        )
-    if len(table_objects) > max_objects:
-        parts.append(f"... {len(table_objects) - max_objects} additional table objects omitted in this batch")
-    return "\n\n".join(parts)
+
+def consolidate_document_objects(objects):
+    from utils.object_routing import deduplicate_evidence_objects
+    return deduplicate_evidence_objects(objects)[0]
+
+
+def render_table_objects_for_prompt(objects, *, max_objects=8, max_rows=35):
+    return "\n\n".join(chunk for obj in objects[:max_objects]
+                        for chunk in render_table_object_chunks(obj, rows_per_chunk=max_rows))

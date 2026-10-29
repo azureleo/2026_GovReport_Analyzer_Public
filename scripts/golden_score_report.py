@@ -37,10 +37,6 @@ def 마크다운(result: dict[str, Any]) -> str:
         f"- 문자유사 매칭: {result['문자유사매칭수']}건(02_지역여건)\n",
         f"- 스케일동치 값 쌍: {result['스케일동치쌍수']}건(06_감축목표)\n",
         "- 값일치율 정의: 양쪽 값이 모두 존재하는 비교 쌍 중 일치한 값의 비율입니다.\n\n",
-        "## 독립 평가 지표\n\n",
-        f"- 셀 정확도(골든 누락 셀 포함): {_비율문자(result.get('독립평가지표', {}).get('cell_accuracy'))}\n",
-        f"- 행 리콜: {_비율문자(result.get('독립평가지표', {}).get('row_recall'))}\n",
-        f"- 행 정밀도: {_비율문자(result.get('독립평가지표', {}).get('row_precision'))}\n\n",
         "## 시트별 표\n\n",
         "| 시트 | 상태 | 골든 행수 | 출력 행수 | 매칭 수 | 엄격 | 완화 | 리콜 | 정밀도 | 값일치율 | 값일치율(스케일동치 포함) | 스케일동치 쌍 | 골든만 있는 값 | 출력만 있는 값 | 의미완화 | 문자유사 |\n",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
@@ -57,21 +53,6 @@ def 마크다운(result: dict[str, Any]) -> str:
             lines.append(_표행([f"{name}(의미완화 포함)", stat["골든행수"], stat["매칭수"], stat["리콜"], stat["값비교수"], stat["값일치율"]]))
         char_inclusive = result[f"{key}_문자유사포함"]["시각 유래"]
         lines.append(_표행(["시각 유래(문자유사 포함)", char_inclusive["골든행수"], char_inclusive["매칭수"], char_inclusive["리콜"], char_inclusive["값비교수"], char_inclusive["값일치율"]]))
-    lines.extend([
-        "\n## 산출유형별 분해\n\n",
-        "| 산출유형 | 골든 행수 | 매칭 수 | 리콜 | 값비교수 | 값일치율 | 유형일치율 |\n",
-        "|---|---:|---:|---:|---:|---:|---:|\n",
-    ])
-    for name, stat in result.get("산출유형별_전체", {}).items():
-        lines.append(_표행([
-            name,
-            stat["골든행수"],
-            stat["매칭수"],
-            stat["리콜"],
-            stat["값비교수"],
-            stat["값일치율"],
-            stat["산출유형일치율"],
-        ]))
     lines.extend(["\n## 미매칭 상세\n\n", "### 골든 미매칭\n\n"])
     for item in result["미매칭상세"]["골든"]:
         lines.append(f"- {item['시트']} {item['행번호']}행 | 키={item['키']} | 출처={item.get('골든_출처유형', '')} | 페이지={item.get('골든_출처페이지', '')}\n")

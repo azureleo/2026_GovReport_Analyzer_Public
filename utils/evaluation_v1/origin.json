@@ -1,0 +1,17 @@
+{
+  "upstream_snapshot": "matched_luna_review_20261026",
+  "upstream_sha256": {
+    "scripts\\score_against_golden.py": "73a3480821d630908c4f30339af66e032cf0ca5096ad84224ef141416345fa3c",
+    "scripts\\golden_score_contract.py": "fd663841284cf6a77d94c80fd10b4569cbdab7c921b74243bdf66a05ca506ac7",
+    "scripts\\golden_score_matching.py": "0d67ad548bd5537f22c0b0590579ef13a6bb6d58af30982c0ecb1fd39bc8fe74",
+    "scripts\\golden_score_report.py": "aa2d74ea888a3d590c7f3f88a6a44eb09da519372d5eb40333ae73afbc62c054",
+    "scripts\\golden_score_workbook.py": "e194c5ba9a0c2e74d02035d836ae38bc354369c00349e1a5ff362b33f2200344"
+  },
+  "changes": [
+    "package-relative imports",
+    "frozen headers.json",
+    "fixed Organizer-compatible normalizers",
+    "close read-only workbook handle"
+  ],
+  "golden_sha256": "27265078002d0ca2d609e54c05603169c0368c1ad5747298dbab7daedf29033c"
+}

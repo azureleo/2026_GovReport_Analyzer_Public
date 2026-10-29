@@ -155,6 +155,11 @@ def match_object_evidence(
 
     exact = [value for value in values if expected_ids.intersection(value.evidence_ids)]
     if exact:
+        object_groups = [set(value.object_ids) for value in exact if value.object_ids]
+        if object_groups and not set.intersection(*object_groups):
+            return ObjectEvidenceMatch("ambiguous", tuple(value.key for value in exact),
+                                       tuple(sorted(expected_ids)),
+                                       "동일 근거 ID가 서로 다른 객체 ID에 연결됨")
         matched_ids = tuple(dict.fromkeys(
             evidence_id
             for value in exact

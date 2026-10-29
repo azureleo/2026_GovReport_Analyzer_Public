@@ -11,13 +11,8 @@ import json
 import math
 import re
 import unicodedata
-from copy import deepcopy
 from collections import defaultdict
 from typing import Any, Iterable
-
-from utils.reading_compatibility import UNIT_ALIASES
-from utils.reading_year import full_year
-from utils.reading_context_facts import same_region
 
 
 _TARGET_VALUE_FIELDS = (
@@ -402,10 +397,193 @@ def guard_foundation_measures(
     return retained, records
 
 
+# ──────────────────────────────────────────────────────────────────────
+# v8-1 S2-4: 03·04·05·09 계약 가드. 다른 정식 시트가 같은 의미를 갖거나 시트
+# 최소 계약을 못 채운 행만 격리한다. 값이 다른 같은 키 행은 격리하지 않는다.
+# ──────────────────────────────────────────────────────────────────────
+_EMISSION_SECTOR_FIELD = {
+    "emissions_regional": "부문",
+    "emissions_management": "관리부문",
+    "emissions_forecast": "부문",
+}
+_EMISSION_VALUE_FIELD = {
+    "emissions_regional": "배출량",
+    "emissions_management": "배출량",
+    "emissions_forecast": "전망값",
+}
+# 부문 자리에 지표 라벨이 들어온 행(06 가드의 visual_metric_label_as_sector와 같은 판정).
+# 골든 05가 '직접배출량'·'간접배출량'을 부문으로 쓰므로 직접/간접 접두 라벨은 제외한다.
+_SECTOR_METRIC_LABELS = {
+    _normalize_text(label)
+    for label in ("총배출량", "순배출량", "배출량", "감축량", "흡수량", "전망", "배출전망", "bau")
+}
+_SECTOR_LABEL_KEEP_PREFIXES = ("직접", "간접")
+_DEFAULT_YEAR_LOWER = 1990
+_DEFAULT_YEAR_UPPER = 2060
+_ANNUAL_PLAN_CONTENT_FIELDS = (
+    "연간계획", "목표물량", "규제혁신계획", "입법계획", "기간시작", "기간종료",
+)
+_NEAR_DUPLICATE_MIN_CHARS = 8
+
+
+def document_year_bounds(document_meta_rows: list[dict[str, Any]] | None) -> tuple[int, int]:
+    """문서 메타의 계획종료연도가 있으면 상한을 종료연도+20으로 넓힌다(기본 1990~2060)."""
+    upper = _DEFAULT_YEAR_UPPER
+    for row in document_meta_rows or []:
+        if not isinstance(row, dict):
+            continue
+        end_year = _number(row.get("계획종료연도"))
+        if end_year is not None:
+            upper = max(upper, int(end_year) + 20)
+    return _DEFAULT_YEAR_LOWER, upper
+
+
+def _is_metric_label_sector(value: Any) -> bool:
+    text = _normalize_text(value)
+    if not text or text.startswith(_SECTOR_LABEL_KEEP_PREFIXES):
+        return False
+    return text in _SECTOR_METRIC_LABELS
+
+
+def _year_out_of_bounds(value: Any, bounds: tuple[int, int]) -> bool:
+    year = _number(value)
+    if year is None:
+        return False
+    return year < bounds[0] or year > bounds[1]
+
+
+def guard_emission_rows(
+    rows: list[dict[str, Any]],
+    sheet_key: str,
+    *,
+    year_bounds: tuple[int, int] = (_DEFAULT_YEAR_LOWER, _DEFAULT_YEAR_UPPER),
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """03·04·05 공통: 키 계약 미달, 지표 라벨 부문, 문서 범위 밖 연도만 격리한다."""
+    sector_field = _EMISSION_SECTOR_FIELD[sheet_key]
+    value_field = _EMISSION_VALUE_FIELD[sheet_key]
+    retained: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        reasons: list[str] = []
+        if (
+            not _has_value(row.get(sector_field))
+            or _number(row.get("연도")) is None
+            or _number(row.get(value_field)) is None
+        ):
+            reasons.append("missing_key_contract")
+        # 골든 03/04는 '총배출량(연료공급량기준)' 같은 합계 라벨 행을 정식 행으로 두므로
+        # 지표 라벨 판정은 06 가드와 같이 시각 유래 행에만 적용한다.
+        is_visual = str(row.get("데이터상태") or "").strip() == "visual_only"
+        if is_visual and (
+            _is_metric_label_sector(row.get(sector_field)) or _is_metric_label_sector(row.get("세부부문"))
+        ):
+            reasons.append("metric_label_as_sector")
+        if _year_out_of_bounds(row.get("연도"), year_bounds):
+            reasons.append("year_out_of_document_range")
+        if reasons:
+            records.append(_record(sheet_key, row, *reasons))
+        else:
+            retained.append(row)
+    return retained, records
+
+
+def _annual_identity(row: dict[str, Any]) -> tuple[str, str]:
+    project_id = _normalize_text(row.get("관리번호"))
+    if project_id:
+        return ("id", project_id)
+    return ("name", _normalize_text(row.get("사업명")))
+
+
+def guard_annual_implementation(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """09: 식별자 없음·계획 내용 없음·같은 (식별자, 연도)의 포함 관계 중복문만 격리한다."""
+    retained: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        reasons: list[str] = []
+        if not _has_value(row.get("관리번호")) and not _has_value(row.get("사업명")):
+            reasons.append("missing_identity")
+        if not any(_has_value(row.get(field)) for field in _ANNUAL_PLAN_CONTENT_FIELDS):
+            reasons.append("no_plan_content")
+        if reasons:
+            records.append(_record("annual_implementation", row, *reasons))
+        else:
+            candidates.append(row)
+
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for row in candidates:
+        identity = _annual_identity(row)
+        if not identity[1]:
+            retained.append(row)
+            continue
+        groups[(*identity, _number(row.get("연도")))].append(row)
+
+    for members in groups.values():
+        dropped: set[int] = set()
+        for index, row in enumerate(members):
+            if index in dropped:
+                continue
+            row_text = _normalize_text(row.get("연간계획"))
+            for other_index, other in enumerate(members):
+                if other_index == index or other_index in dropped:
+                    continue
+                if _number(row.get("목표물량")) is not None or _number(other.get("목표물량")) is not None:
+                    if not _same_number(row.get("목표물량"), other.get("목표물량")):
+                        continue
+                other_text = _normalize_text(other.get("연간계획"))
+                shorter, longer = sorted((row_text, other_text), key=len)
+                if len(shorter) < _NEAR_DUPLICATE_MIN_CHARS or shorter not in longer:
+                    continue
+                # 짧은 쪽을 격리한다(정보 손실 없음). 길이가 같으면 뒤의 행을 격리.
+                loser = other_index if len(other_text) <= len(row_text) else index
+                dropped.add(loser)
+                records.append(_record(
+                    "annual_implementation", members[loser], "near_duplicate_plan_text",
+                ))
+                if loser == index:
+                    break
+        retained.extend(row for index, row in enumerate(members) if index not in dropped)
+    return retained, records
+
+
+def summarize_quarantine(records: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    summary: dict[str, dict[str, int]] = {}
+    for record in records:
+        sheet = str(record.get("sheet_key") or "")
+        by_reason = summary.setdefault(sheet, {})
+        for reason in record.get("reason_codes", []) or ["unspecified"]:
+            by_reason[str(reason)] = by_reason.get(str(reason), 0) + 1
+    return summary
+
+
+def write_quarantine_ledger(records: list[dict[str, Any]], output_path: Any) -> Any:
+    """격리 원장을 산출물 옆 `<stem>_격리원장.json`으로 쓴다(엑셀 시트는 추가하지 않는다)."""
+    from pathlib import Path
+
+    target = Path(output_path)
+    ledger_path = target.with_name(f"{target.stem}_격리원장.json")
+    payload = {
+        "summary": summarize_quarantine(records),
+        "records": records,
+    }
+    ledger_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8",
+    )
+    return ledger_path
+
+
 def apply_semantic_contract_guards(
     cleaned: dict[str, Any],
+    *,
+    contract_drops: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Apply conservative sheet contracts and preserve a quarantine ledger."""
+    """Mutate the guarded sheets and return a non-public quarantine ledger.
+
+    contract_drops: 정제기가 키 계약 미달로 이미 제외한 행(시트키 → 행 목록). 격리
+    원장에 missing_key_contract로 함께 남긴다(삭제 자체는 정제기가 담당).
+    """
     records: list[dict[str, Any]] = []
     targets, target_records = guard_reduction_targets(
         list(cleaned.get("reduction_targets", [])),
@@ -417,76 +595,25 @@ def apply_semantic_contract_guards(
     )
     cleaned["reduction_targets"] = targets
     cleaned["foundation_measures"] = foundation
-    if 'annual_implementation' in cleaned:
-        annual, annual_records = guard_annual_budget_rows(
-            cleaned['annual_implementation'], financial_rows=cleaned.get('financial_plan', []))
-        cleaned['annual_implementation'] = annual
-        records.extend(annual_records)
     records.extend(target_records)
     records.extend(foundation_records)
+
+    year_bounds = document_year_bounds(cleaned.get("document_meta"))
+    for sheet_key in ("emissions_regional", "emissions_management", "emissions_forecast"):
+        rows = cleaned.get(sheet_key)
+        if not isinstance(rows, list):
+            continue
+        kept, sheet_records = guard_emission_rows(rows, sheet_key, year_bounds=year_bounds)
+        cleaned[sheet_key] = kept
+        records.extend(sheet_records)
+    annual = cleaned.get("annual_implementation")
+    if isinstance(annual, list):
+        kept, annual_records = guard_annual_implementation(annual)
+        cleaned["annual_implementation"] = kept
+        records.extend(annual_records)
+
+    for sheet_key, dropped_rows in (contract_drops or {}).items():
+        for row in dropped_rows:
+            if isinstance(row, dict):
+                records.append(_record(sheet_key, row, "missing_key_contract"))
     return records
-
-
-def guard_annual_budget_rows(rows, *, financial_rows=None):
-    """Quarantine explicit budget leakage, never currency-only performance KPIs.
-
-    Counterparts must share table/page AND project/year/value/unit. A whole page
-    or an equal amount alone is insufficient. No automatic financial row creation.
-    """
-    def identity(row):
-        literal = lambda value: re.sub(r'\s+', '', unicodedata.normalize('NFKC', str(value or ''))).casefold()
-        table = literal(row.get('표ID'))
-        project = literal(row.get('관리번호') or row.get('사업명'))
-        pages, year = _pages(row), full_year(row.get('연도'))
-        return (table, project, pages, year) if table and project and pages and year else None
-
-    # Index once per sheet rather than scanning every budget for every row.
-    counterparts = defaultdict(list)
-    for number, other in enumerate(financial_rows or [], 1):
-        if isinstance(other, dict) and (key := identity(other)) is not None:
-            counterparts[key].append((number, other))
-    kept, records = [], []
-    for index, row in enumerate(rows, 1):
-        envelope = row.get('_reading') if isinstance(row.get('_reading'), dict) else {}
-        context = envelope.get('문맥 구분') or {}
-        context = context if isinstance(context, dict) else {}
-        unit = UNIT_ALIASES.get(row.get('목표단위'), row.get('목표단위')) if isinstance(row.get('목표단위'), str) else None
-        currency = unit in ('원', '천원', '백만원', '억원')
-        explicit_kpi = context.get('값의미') in ('성과지표', '금액형 성과지표', '투자유치액', '매출액') and bool(envelope.get('근거 문구'))
-        explicit_budget = (bool(envelope.get('근거 문구')) and
-                           context.get('값의미') in ('재정투자 계획 예산', '예산액', '재정투자 예산'))
-        nonbudget = str(row.get('연간계획') or '').strip() == '비예산'
-        # A substantive, non-budget annual goal is not disproved by an equal
-        # budget number elsewhere. In ambiguous cases retain it for review.
-        explicit_kpi = explicit_kpi or (bool(str(row.get('연간계획') or '').strip())
-                                        and not nonbudget and not explicit_budget)
-        reason, matches = None, []
-        if not explicit_kpi and (currency or nonbudget):
-            if explicit_budget:
-                reason = 'explicit_budget_not_annual_target'
-            key = identity(row)
-            if key is not None:
-                for number, other in counterparts.get(key, []):
-                    if row.get('지자체명') and other.get('지자체명') and not same_region(row['지자체명'], other['지자체명']):
-                        continue
-                    other_envelope = other.get('_reading') or {}
-                    stated = other.get('값원문') or (other_envelope.get('값원문') if isinstance(other_envelope, dict) else None)
-                    value = row.get('목표물량')
-                    other_unit = other.get('예산단위')
-                    other_unit = UNIT_ALIASES.get(other_unit, other_unit) if isinstance(other_unit, str) else None
-                    equal_amount = (type(value) in (int, float) and math.isfinite(value)
-                                    and type(other.get('예산액')) in (int, float)
-                                    and value == other['예산액'] and unit == other_unit)
-                    if equal_amount or (nonbudget and stated == '비예산' and value is None and other.get('예산액') is None):
-                        matches.append(dict(sheet_key='financial_plan', row_index=number,
-                                            evidence_ids=list(_ids(other))))
-                if matches:
-                    reason = 'same_table_financial_fact_not_annual_target'
-        if reason:
-            record = _record('annual_implementation', row, reason)
-            record.update(row_index=index, row=deepcopy(row), financial_matches=matches,
-                          action='quarantine_without_inferred_transfer')
-            records.append(record)
-        else:
-            kept.append(row)
-    return kept, records

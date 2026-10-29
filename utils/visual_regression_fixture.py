@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -69,7 +71,7 @@ def load_case_specs(path: str | Path) -> list[dict[str, Any]]:
                 f"{source}:{line_number} 필수 필드 누락: {', '.join(missing)}"
             )
         case_id = str(row.get("case_id") or "").strip()
-        if not case_id or case_id in seen:
+        if not re.fullmatch(r"[0-9A-Za-z_.-]+", case_id) or ".." in case_id or case_id in seen:
             raise VisualRegressionFixtureError(
                 f"{source}:{line_number} case_id가 비어 있거나 중복입니다: {case_id}"
             )
@@ -87,7 +89,7 @@ def load_case_specs(path: str | Path) -> list[dict[str, Any]]:
         if bbox is not None and (
             not isinstance(bbox, list)
             or len(bbox) != 4
-            or not all(isinstance(value, (int, float)) for value in bbox)
+            or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in bbox)
         ):
             raise VisualRegressionFixtureError(
                 f"{source}:{line_number} bbox_pdf는 숫자 4개의 배열이어야 합니다."
@@ -244,7 +246,7 @@ def build_visual_regression_fixture(
             {
                 "case_id": case["case_id"],
                 "source_page": case["source_page"],
-                "review_status": "reviewed",
+                "review_status": case.get("review_status", "pending"),
                 "expected_triage": case["expected_triage"],
                 "expected_status": case["expected_status"],
                 "expected_object_type": case["expected_object_type"],
@@ -267,7 +269,7 @@ def build_visual_regression_fixture(
         "schema_version": SCHEMA_VERSION,
         "dataset_id": dataset_id,
         "role": "regression",
-        "review_status": "reviewed",
+        "review_status": "reviewed" if all(case.get("review_status") == "reviewed" for case in cases) else "pending",
         "locked": True,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "dataset_fingerprint": _fingerprint(source_hash, cases_hash, dpi),
@@ -332,6 +334,10 @@ def validate_visual_regression_fixture(
     check(payload["objects_file"], payload["objects_sha256"], "objects")
     check(payload["annotations_file"], payload["annotations_sha256"], "annotations")
     check(payload["subset_pdf"], payload["subset_pdf_sha256"], "subset PDF")
+    for line in (manifest.parent / payload["objects_file"]).read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        if record.get("crop_image"):
+            check(record["crop_image"], record["crop_image_sha256"], "crop image")
     for page in payload.get("pages", []):
         check(page["page_image"], page["page_image_sha256"], "page image")
         check(page["page_text"], page["page_text_sha256"], "page text")

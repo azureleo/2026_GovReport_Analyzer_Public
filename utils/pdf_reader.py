@@ -7,7 +7,6 @@ PyMuPDF(fitz) 기반으로 구현되었으며,
 
 import base64
 import io
-import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,10 +17,6 @@ fitz.TOOLS.mupdf_display_errors(False)   # MuPDF C라이브러리 노이즈 억�
 from PIL import Image
 
 import config
-
-logger = logging.getLogger(__name__)
-
-_TABLE_MARKER_RE = re.compile(r"(?m)(?:^|\[|\()\s*표\s*\d")
 
 
 @dataclass
@@ -47,46 +42,6 @@ class PDFContent:
     source_path: str = ""
 
 
-def _bbox_tuple(value: Any) -> tuple[float, float, float, float] | None:
-    """PyMuPDF Rect/tuple을 직렬화 가능한 PDF 좌표로 정규화한다."""
-    try:
-        if hasattr(value, "x0"):
-            values = (value.x0, value.y0, value.x1, value.y1)
-        else:
-            values = tuple(value)
-        if len(values) != 4:
-            return None
-        return tuple(float(item) for item in values)
-    except (TypeError, ValueError):
-        return None
-
-
-def _extract_text_blocks(page: fitz.Page) -> list[dict[str, Any]]:
-    """읽기 순서를 유지한 텍스트 블록과 좌표를 반환한다."""
-    try:
-        raw_blocks = page.get_text("blocks", sort=True)
-    except Exception:
-        return []
-    blocks: list[dict[str, Any]] = []
-    for fallback_index, block in enumerate(raw_blocks, start=1):
-        if len(block) < 5:
-            continue
-        text = str(block[4] or "").strip()
-        block_type = int(block[6]) if len(block) > 6 and block[6] is not None else 0
-        if block_type != 0 or not text:
-            continue
-        bbox = _bbox_tuple(block[:4])
-        blocks.append({
-            "block_id": int(block[5]) if len(block) > 5 and block[5] is not None else fallback_index,
-            "text": text,
-            "bbox": list(bbox) if bbox else None,
-            "block_type": "text",
-            "line_count": len([line for line in text.splitlines() if line.strip()]),
-            "char_count": len(text),
-        })
-    return blocks
-
-
 def _resize_image(pil_img: Image.Image, max_size: int = config.MAX_IMAGE_SIZE) -> Image.Image:
     """이미지를 최대 크기 이하로 비율을 유지하며 리사이즈"""
     w, h = pil_img.size
@@ -103,77 +58,51 @@ def _image_to_base64(pil_img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _table_records_with_strategy(
-    page: fitz.Page,
-    strategy: str,
-) -> tuple[list[dict[str, Any]], int]:
-    """주어진 전략으로 표 HTML, 좌표, 크기를 함께 추출한다."""
-    records: list[dict[str, Any]] = []
-    cells = 0
+def _extract_table_records_from_page(page: fitz.Page) -> list[dict]:
+    """
+    PyMuPDF의 find_tables()를 사용해 페이지 내 표를 HTML 문자열 리스트로 반환.
+    표가 없으면 빈 리스트 반환.
+    """
+    tables = []
+    original_rotation = int(getattr(page, "rotation", 0) or 0)
     try:
-        tab_finder = page.find_tables(strategy=strategy)
-    except Exception:
-        return [], 0
-    for table_index, tab in enumerate(tab_finder.tables, start=1):
-        try:
+        if original_rotation:
+            # find_tables can transpose a rotated page; objects use the same
+            # unrotated PDF space as get_text blocks and OCR derotation.
+            page.set_rotation(0)
+        tab_finder = page.find_tables()
+        for index, tab in enumerate(tab_finder.tables, 1):
             df = tab.to_pandas()
-        except Exception:
-            continue
-        if df.size == 0:
-            continue
-        row_count = int(df.shape[0]) + 1
-        column_count = int(df.shape[1])
-        cells += int(df.shape[0]) * column_count
-        bbox = _bbox_tuple(getattr(tab, "bbox", None))
-        records.append({
-            "table_index": table_index,
-            "html": df.to_html(index=False, border=1, na_rep=""),
-            "bbox": list(bbox) if bbox else None,
-            "strategy": strategy,
-            "row_count": row_count,
-            "column_count": column_count,
-            "cell_count": row_count * column_count,
-        })
-    return records, cells
-
-
-def _tables_with_strategy(page: fitz.Page, strategy: str) -> tuple[list[str], int]:
-    """기존 호출자 호환용 HTML 전용 반환 함수."""
-    records, cells = _table_records_with_strategy(page, strategy)
-    return [str(record["html"]) for record in records], cells
-
-
-def _extract_table_records_from_page(page: fitz.Page) -> list[dict[str, Any]]:
-    """괘선 우선 전략으로 표 객체 메타데이터까지 추출한다."""
-    for strategy in ("lines_strict", "lines"):
-        records, _ = _table_records_with_strategy(page, strategy)
-        if records:
-            return records
-
-    records, _ = _table_records_with_strategy(page, "text")
-    if records:
-        return records
-
-    try:
-        if _TABLE_MARKER_RE.search(page.get_text("text")):
-            logger.warning("페이지 %s: '표 N' 마커는 있으나 표 파싱 결과 0개", page.number + 1)
+            html = df.to_html(index=False, border=1, na_rep="")
+            tables.append({
+                "html": html, "table_index": index,
+                "bbox": list(tab.bbox), "row_count": len(df) + 1,
+                "column_count": len(df.columns), "engine": "pymupdf",
+            })
     except Exception:
         pass
-    return []
+    finally:
+        if original_rotation:
+            page.set_rotation(original_rotation)
+    return tables
 
 
 def _extract_tables_from_page(page: fitz.Page) -> list[str]:
-    """
-    페이지 내 표를 HTML 문자열 리스트로 반환.
+    """Keep the original HTML-only API alongside object metadata."""
+    return [record["html"] for record in _extract_table_records_from_page(page)]
 
-    한국 정부 보고서는 괘선 일부 생략·셀 병합이 많아 기본 전략만으로는 표를 놓치거나
-    깨뜨린다. 괘선 기반(lines_strict→lines)을 먼저 시도하고, 둘 다 못 찾으면 텍스트
-    정렬 기반(text)으로 폴백한다. (text를 max-cells로 경쟁시키면 무괘선 표를 과분할해
-    오히려 이기는 경우가 있어, 괘선 우선·텍스트 폴백 순서를 쓴다.)
 
-    '표 N' 마커가 있는데 표를 0개 찾으면 조용한 유실 대신 경고를 남긴다.
-    """
-    return [str(record["html"]) for record in _extract_table_records_from_page(page)]
+def _extract_text_blocks(page: fitz.Page) -> list[dict]:
+    blocks = []
+    try:
+        raw_blocks = page.get_text("blocks", sort=True)
+    except Exception:
+        return blocks
+    for block in raw_blocks:
+        if len(block) >= 5 and (len(block) < 7 or block[6] == 0):
+            blocks.append({"text": str(block[4]), "bbox": list(block[:4]),
+                           "block_id": block[5] if len(block) > 5 else len(blocks)})
+    return blocks
 
 
 def _extract_images_from_page(
@@ -208,11 +137,7 @@ def _extract_images_from_page(
             pil_img = _resize_image(pil_img)
             b64 = _image_to_base64(pil_img)
             try:
-                placements = [
-                    list(rect)
-                    for rect in page.get_image_rects(xref)
-                    if _bbox_tuple(rect) is not None
-                ]
+                placements = page.get_image_rects(xref)
             except Exception:
                 placements = []
             result.append({
@@ -220,8 +145,7 @@ def _extract_images_from_page(
                 "width": pil_img.width,
                 "height": pil_img.height,
                 "caption": "",
-                "bbox": placements[0] if placements else None,
-                "placements": placements,
+                "bbox": list(placements[0]) if placements else None,
                 "xref": xref,
                 "source_kind": "embedded",
             })
@@ -244,55 +168,22 @@ def _render_page_as_image(page: fitz.Page) -> dict:
         "width": pil_img.width,
         "height": pil_img.height,
         "caption": f"Page {page.number + 1} full render",
-        "bbox": [0.0, 0.0, float(page.rect.width), float(page.rect.height)],
+        "bbox": list(page.rect),
         "source_kind": "page_render",
     }
 
 
-_VISUAL_RENDER_PHRASES = [
-    "그래프", "차트", "도표", "배출량 추이", "온실가스 배출",
-    "감축 목표", "배출 현황", "에너지 소비",
-]
-_VISUAL_RENDER_PATTERNS = [
-    re.compile(r"(?m)^\s*\[?\s*그림\s*\d"),
-    re.compile(r"\b(?:Figure|Fig\.|Chart)\b", re.I),
-]
-
-
 def _has_graph_keywords(text: str) -> bool:
-    """그래프/차트/도표가 있을 가능성이 높은 페이지인지 판별."""
-    if any(phrase in text for phrase in _VISUAL_RENDER_PHRASES):
-        return True
-    return any(pattern.search(text) for pattern in _VISUAL_RENDER_PATTERNS)
-
-
-def _drawing_count(page: fitz.Page) -> int:
-    try:
-        return len(page.get_drawings())
-    except Exception:
-        return 0
-
-
-def _is_vector_chart_page(
-    page: fitz.Page,
-    tables: list[str],
-    images: list[dict],
-) -> bool:
-    """
-    벡터로 그려진 차트가 있을 법한 페이지인지 판별(전체 렌더링 대상 승격용).
-
-    벡터 차트는 get_images()에 안 잡혀 누락된다. 다만 한국 정부 보고서의 차트 페이지는
-    텍스트가 많아 '텍스트가 적다'는 신호는 쓸 수 없다. 대신 다음을 본다:
-    - 파싱된 표가 없음(있으면 데이터는 표로 이미 확보)
-    - 임베드 이미지가 없음(있으면 이미지로 이미 확보)
-    - 벡터 path가 충분히 많음(축·격자·막대 등 차트 구성요소)
-    이 조건은 보수적이라 표/이미지로 데이터가 잡힌 페이지는 과렌더링하지 않는다.
-    """
-    if not getattr(config, "VECTOR_RENDER_ENABLED", True):
-        return False
-    if tables or images:
-        return False
-    return _drawing_count(page) >= int(getattr(config, "VECTOR_RENDER_MIN_DRAWINGS", 60))
+    """그래프/차트가 있을 가능성이 높은 페이지인지 키워드로 판별"""
+    keywords = [
+        "그림", "그래프", "차트", "Figure", "Fig.", "Chart",
+        "배출량 추이", "온실가스 배출", "감축 목표", "배출 현황",
+        "에너지 소비", "탄소중립", "NDC",
+    ]
+    for kw in keywords:
+        if kw in text:
+            return True
+    return False
 
 
 def extract_pdf(
@@ -308,56 +199,45 @@ def extract_pdf(
     """
     pdf_path = Path(pdf_path)
     doc = fitz.open(str(pdf_path))
-    try:
-        if doc.needs_pass:
-            raise RuntimeError("암호로 보호된 PDF입니다. 암호를 해제한 사본으로 다시 실행하세요")
 
-        pages: list[PageContent] = []
-        all_texts: list[str] = []
+    pages: list[PageContent] = []
+    all_texts: list[str] = []
 
-        for page_num in range(len(doc)):
-            page = doc[page_num]
+    for page_num in range(len(doc)):
+        page = doc[page_num]
 
-            # 텍스트와 좌표 블록 추출
-            text = page.get_text("text", sort=True)
-            text_blocks = _extract_text_blocks(page)
-            all_texts.append(f"[페이지 {page_num + 1}]\n{text}")
+        # 텍스트 추출
+        text = page.get_text("text", sort=True)
+        all_texts.append(f"[페이지 {page_num + 1}]\n{text}")
 
-            # 표 추출. 기존 HTML 목록과 객체 메타데이터를 함께 유지한다.
-            table_records = _extract_table_records_from_page(page)
-            tables = [str(record["html"]) for record in table_records]
+        # 표 추출
+        table_records = _extract_table_records_from_page(page)
+        tables = [record["html"] for record in table_records]
 
-            # 이미지 추출 (embedded images)
-            images = _extract_images_from_page(page, doc)
+        # 이미지 추출 (embedded images)
+        images = _extract_images_from_page(page, doc)
 
-            # 그래프가 있을 법한 페이지는 전체 렌더링 추가.
-            # (1) 텍스트에 그래프/차트 키워드가 있거나, (2) 표·임베드이미지가 없는데 벡터 path가
-            # 많아 벡터 차트로 추정되는 페이지(키워드가 없어 누락되던 케이스)를 잡는다.
-            if render_graph_pages and (
-                _has_graph_keywords(text) or _is_vector_chart_page(page, tables, images)
-            ):
-                rendered = _render_page_as_image(page)
-                # 이미 embedded image가 없거나, rendered 페이지가 더 풍부한 경우 추가
-                images.append(rendered)
+        # 그래프가 있을 법한 페이지는 전체 렌더링 추가
+        if render_graph_pages and _has_graph_keywords(text):
+            rendered = _render_page_as_image(page)
+            # 이미 embedded image가 없거나, rendered 페이지가 더 풍부한 경우 추가
+            images.append(rendered)
 
-            pages.append(PageContent(
-                page_number=page_num + 1,
-                text=text,
-                tables=tables,
-                images=images,
-                text_blocks=text_blocks,
-                table_records=table_records,
-                width=float(page.rect.width),
-                height=float(page.rect.height),
-                metadata={
-                    "drawing_count": _drawing_count(page) if getattr(config, "VECTOR_RENDER_ENABLED", True) else 0,
-                    "native_text_chars": len(text.strip()),
-                    "table_count": len(table_records),
-                    "image_count": len(images),
-                },
-            ))
-    finally:
-        doc.close()
+        pages.append(PageContent(
+            page_number=page_num + 1,
+            text=text,
+            tables=tables,
+            images=images,
+            text_blocks=_extract_text_blocks(page),
+            table_records=table_records,
+            width=float(page.rect.width), height=float(page.rect.height),
+            metadata={"rotation": int(page.rotation), "native_text_chars": len(text.strip()),
+                      "unrotated_width": float(page.cropbox.width),
+                      "unrotated_height": float(page.cropbox.height),
+                      "coordinate_space": "pdf_points_unrotated"},
+        ))
+
+    doc.close()
 
     return PDFContent(
         total_pages=len(pages),

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import re
+import math
 from typing import Any, Iterable
 
 
@@ -82,7 +83,7 @@ def normalize_object_ids(*values: Any) -> tuple[str, ...]:
 
     def append(value: Any) -> None:
         if isinstance(value, (list, tuple, set)):
-            for item in value:
+            for item in sorted(value, key=str) if isinstance(value, set) else value:
                 append(item)
             return
         text = str(value or "").strip()
@@ -202,12 +203,19 @@ def match_physical_objects(
 
     both_have_evidence = bool(left.evidence_id and right.evidence_id)
     same_evidence = both_have_evidence and left.evidence_id == right.evidence_id
-    if both_have_evidence and not same_evidence:
+    # Auto-generated per-representation IDs are bookkeeping, not proof that a
+    # caption proxy and its native table are different physical objects.
+    left_explicit_evidence = bool(left.evidence_id and left.evidence_id != f"ev-{left.object_id}")
+    right_explicit_evidence = bool(right.evidence_id and right.evidence_id != f"ev-{right.object_id}")
+    if both_have_evidence and not same_evidence and left_explicit_evidence and right_explicit_evidence:
         return PhysicalObjectMatch(False, reason="근거 ID 불일치")
 
     left_number = normalize_object_number(left.number or left.caption)
     right_number = normalize_object_number(right.number or right.caption)
     same_number = bool(left_number and left_number == right_number)
+    if left_number and right_number and left_number != right_number:
+        return PhysicalObjectMatch(False, "number_conflict", 1.0, blocked=True,
+                                   reason="표·그림 번호 불일치")
     similarity = caption_similarity(left, right)
     overlap = bbox_iou(left.bbox, right.bbox)
 
@@ -313,7 +321,7 @@ def aggregate_identity_metadata(
     """대표 객체에 별칭과 프록시 이력을 손실 없이 기록한다."""
     values = list(identities)
     aliases = normalize_object_ids(
-        *(value for identity in values for value in identity_object_ids(identity))
+        *(value for identity in values for value in sorted(identity_object_ids(identity)))
     )
     aliases = tuple(value for value in aliases if value != canonical_object_id)
     canonical_identity = next(
@@ -364,6 +372,9 @@ def _bbox(value: Any) -> tuple[float, float, float, float] | None:
     if not isinstance(value, (list, tuple)) or len(value) != 4:
         return None
     try:
-        return tuple(float(item) for item in value)  # type: ignore[return-value]
+        box = tuple(float(item) for item in value)
+        if not all(math.isfinite(item) for item in box) or box[2] <= box[0] or box[3] <= box[1]:
+            return None
+        return box  # type: ignore[return-value]
     except (TypeError, ValueError):
         return None

@@ -10,8 +10,27 @@ from typing import Any, Sequence
 
 import config
 from utils.document_objects import DocumentObject, build_document_objects
-from utils.evidence_merge import normalize_evidence_ids
 from utils.pdf_reader import PDFContent
+
+
+def normalize_evidence_ids(*values: Any) -> list[str]:
+    result: set[str] = set()
+    def visit(value: Any) -> None:
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                visit(item)
+        elif value not in (None, ""):
+            text = str(value).strip()
+            if text.startswith("["):
+                try:
+                    visit(json.loads(text))
+                    return
+                except (TypeError, ValueError):
+                    pass
+            result.update(part.strip() for part in text.split("|") if part.strip())
+    for value in values:
+        visit(value)
+    return sorted(result)
 
 
 _SEMANTIC_TERMS: dict[str, tuple[str, ...]] = {
@@ -34,7 +53,7 @@ _SEMANTIC_TERMS: dict[str, tuple[str, ...]] = {
     ),
     "emissions_forecast": (
         "온실가스 배출량 전망", "배출량 전망", "배출 전망", "기준전망", "전망 결과",
-        "bau 시나리오", "bau 전망",
+        "bau 시나리오", "bau 전망", "배출량 bau 전망", "bau 배출량",
     ),
     "reduction_targets": (
         "온실가스 감축 목표", "온실가스 감축목표", "부문별 감축 목표", "부문별 감축목표",
@@ -72,8 +91,15 @@ _SEMANTIC_TERMS: dict[str, tuple[str, ...]] = {
 }
 
 _CURRENT_EMISSION_SHEETS = {"emissions_regional", "emissions_management"}
+# 현황 시트의 축(키) 필드. 이 필드가 채워진 행은 표 자체가 인벤토리 축(직접/간접)을
+# 갖는다는 뜻이므로 전망 페이지에 있어도 현황 시트에 남긴다(골든 계약: 05에 관리권한
+# 축 필드가 없어 '관리 권한 내 배출량 전망'은 04에 둔다). 축이 빈 전망 연도행만 05로 옮긴다.
+_CURRENT_EMISSION_AXIS_FIELD = {
+    "emissions_regional": "배출유형",
+    "emissions_management": "직간접구분",
+}
 _NON_SEMANTIC_KEYS = {
-    "_row_id", "_entity_id", "출처페이지", "출처페이지추정", "데이터상태",
+    "_row_id", "_entity_id", "_추출원천", "출처페이지", "출처페이지추정", "데이터상태",
 }
 _PROVENANCE_COPY_FIELDS = (
     "출처페이지",
@@ -564,11 +590,13 @@ def _merge_forecast_provenance(target: dict[str, Any], source: dict[str, Any]) -
             target[field] = source[field]
 
 
-def _forecast_row(source_sheet: str, row: dict[str, Any], target: SemanticTarget) -> dict[str, Any]:
+def _forecast_row(source_sheet: str, row: dict[str, Any], target: SemanticTarget, scenario: str = "") -> dict[str, Any]:
     sector = row.get("부문") if source_sheet == "emissions_regional" else row.get("관리부문")
-    scenario = "BAU" if any("bau" in keyword.casefold() for keyword in target.keywords) else "기준전망"
+    # 출처 시트가 곧 인벤토리 축이다: 03(지역 인벤토리) → 지역전체, 04(관리권한 인벤토리) → 관리권한.
+    scope = "지역전체" if source_sheet == "emissions_regional" else "관리권한"
     mapped = {
         "지자체명": row.get("지자체명"),
+        "전망범위": scope,
         "시나리오": scenario,
         "전망방법코드": None,
         "전망방법원문": None,
@@ -589,8 +617,51 @@ def _forecast_row(source_sheet: str, row: dict[str, Any], target: SemanticTarget
 def _forecast_signature(row: dict[str, Any]) -> tuple[str, ...]:
     return tuple(
         _normalize(row.get(field))
-        for field in ("지자체명", "부문", "세부부문", "연도", "전망값", "단위")
+        for field in ("지자체명", "전망범위", "시나리오", "부문", "세부부문", "연도", "전망값", "단위")
     )
+
+
+def _row_objects(row: dict[str, Any], objects: Sequence[DocumentObject]) -> list[DocumentObject]:
+    ids = set(normalize_evidence_ids(*[row.get(field) for field in
+        ("근거ID", "근거ID목록", "source_evidence_id", "source_evidence_ids",
+         "객체ID", "근거객체ID", "object_id")]))
+    if not ids:
+        return []
+    return [obj for obj in objects if ids.intersection(normalize_evidence_ids(
+        obj.object_id, obj.metadata.get("evidence_id"), obj.metadata.get("evidence_ids"),
+        obj.metadata.get("source_object_id")))]
+
+
+def _grounded_scenario(row: dict[str, Any], document: PDFContent,
+                       objects: Sequence[DocumentObject], pages: tuple[int, ...]) -> str:
+    explicit = re.sub(r"\s+", "", str(row.get("시나리오") or "")).casefold()
+    aliases = {"bau": "BAU", "기준전망": "BAU", "정책반영": "정책반영", "추가조치": "추가조치"}
+    matched = _row_objects(row, objects)
+    if matched:
+        context = " ".join(" ".join((obj.caption, obj.section, obj.nearby_text)) for obj in matched)
+    else:
+        context = " ".join(page.text[:5000] for page in document.pages if page.page_number in pages)
+    context += " " + " ".join(str(row.get(field) or "") for field in
+                             ("_원문헤더", "원문헤더", "행구분", "지표명", "자료유형", "시나리오"))
+    folded = re.sub(r"\s+", "", context).casefold()
+    # Target and historical values require their own destination; axis clearing is
+    # never proof that an observed value is a forecast.
+    if any(word in explicit for word in ("목표", "실적", "현황")):
+        return ""
+    if row.get("_axis_original"):
+        return ""
+    if explicit in aliases:
+        return aliases[explicit]
+    if any(word in folded for word in ("목표배출량", "목표값", "목표치", "감축목표", "실적")):
+        return ""
+    candidates = set()
+    if re.search(r"\bbau\b", context, re.I) or "기준전망" in folded:
+        candidates.add("BAU")
+    if "정책반영" in folded or "정책시나리오" in folded:
+        candidates.add("정책반영")
+    if "추가조치" in folded:
+        candidates.add("추가조치")
+    return next(iter(candidates)) if len(candidates) == 1 else ""
 
 
 def validate_and_reclassify(
@@ -600,113 +671,73 @@ def validate_and_reclassify(
     auto_reclassify: bool | None = None,
     document_objects: Sequence[DocumentObject] | None = None,
 ) -> SemanticRoutingReport:
-    """
-    시트 의미를 검증하고 안전한 미래연도 배출전망 오배치만 자동 이동한다.
-
-    과거 기준연도 값은 전망표 안에 함께 있어도 현황 행으로 유효할 수 있으므로
-    계획시작연도보다 이른 행은 오배치 분모와 자동 이동에서 제외한다.
-    """
+    """Move only grounded future forecasts; hold unknown scenarios for review."""
+    from agents.organizer_agent import deduplicate_forecast_rows, collect_key_blank_stats
     report = SemanticRoutingReport()
-    page_targets = _page_targets(document, document_objects)
+    objects = list(document_objects if document_objects is not None else build_document_objects(document.pages))
+    page_targets = _page_targets(document, objects)
     plan_start = _plan_start_year(final_data)
     if auto_reclassify is None:
         auto_reclassify = bool(getattr(config, "SEMANTIC_ROUTING_AUTO_RECLASSIFY", True))
-
     removals: dict[str, set[int]] = defaultdict(set)
-    forecast_rows = final_data.get("emissions_forecast", [])
-    if not isinstance(forecast_rows, list):
-        forecast_rows = []
-        final_data["emissions_forecast"] = forecast_rows
-    forecast_by_signature: dict[tuple[str, ...], dict[str, Any]] = {}
-    for row in forecast_rows:
-        if isinstance(row, dict):
-            forecast_by_signature.setdefault(_forecast_signature(row), row)
-    source_snapshots = {
-        sheet_key: list(rows)
-        for sheet_key in getattr(config, "EXTRACTION_SHEETS", [])
-        if isinstance((rows := final_data.get(sheet_key, [])), list)
-    }
-
-    for source_sheet, rows in source_snapshots.items():
-        for index, row in enumerate(rows):
+    forecast_rows = [row for row in final_data.get("emissions_forecast", [])
+                     if isinstance(row, dict)]
+    for source_sheet in getattr(config, "EXTRACTION_SHEETS", []):
+        rows = final_data.get(source_sheet, [])
+        if not isinstance(rows, list):
+            continue
+        for index, row in enumerate(list(rows)):
             if not isinstance(row, dict):
                 continue
             report.checked_rows += 1
-            target, source_pages = _row_target(row, page_targets, document.total_pages)
+            target, pages = _row_target(row, page_targets, document.total_pages)
+            matched = _row_objects(row, objects)
+            local_targets = [value for obj in matched
+                             if (value := infer_object_semantic_target(obj)) is not None]
+            if local_targets and len({value.sheet_key for value in local_targets}) == 1:
+                target = max(local_targets, key=lambda value: (value.score, value.margin))
             if target is None:
                 report.ambiguous_rows += 1
                 continue
-
             year = _to_int(row.get("연도"))
-            historical_on_forecast_page = (
-                source_sheet in _CURRENT_EMISSION_SHEETS
-                and target.sheet_key == "emissions_forecast"
-                and plan_start is not None
-                and year is not None
-                and year < plan_start
-            )
-            if historical_on_forecast_page:
+            if (source_sheet in _CURRENT_EMISSION_SHEETS
+                    and target.sheet_key == "emissions_forecast"
+                    and plan_start is not None and year is not None and year < plan_start):
                 continue
-
             report.evaluable_rows += 1
             if source_sheet == target.sheet_key:
                 continue
-
             report.mismatches_before += 1
-            status = "오배치의심"
-            action = "검토필요"
-            can_move_forecast = (
-                auto_reclassify
-                and source_sheet in _CURRENT_EMISSION_SHEETS
-                and target.sheet_key == "emissions_forecast"
-                and plan_start is not None
-                and year is not None
-                and year >= plan_start
+            scenario = _grounded_scenario(row, document, objects, pages)
+            axis = str(row.get(_CURRENT_EMISSION_AXIS_FIELD.get(source_sheet, "")) or "").strip()
+            can_move = (
+                auto_reclassify and source_sheet in _CURRENT_EMISSION_SHEETS
+                and target.sheet_key == "emissions_forecast" and not axis and bool(scenario)
+                and plan_start is not None and year is not None and year >= plan_start
                 and row.get("배출량") not in (None, "")
-                and (
-                    row.get("부문")
-                    if source_sheet == "emissions_regional"
-                    else row.get("관리부문")
-                ) not in (None, "")
-                and any(
-                    marker in target.evidence
-                    for marker in ("캡션:", "섹션:")
-                )
+                and (row.get("부문") if source_sheet == "emissions_regional" else row.get("관리부문"))
+                and any(marker in target.evidence for marker in ("캡션:", "섹션:"))
             )
-            if can_move_forecast:
-                mapped = _forecast_row(source_sheet, row, target)
-                signature = _forecast_signature(mapped)
+            if can_move:
+                mapped = _forecast_row(source_sheet, row, target, scenario)
+                mapped["_semantic_routing"] = {"source_sheet": source_sheet, "rule": "grounded_forecast_v1",
+                                                "evidence": target.evidence, "scenario": scenario}
+                forecast_rows.append(mapped)
                 removals[source_sheet].add(index)
-                if signature in forecast_by_signature:
-                    _merge_forecast_provenance(forecast_by_signature[signature], mapped)
-                    report.removed_duplicates += 1
-                    status = "중복제거"
-                    action = "근거 병합 후 원본시트에서 제거"
-                else:
-                    forecast_rows.append(mapped)
-                    forecast_by_signature[signature] = mapped
-                    report.reclassified_rows += 1
-                    status = "재분류"
-                    action = "05_배출전망으로 이동"
+                report.reclassified_rows += 1
+                status, action = "재분류", "05_배출전망으로 이동"
             else:
                 report.mismatches_after += 1
-
-            report.actions.append(RoutingAction(
-                source_sheet=source_sheet,
-                predicted_sheet=target.sheet_key,
-                status=status,
-                action=action,
-                source_pages=source_pages,
-                evidence=target.evidence,
-                keywords=target.keywords,
-                row_summary=_row_summary(row),
-            ))
-
+                status, action = "오배치의심", "시나리오·현황·목표 구분 및 원래 축 확인"
+                if source_sheet in _CURRENT_EMISSION_SHEETS and target.sheet_key == "emissions_forecast":
+                    row["_forecast_routing_review"] = {"reason": "insufficient_forecast_contract",
+                                                       "evidence": target.evidence, "scenario": scenario}
+            report.actions.append(RoutingAction(source_sheet, target.sheet_key, status, action,
+                                                pages, target.evidence, target.keywords, _row_summary(row)))
     for sheet_key, indices in removals.items():
-        rows = final_data.get(sheet_key, [])
-        if isinstance(rows, list):
-            final_data[sheet_key] = [
-                row for index, row in enumerate(rows) if index not in indices
-            ]
-    final_data["emissions_forecast"] = forecast_rows
+        final_data[sheet_key] = [row for index, row in enumerate(final_data.get(sheet_key, [])) if index not in indices]
+    unique = deduplicate_forecast_rows(forecast_rows)
+    report.removed_duplicates = len(forecast_rows) - len(unique)
+    final_data["emissions_forecast"] = unique
+    final_data["_key_blank_stats"] = collect_key_blank_stats(final_data)
     return report

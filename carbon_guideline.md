@@ -25,8 +25,6 @@
 
 ### 0.2 기준연도·계획기간·목표연도
 
-<!-- sheets: document_meta, plan_overview -->
-
 | 항목 | 원문 기준 | 추출 규칙 |
 |---|---|---|
 | 기준연도 | 2018년 | 보고서가 다른 기준연도를 쓰더라도 `base_year_reported`와 `base_year_standard_2018`을 분리 저장한다. 2018년 대비 목표는 반드시 별도 추출한다. |
@@ -79,7 +77,7 @@
 
 | 원칙 | 내용 | 추출 시 적용 |
 |---|---|---|
-| 2050 탄소중립 목표 | 지자체 중·장기 온실가스 감축전략은 2050 탄소중립 목표를 전제로 수립 | 2050 관련 비전·목표를 필수 탐색하되, 정량값은 원문에 존재하는 경우에만 저장 |
+| 2050 탄소중립 목표 | 지자체 중·장기 온실가스 감축전략은 2050 탄소중립 목표를 전제로 수립 | 비전·전략에서 2050 관련 문구와 정량 목표를 반드시 별도 저장 |
 | 경제·환경 조화 | 계획 수립·이행 과정에서 경제와 환경의 조화로운 발전 도모 | 녹색성장, 산업전환, 지역경제 관련 전략을 대응기반 강화 또는 감축대책과 연결 |
 | 실현가능성 고려 | 지역 추진여건을 고려해 지자체 주도 가능 정책 중심으로 작성 | 국가사업 단순 전재인지, 지자체 주도사업인지 구분 |
 | 감축과 기반강화 포괄 | 온실가스 감축과 기후위기 대응기반 강화 모두 포함 | 감축대책과 대응기반 강화대책을 다른 시트로 분리하되 문서 내 연결을 보존 |
@@ -95,11 +93,7 @@
 
 ### 2.1 기본계획 표준 목차
 
-<!-- sheets: document_meta, plan_overview -->
-
 지자체 보고서의 목차가 다르더라도 아래 구조로 매핑한다.
-
-이 목차는 원문 제3장 표6(광역·기초 공통, 8장 체계)과 부록12 시군구 목차를 합성한 **매핑용 표준**이며, 원문 어느 단일 목차와도 1:1 대응하지 않는다.
 
 | 표준 장 | 표준 세부항목 | 추출 내용 |
 |---|---|---|
@@ -126,8 +120,6 @@
 
 ### 2.2 지역 환경요인 분석
 
-<!-- sheets: regional_conditions -->
-
 원문은 지역 환경요인을 자연환경, 인문·사회환경, 경제·산업환경, 에너지 현황으로 구분한다. 관련 통계는 기본계획 작성시점 기준 **최근 5년 이상**을 포함하도록 추출한다.
 
 | 범주 | 필수·권장 지표 | 표준 컬럼 매핑 |
@@ -139,13 +131,11 @@
 
 추출 원칙:
 
-- 표·본문·그래프의 수치가 충돌하면 어느 하나를 출처 유형만으로 우선하지 않는다. 모든 원문값과 근거를 보존하고 `data_status=conflicting`으로 기록하며, 명시적 산식·동일 근거 ID로 검증된 경우에만 선호값을 설정한다.
+- 표·그래프의 수치가 본문 설명과 다를 경우 표의 수치를 우선하되, 본문 설명의 수치도 `source_note`에 보존한다.
 - 단위는 원문 단위를 `unit_raw`에 저장하고, 표준 단위가 가능하면 `unit_standard`, `value_standardized`를 별도로 둔다.
 - 연도별 데이터는 넓은 표 형태로 두지 말고 가능하면 `연도-지표` 행 단위의 long format으로 저장한다.
 
 ### 2.3 온실가스 배출·흡수 현황
-
-<!-- sheets: emissions_regional -->
 
 #### 2.3.1 기본 통계 출처
 
@@ -174,8 +164,6 @@
 
 ### 2.4 지자체 관리권한 인벤토리 연계표
 
-<!-- sheets: emissions_management -->
-
 기본계획의 감축목표는 지역 전체 인벤토리를 그대로 쓰는 것이 아니라, GIR 지역 인벤토리를 지자체가 관리권한을 가지는 비산업부문 중심으로 재구성한 **관리권한 인벤토리**를 기준으로 설정한다.
 
 | 구분 | 표준 부문 | 표준 세부부문 | GIR/인벤토리 연계 부문 |
@@ -197,8 +185,6 @@
 | 간접배출량 | 열 | 가정 | 열-A.연료연소-4.기타-b.가정 |
 | 간접배출량 | 폐기물 | 폐기물 전체 | 폐기물 전체 발생량 |
 
-검증: 원문 <표10>(`docs/references/assets/표10.png`)과 16행 전수 대조 완료 — 매핑·농경지토양 각주(명칭은 간접배출이나 내용상 직접배출로 분류) 모두 원문과 일치(2026-07-02, docs/audit 참조). 원문 표10의 부문명은 '농업'이며 본 문서는 표준부문 '농축산'으로 정규화 표기.
-
 추출 원칙:
 
 - `합계(흡수원 제외)`와 `합계(흡수원 포함)`을 모두 추출한다.
@@ -206,8 +192,6 @@
 - 농경지토양의 `간접배출`은 명칭상 간접이지만 내용상 직접배출 항목으로 분류한다고 원문이 설명한다. 따라서 표준 매핑에서는 직접배출량-농축산으로 둔다.
 
 ### 2.5 온실가스 배출·흡수 전망
-
-<!-- sheets: emissions_forecast -->
 
 #### 2.5.1 BAU 개념
 
@@ -256,8 +240,6 @@
 
 ### 2.6 비전·전략·감축목표
 
-<!-- sheets: reduction_targets, vision_strategy -->
-
 #### 2.6.1 총괄 감축목표
 
 추출해야 할 총괄 목표 형식:
@@ -279,9 +261,7 @@
 | `target_year` | 2030, 2033/2034, 2050 등 |
 | `bau_emission` | 목표연도 배출전망 |
 | `target_reduction` | 목표 감축량 |
-| `target_emission` | 목표배출량. 목표연도는 원칙적으로 순배출량 기준 |
-| `base_emission_basis` | `gross/net/reported_other/unknown`. 2018년 감축목표 기준값은 원칙적으로 `gross` |
-| `target_emission_basis` | `gross/net/reported_other/unknown`. 목표연도는 원칙적으로 `net` |
+| `target_emission` | 목표배출량. 목표연도는 순배출량 기준 사용 가능 |
 | `reduction_rate_percent` | 기준연도 대비 감축률 |
 | `target_scope` | 관리권한, 관리권한+추가감축, 지역 전체 등 |
 | `outside_jurisdiction_reduction` | 전환·산업 등 관리권한 외 추가감축량이 있으면 별도 저장 |
@@ -295,9 +275,7 @@
 감축률(%) = (2018년 기준배출량 - 목표배출량) / 2018년 기준배출량 × 100
 ```
 
-검증: 원문 예시 그래프(2018 총배출량 20,998.2 → 2030 목표배출량 12,514.3 = 40.4% 감축, 목표감축량 3,255.7 + 목표배출량 = 배출전망 15,770.0)와 수치 정합 확인(2026-07-02, docs/audit 참조).
-
-관리권한 외 추가감축노력(전환, 산업 등)을 포함하더라도 감축률 산정 시에는 해당 추가감축량을 제외하고, 관리권한 외 추가감축 부문(전환, 산업)을 포함한 감축률은 **비전 및 전략에** 병기한다.
+관리권한 외 추가감축노력(전환, 산업 등)을 포함하더라도 감축률 산정 시에는 해당 추가감축량을 제외하고, 필요하면 별도 병기한다.
 
 #### 2.6.3 부문별 감축목표 표준 부문
 
@@ -315,8 +293,6 @@
 
 ### 2.7 부문별 온실가스 감축대책
 
-<!-- sheets: mitigation_projects, quantitative_reductions -->
-
 감축대책은 다음 구조로 추출한다.
 
 | 항목 | 추출 내용 |
@@ -333,13 +309,7 @@
 
 ### 2.8 기후위기 대응기반 강화대책
 
-<!-- sheets: foundation_measures -->
-
 대응기반 강화대책은 감축량을 직접 산정하지 않더라도 별도 정책 영역으로 추출한다.
-
-기후 감시·예측·영향·취약성·리스크·재난 자료는 일반 적응사업 설명에 합치지 않고 다음 구조로 저장한다. 현 단계에서는 `12_foundation_measures`의 확장 필드로 운영하고, 충분한 지자체 표본이 확보되면 `12a_climate_risk_adaptation` 독립 시트로 승격한다.
-
-`assessment_type`, `climate_variable`, `scenario`, `baseline_period`, `future_period`, `spatial_unit`, `sector`, `risk_item`, `vulnerability_indicator`, `value`, `unit`, `risk_level`, `methodology`, `data_source`, `linked_adaptation_task`
 
 | 표준 영역 | 원문 기준 내용 | 추출 포인트 |
 |---|---|---|
@@ -352,8 +322,6 @@
 | 정의로운 전환 | 조례, 협의회, 고용영향, 사업전환, 중소기업·소상공인·농어업인 지원 | 피해예상 업종, 이해관계자, 지원수단 |
 | 탄소중립·녹색성장 인력양성 | 대학·기관 협력, 산학연, 전문인력, 사업재편 준비인력 | 교육과정, 인력수, 기관 |
 
-이 분류는 가이드라인 원문이 아니라 「공유재산 및 물품관리법」 제5조의 법정 분류를 보충한 것이다(원문은 '행정재산'과 '공유 자연자원'까지만 언급).
-
 공유재산 종류 코드북:
 
 | 범주 | 예시 |
@@ -365,8 +333,6 @@
 | 공유 자연자원 | 산림, 어족자원, 갯벌, 목초지, 대기 |
 
 ### 2.9 과제별 관리카드
-
-<!-- sheets: mitigation_projects, annual_implementation, quantitative_reductions, financial_plan -->
 
 온실가스 감축대책은 관리카드 필수 작성, 대응기반 강화대책은 관리카드 작성 권고다. 향후 보고서에서 관리카드가 있으면 최우선 구조화 대상이다.
 
@@ -387,9 +353,7 @@
 | `kpi_unit` | 성과지표 단위 |
 | `annual_plan` | 연차별 이행계획 텍스트 |
 | `annual_target_quantity` | 연도별 목표 물량 |
-| `expected_reduction` | 원문에 보고된 감축량 값. 값의 의미는 `reduction_type`으로 별도 저장 |
-| `reduction_type` | `potential/target/planned/expected/estimated/actual/reported_other` |
-| `temporal_basis` | `annual/cumulative/period_total/unknown` |
+| `expected_reduction` | 연차별 온실가스 감축량 또는 감축잠재량 |
 | `is_quantitative_reduction` | 정량사업 여부 |
 | `monitoring_factor` | 감축원단위 적용 시 모니터링 인자 |
 | `budget_total` | 총 예산 |
@@ -405,8 +369,6 @@
 - `2029~2030`, `2031~2033`처럼 묶음 표기가 있으면 `period_label`을 원문 그대로 보존한다.
 
 ### 2.10 재정투자 계획
-
-<!-- sheets: financial_plan -->
 
 재정투자 계획은 부문별·재원별·연도별 예산을 추출한다.
 
@@ -431,8 +393,6 @@
 ---
 
 ## 3. 추진상황 점검보고서 추출 기준
-
-<!-- sheets: monitoring_performance, changes_actions, governance_feedback -->
 
 ### 3.1 점검 결과보고서 표준 목차
 
@@ -499,8 +459,6 @@
 
 ## 4. 원문 시각자료·표 점검 결과
 
-<!-- sheets: visual_inventory -->
-
 첨부 HWP에는 텍스트 표뿐 아니라 기본계획 수립체계도, 추진상황 점검체계도, BAU 개념도, 전망방법 도식, 점검절차 흐름도, 예시 그래프 등이 포함되어 있다. 아래 내용은 이미지까지 확인해 추출한 구조화 결과다.
 
 | 이미지 ID | 원문상 역할 | 확인된 내용 | 데이터 추출 반영 |
@@ -522,7 +480,7 @@
 
 시각자료 추출 원칙:
 
-1. 텍스트 표는 우선 처리할 수 있으나, 값 충돌 시 표라는 이유만으로 정답으로 선택하지 않는다.
+1. 표가 텍스트로 존재하면 표를 우선한다.
 2. 그래프에 수치 레이블이 인쇄되어 있으면 수치 그대로 추출하고 `source_type=graph_label`로 표시한다.
 3. 그래프 축만 있고 정확한 수치가 없으면 추정하지 않는다. 필요 시 `needs_digitization=true`로 표시한다.
 4. 이미지 안에만 존재하는 절차·기한·분류명은 `visual_table_inventory`와 관련 시트에 모두 저장한다.
@@ -549,8 +507,6 @@
 | `data_status` | reported/calculated/visual_only/not_reported/conflicting |
 | `confidence` | high/medium/low |
 | `review_note` | 검토 메모 |
-| `derivation_type` | `explicit/normalized/calculated/inferred/external_lookup` |
-| `evidence_id` | 원문 객체 또는 출처페이지 기반의 안정적인 근거 식별자 |
 
 ### 5.2 권장 시트 목록
 
@@ -562,15 +518,15 @@
 | `03_emissions_regional_inventory` | 지역 전체 직접·간접 배출·흡수 현황 | `inventory_source`, `emission_scope`, `emission_category`, `sector`, `subsector`, `year`, `emission_value`, `unit`, `is_sink` |
 | `04_emissions_management_inventory` | 지자체 관리권한 인벤토리 | `inventory_source`, `management_sector`, `subsector`, `direct_indirect`, `year`, `emission_value`, `unit`, `included_in_total` |
 | `05_emissions_forecast` | 배출·흡수 전망 | `scenario`, `forecast_method_code`, `forecast_method_raw`, `sector`, `subsector`, `year`, `forecast_value`, `unit`, `assumption` |
-| `06_reduction_targets` | 총괄·부문별 감축목표 | `target_scope`, `sector`, `subsector`, `base_year`, `base_emission`, `base_emission_basis`, `target_year`, `bau_emission`, `target_reduction`, `target_emission`, `target_emission_basis`, `reduction_rate_percent`, `calculated_reduction_rate` |
+| `06_reduction_targets` | 총괄·부문별 감축목표 | `target_scope`, `sector`, `subsector`, `base_year`, `base_emission`, `target_year`, `bau_emission`, `target_reduction`, `target_emission`, `reduction_rate_percent` |
 | `07_vision_strategy` | 비전·전략 | `vision_text`, `strategy_level`, `strategy_name`, `sector`, `description`, `keyword` |
 | `08_mitigation_projects` | 감축대책·세부사업 목록 | `sector`, `project_id`, `project_name`, `project_type`, `lead_department`, `cooperating_department`, `project_summary`, `kpi_name`, `kpi_unit`, `is_quantitative_reduction` |
 | `09_annual_implementation` | 연차별 이행계획 | `project_id`, `project_name`, `period_start`, `period_end`, `year`, `annual_plan_text`, `target_quantity`, `target_unit`, `regulatory_plan`, `legislation_plan` |
-| `10_quantitative_reductions` | 정량사업 감축량 | `project_id`, `year`, `monitoring_factor`, `activity_value`, `activity_unit`, `emission_factor_id`, `emission_factor_value`, `expected_reduction`, `reduction_type`, `temporal_basis`, `unit` |
+| `10_quantitative_reductions` | 정량사업 감축량 | `project_id`, `year`, `monitoring_factor`, `activity_value`, `activity_unit`, `emission_factor_id`, `emission_factor_value`, `expected_reduction`, `unit` |
 | `11_financial_plan` | 재정투자 계획 | `plan_category`, `sector`, `project_id`, `finance_source`, `year`, `budget_value`, `budget_unit`, `subtotal_or_total` |
-| `12_foundation_measures` | 기후위기 대응기반 강화대책 및 기후위험 평가 | `foundation_area`, `task_id`, `task_name`, `policy_direction`, `main_contents`, `assessment_type`, `climate_variable`, `scenario`, `baseline_period`, `future_period`, `spatial_unit`, `risk_item`, `vulnerability_indicator`, `value`, `unit`, `risk_level` |
+| `12_foundation_measures` | 기후위기 대응기반 강화대책 | `foundation_area`, `task_id`, `task_name`, `policy_direction`, `main_contents`, `target`, `lead_department`, `period` |
 | `13_governance_feedback` | 이행관리·환류체계 | `governance_body`, `role`, `responsible_department`, `process_step`, `deadline`, `output_document` |
-| `14_monitoring_performance` | 추진상황 점검 실적 | `inspection_year`, `sector`, `project_id`, `project_name`, `annual_plan`, `performance`, `budget_raw`, `budget_value`, `budget_type`, `budget_unit`, `budget_execution_rate`, `achievement_status`, `business_type` |
+| `14_monitoring_performance` | 추진상황 점검 실적 | `inspection_year`, `sector`, `project_id`, `project_name`, `annual_plan`, `performance`, `budget_spent`, `achievement_status`, `business_type` |
 | `15_changes_and_actions` | 변경과제·미달성 조치 | `inspection_year`, `sector`, `project_id`, `project_name`, `change_before`, `change_after`, `change_reason`, `delay_or_failure_reason`, `action_plan` |
 | `16_visual_table_inventory` | 표·그림·이미지 목록 | `visual_id`, `caption`, `visual_type`, `contains_data`, `extracted_values`, `needs_digitization`, `related_sheet` |
 | `90_codebook` | 표준 코드 | `code_type`, `code`, `label_ko`, `definition`, `note` |
@@ -579,8 +535,6 @@
 ### 5.3 시트별 세부 컬럼 가이드
 
 #### `02_regional_conditions`
-
-<!-- sheets: regional_conditions -->
 
 | 컬럼 | 예시 |
 |---|---|
@@ -596,8 +550,6 @@
 
 #### `04_emissions_management_inventory`
 
-<!-- sheets: emissions_management -->
-
 | 컬럼 | 설명 |
 |---|---|
 | `management_sector` | 건물, 수송, 농축산, 폐기물, 흡수원 |
@@ -612,8 +564,6 @@
 
 #### `06_reduction_targets`
 
-<!-- sheets: reduction_targets -->
-
 | 컬럼 | 설명 |
 |---|---|
 | `target_level` | 총괄 / 부문 / 세부부문 / 사업 |
@@ -621,19 +571,14 @@
 | `sector` | 부문 |
 | `base_year` | 보통 2018 |
 | `base_emission` | 기준연도 배출량 |
-| `base_emission_basis` | 총배출량 `gross` / 순배출량 `net` / 원문기타 / 불명 |
 | `forecast_year` | 목표연도와 같으면 동일 값 |
 | `bau_emission` | 배출전망 |
 | `target_reduction` | 목표감축량 |
 | `target_emission` | 목표배출량 |
-| `target_emission_basis` | 총배출량 `gross` / 순배출량 `net` / 원문기타 / 불명 |
 | `reduction_rate_percent` | 감축률 |
-| `calculated_reduction_rate` | 보고 감축률을 덮어쓰지 않는 별도 검산값 |
 | `formula_check` | 계산 검증 결과 |
 
 #### `08_mitigation_projects`
-
-<!-- sheets: mitigation_projects -->
 
 | 컬럼 | 설명 |
 |---|---|
@@ -652,18 +597,12 @@
 
 #### `14_monitoring_performance`
 
-<!-- sheets: monitoring_performance -->
-
 | 컬럼 | 설명 |
 |---|---|
 | `inspection_year` | 점검 대상연도 |
 | `annual_plan` | 해당연도 이행계획 |
 | `performance` | 이행실적 |
-| `budget_raw` | 소요예산 등 원문 표현과 원문값 |
-| `budget_value` | 구조화한 예산 수치 |
-| `budget_type` | `planned/required/secured/allocated/executed/reported_unspecified` |
-| `budget_unit` | 원/천원/백만원/억원 등 원문 단위 |
-| `budget_execution_rate` | 집행률이 원문에 존재하는 경우의 수치 |
+| `budget_spent` | 소요예산 |
 | `achievement_status` | 달성/정상추진/지연/미달성 |
 | `business_type` | 기존/변경/신규 |
 | `representative_project_flag` | 대표 추진과제 여부 |
@@ -700,8 +639,6 @@
 
 원문 부록3은 한국환경공단의 감축원단위 적용 가이드라인에 따른 114개 감축원단위를 부문별로 재구성한다. 후속 계산용 참조 테이블을 만들 때는 아래 구조로 별도 저장한다.
 
-**감축량 자동 생성 금지:** 사업명과 부록3 항목이 유사하다는 이유만으로 감축량이나 감축원단위 값을 보고 데이터에 채우지 않는다. 보고서가 원단위 적용을 명시했거나 사용자가 별도 계산을 요청한 경우에만 사업 의미, 모니터링 인자, 활동단위를 모두 검증하여 계산하고 `derivation_type=calculated` 또는 `external_lookup`으로 분리한다.
-
 | 코드 | 부문 | 원문 번호 범위 | 예시 사업 |
 |---|---|---|---|
 | `unit_transition` | 전환 | 1-1~1-12 | 태양광, BIPV, 풍력, 소수력, 지열, 소각장 폐열, 바이오가스 열병합 |
@@ -731,18 +668,6 @@ factor_value, factor_unit, source_title, source_year, note
 | `conflicting` | 표·본문·그래프 간 수치가 충돌 |
 | `needs_review` | 사람이 재확인해야 함 |
 
-### 6.5 산출 유형 코드
-
-| 코드 | 의미 |
-|---|---|
-| `explicit` | 원문에 직접 제시된 값 |
-| `normalized` | 명칭·단위·형식만 표준화한 값 |
-| `calculated` | 원문 수치와 명시 산식으로 계산한 값 |
-| `inferred` | 문맥상 분류한 값. 원문 보고값처럼 취급하지 않음 |
-| `external_lookup` | 외부 코드북·참조표와 연결한 값 |
-
-근거 강도는 `explicit > normalized > calculated > inferred` 순으로 평가한다. `external_lookup`은 원문 보고값과 분리하며, 모든 주요 행에 `derivation_type`과 `evidence_id`를 기록한다.
-
 ---
 
 ## 7. 보고서가 가이드라인 형식을 따르지 않을 때의 매핑 규칙
@@ -752,9 +677,9 @@ factor_value, factor_unit, source_title, source_year, note
 3. **흡수원은 감축대책과 별도로 관리**한다. 산림·공원·도시숲·바다숲·습지·블루카본은 `sink`로 우선 매핑한다.
 4. **전환·산업은 관리권한 외 여부를 표시**한다. 지자체가 직접 추진 가능한 사업이면 감축대책에 포함하되, 감축률 산정 포함 여부는 `target_scope`로 분리한다.
 5. **숫자는 원문 단위를 먼저 보존**한다. 변환값은 별도 컬럼에 둔다.
-6. **출처 유형만으로 우선순위를 정하지 않는다**. 그래프에만 수치가 있으면 `visual_only`로 저장하고, 표·본문과 충돌하면 모두 `conflicting`으로 보존한다.
+6. **그래프는 표보다 후순위**다. 그래프에만 수치가 있으면 `visual_only`로 저장한다.
 7. **목표·전망·실적을 혼동하지 않는다**. 같은 연도·부문 수치라도 `data_type`을 `historical_emission`, `forecast`, `target`, `performance`로 구분한다.
-8. **정량사업과 정성사업을 원문 근거로 구분**한다. 정량 감축량 또는 산정 가능한 정량 성과가 명시되면 정량, 정량성과 없이 정책·교육·홍보 성과만 제시되면 정성으로 두며 판단 불가능하면 `unknown`으로 둔다. 사업명만으로 판단하지 않는다.
+8. **정량사업과 정성사업을 구분**한다. 감축량 수치가 없고 교육·캠페인 중심이면 정성사업으로 둔다.
 9. **성과지표와 감축량은 별개로 저장**한다. 예: “전기차 보급대수”는 KPI이고, tCO2eq 감축량은 별도 정량감축량이다.
 10. **결측은 임의 보완하지 않는다**. 보고서에 없으면 `not_reported`로 남기고, 추정·계산은 요청이 있을 때만 수행한다.
 
@@ -807,7 +732,7 @@ factor_value, factor_unit, source_title, source_year, note
 
 1. **문서 메타 추출**: 표지, 제출일, 지자체명, 계획기간, 발간기관, 목차 확보.
 2. **목차 매핑**: 원문 목차를 이 가이드라인의 표준 장에 매핑.
-3. **표 우선 처리**: 지역현황, 배출현황, 전망, 목표, 추진과제, 예산 표를 먼저 구조화하되 충돌값의 정답 우선권을 부여하지 않음.
+3. **표 우선 추출**: 지역현황, 배출현황, 전망, 목표, 추진과제, 예산 표를 먼저 추출.
 4. **이미지·그래프 확인**: 그래프·지도·도식에만 있는 수치·절차·분류를 `16_visual_table_inventory`에 기록하고, 값은 관련 시트에도 반영.
 5. **인벤토리 분리**: 지역 전체 인벤토리와 관리권한 인벤토리를 분리 저장.
 6. **목표 계산 검증**: 기준배출량, BAU, 목표감축량, 목표배출량, 감축률의 관계 확인.

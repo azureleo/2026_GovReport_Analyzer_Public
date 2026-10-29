@@ -1,482 +1,271 @@
-"""고정 골든셋·홀드아웃 계약에 따라 파이프라인 출력을 평가한다."""
-
+"""버전 고정 골든 평가. 모델 호출/업무 값 수정 없이 저장 Excel만 채점한다."""
 from __future__ import annotations
 
-import hashlib
+from collections import defaultdict
 import json
-import re
-import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+import time
 
-from openpyxl import load_workbook
+from utils.integration_audit import document_hash, save_json
+from utils.quality_adapters import canonical, norm, number, pages, present, unit_norm
+from utils.quality_evaluation import money_scale, same_city
 
-from scripts.audit_visual_inventory import AuditPaths, run_audit
-from scripts.score_against_golden import score_workbooks
-from utils.routing_benchmark import evaluate_fixed_routing_inventory
-
-
-class EvaluationContractError(RuntimeError):
-    """평가 데이터셋 계약 또는 파일 해시가 유효하지 않다."""
+ROOT = Path(__file__).resolve().parents[1]
+VERSION = "golden-v2-identity-unit-scope-1"
+EXCLUDED = {"지자체명", "출처페이지", "데이터상태", "derivation_type", "근거ID"}
 
 
-@dataclass(frozen=True, slots=True)
-class EvaluationDataset:
-    dataset_id: str
-    role: str
-    review_status: str
-    locked: bool
-    source_path: Path
-    source_sha256: str
-    golden_path: Path | None
-    golden_sha256: str
-    visual_inventory_path: Path | None
-    visual_inventory_sha256: str
-    routing_inventory_path: Path | None
-    routing_inventory_sha256: str
-    notes: str = ""
+def _unavailable(reason, mode, *, status="unassessed", dataset=None):
+    return {"status": status, "reason": reason, "mode": mode, "contract_version": VERSION,
+            "dataset_id": dataset, "model_accuracy_evaluated": False,
+            "metrics": {"cell_accuracy": None, "row_recall": None, "row_precision": None}}
 
 
-@dataclass(frozen=True, slots=True)
-class BenchmarkEvaluationResult:
-    dataset: EvaluationDataset
-    metrics: dict[str, Any]
-    report_json: Path
-    report_markdown: Path
-    artifacts: dict[str, str]
+def _scope_rows(rows, scope):
+    allowed_pages = set(scope.get("pages", []))
+    filters = scope.get("fields", {})
+    result, unlocated = [], []
+    for row in rows:
+        if filters and not all(any(norm(row.값.get(f)) == norm(v) for v in values) for f, values in filters.items()):
+            continue
+        if allowed_pages:
+            rp, error = pages(row.값.get("골든_출처페이지") or row.값.get("출처페이지"))
+            if error or not rp:
+                unlocated.append(row.번호)
+                continue
+            if not set(rp) & allowed_pages:
+                continue
+        result.append(row)
+    return result, unlocated
 
 
-def sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest().lower()
+IDENTITY = {
+    "00": ["지자체명", "계획명"], "01": ["개요유형", "항목명"],
+    "02": ["지표범주", "지표명", "연도"],
+    "03": ["인벤토리출처", "배출범위", "배출유형", "부문", "세부부문", "연도"],
+    "04": ["인벤토리출처", "관리부문", "세부부문", "직간접구분", "연도"],
+    "05": ["전망범위", "시나리오", "부문", "세부부문", "연도"],
+    "06": ["목표수준", "목표범위", "부문", "기준연도", "목표연도"],
+    "07": ["전략수준", "전략명", "비전문구"],
+    "08": ["관리번호", "사업명", "부문"], "09": ["관리번호", "사업명", "연도"],
+    "10": ["관리번호", "사업명", "연도", "모니터링인자"],
+    "11": ["계획구분", "부문", "사업명", "재원구분", "연도"],
+    "12": ["과제ID", "과제명", "대응기반영역"], "13": ["거버넌스기구", "절차단계", "역할"],
+    "14": ["관리번호", "사업명", "점검연도"], "15": ["관리번호", "사업명", "점검연도"],
+}
 
 
-def _resolve_path(base: Path, value: Any) -> Path | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    path = Path(text).expanduser()
-    return path.resolve() if path.is_absolute() else (base / path).resolve()
+def _identity_compatible(sheet, left, right, key_value):
+    """식별 조건만 사용한다. 골든 숫자/단위 정답에 가까운 후보를 선택하지 않는다."""
+    fields = IDENTITY[sheet[:2]]
+    shared = [f for f in fields if present(left.get(f)) and present(right.get(f))]
+    explicit = set()
+    for identifier in ("관리번호", "과제ID"):
+        if identifier in shared:
+            a, b = key_value(identifier, left[identifier]), key_value(identifier, right[identifier])
+            if a and b and norm(a) not in {"미상", "알수없음", "없음", "-"} and norm(b) not in {"미상", "알수없음", "없음", "-"}:
+                if a != b:
+                    return False
+                explicit.add(identifier)
+            else:
+                shared.remove(identifier)
+    if present(left.get("지자체명")) and present(right.get("지자체명")) and not same_city(left["지자체명"], right["지자체명"]):
+        return False
+    for field in shared:
+        if field == "지자체명":
+            continue
+        if (field == "사업명" and "관리번호" in explicit) or (field == "과제명" and "과제ID" in explicit):
+            continue
+        if key_value(field, left[field]) != key_value(field, right[field]):
+            return False
+    prefix = sheet[:2]
+    if prefix in {"08", "09", "10", "11", "14", "15"}:
+        anchor = {"사업명", "관리번호"}.intersection(shared)
+        time = "점검연도" if prefix in {"14", "15"} else "연도"
+        return bool(anchor) and (prefix == "08" or time in shared)
+    if prefix == "12":
+        return bool({"과제명", "과제ID"}.intersection(shared))
+    if prefix == "07":
+        return bool({"전략명", "비전문구"}.intersection(shared))
+    if prefix == "00":
+        return "계획명" in shared
+    # 하나의 숫자/연도만 같은 행을 대응시키지 않는다.
+    return len(shared) >= 2
 
 
-def load_evaluation_datasets(manifest_path: str | Path) -> list[EvaluationDataset]:
-    manifest = Path(manifest_path).expanduser().resolve()
+def _equivalent(field, golden, output, legacy_compare):
+    # 명시적으로 등록된 같은 통화 차원에서만 배율을 환산한다.
+    if field in {"예산액", "예산단위"}:
+        a, b = money_scale(golden.get("예산단위")), money_scale(output.get("예산단위"))
+        if a is not None and b is not None:
+            ga, ob = number(golden.get("예산액")), number(output.get("예산액"))
+            if field == "예산단위":
+                return True
+            if ga is not None and ob is not None:
+                return legacy_compare(field, ga * a, ob * b)
+    # CO2와 CO2eq는 동치로 합치지 않는다.
+    if field in {"배출량", "전망값", "예상감축량", "단위"}:
+        import re
+        pattern = r"(kg|t|kt|mt|톤|천톤|만톤|백만톤)(co2eq|co2e|co2)"
+        a, b = re.fullmatch(pattern, unit_norm(golden.get("단위"))), re.fullmatch(pattern, unit_norm(output.get("단위")))
+        scales = {"kg": 0.001, "t": 1, "톤": 1, "kt": 1000, "천톤": 1000,
+                  "만톤": 10000, "mt": 1000000, "백만톤": 1000000}
+        if a and b and ({"co2eq": "eq", "co2e": "eq", "co2": "co2"}[a[2]] == {"co2eq": "eq", "co2e": "eq", "co2": "co2"}[b[2]]):
+            if field == "단위":
+                return True
+            x, y = number(golden.get(field)), number(output.get(field))
+            if x is not None and y is not None:
+                return legacy_compare(field, x * scales[a[1]], y * scales[b[1]])
+    return legacy_compare(field, golden.get(field), output.get(field))
+
+
+def score_v2(output_path, golden_path, *, scope=None):
+    from utils.evaluation_v1.golden_score_contract import 데이터시트, 계약헤더, 키값, 값필드
+    from utils.evaluation_v1.golden_score_workbook import 워크북읽기
+    from utils.evaluation_v1.golden_score_matching import _필드일치
+    golden = 워크북읽기(Path(golden_path), golden=True)
+    output = 워크북읽기(Path(output_path), golden=False)
+    scope = scope or {"kind": "document"}
+    total = defaultdict(int)
+    details, per_sheet = [], {}
+    format_errors = []
+    for sheet in 데이터시트:
+        if scope.get("sheets") and sheet not in scope["sheets"]:
+            continue
+        gs, os = golden[sheet], output[sheet]
+        if gs.상태 == "골든 없음":
+            continue
+        if gs.상태 == "형식 오류":
+            format_errors.extend(gs.오류)
+            continue
+        gr, gu = _scope_rows(gs.행들, scope)
+        out, ou = _scope_rows(os.행들, scope)
+        if not gr:
+            continue
+        fields = [f for f in 계약헤더(sheet) if f not in EXCLUDED]
+        # 양방향 후보 그래프에서 유일한 경우만 승인한다. 행 순서로 먼저 나온 답을 택하지 않는다.
+        edges, reverse = {}, defaultdict(list)
+        for gi, g in enumerate(gr):
+            candidates = [oi for oi, o in enumerate(out) if _identity_compatible(sheet, g.값, o.값, 키값)]
+            edges[gi] = candidates
+            for oi in candidates:
+                reverse[oi].append(gi)
+        stats = defaultdict(int)
+        stats.update(golden_rows=len(gr), output_rows=len(out), scope_unlocated_golden=len(gu), scope_unlocated_output=len(ou))
+        for gi, g in enumerate(gr):
+            candidates = edges[gi]
+            signatures = {canonical({f: out[i].값.get(f) for f in 계약헤더(sheet)}) for i in candidates}
+            o = None
+            if candidates and len(signatures) == 1 and all(len(reverse[i]) == 1 for i in candidates):
+                o = out[min(candidates, key=lambda i: out[i].번호)]
+                stats["row_matches"] += 1
+                stats["duplicate_output_candidates"] += len(candidates) - 1
+                details.append({"sheet": sheet, "golden_row": g.번호, "output_row": o.번호, "status": "matched"})
+            else:
+                status = "ambiguous" if candidates else "missing"
+                stats[status] += 1
+                details.append({"sheet": sheet, "golden_row": g.번호, "output_rows": [out[i].번호 for i in candidates], "status": status})
+            for field in fields:
+                if not present(g.값.get(field)):
+                    continue
+                stats["cell_expected"] += 1
+                if o is not None and present(o.값.get(field)) and _equivalent(field, g.값, o.값, _필드일치):
+                    stats["cell_matches"] += 1
+                elif o is not None:
+                    details.append({"sheet": sheet, "golden_row": g.번호, "output_row": o.번호, "field": field,
+                                    "status": "cell_mismatch", "golden": g.값.get(field), "output": o.값.get(field)})
+            if o is not None:
+                for f in 값필드.get(sheet, []):
+                    if present(g.값.get(f)) and present(o.값.get(f)):
+                        stats["value_pairs"] += 1
+                        stats["value_matches"] += _equivalent(f, g.값, o.값, _필드일치)
+        per_sheet[sheet] = dict(stats)
+        for k, v in stats.items():
+            total[k] += v
+    def ratio(a, b):
+        return round(total[a] / total[b], 6) if total[b] else None
+    return {"contract_version": VERSION, "scope": scope, "counts": dict(total), "per_sheet": per_sheet,
+            "metrics": {"cell_accuracy": ratio("cell_matches", "cell_expected"),
+                        "row_recall": ratio("row_matches", "golden_rows"),
+                        "row_precision": ratio("row_matches", "output_rows"),
+                        "value_agreement": ratio("value_matches", "value_pairs")},
+            "format_errors": format_errors, "details": details,
+            "limitations": ["골든 매칭 정밀도는 불완전한 골든에 대한 비율이며 실제 오답률이 아님",
+                            "모호한 다중 후보는 정답값과 가까운 행을 선택하지 않고 미매칭으로 보존",
+                            "골든에 없는 출력은 오답으로 확정하지 않음", "v1/v2는 별도 계약이므로 숫자를 혼합 비교하지 않음"]}
+
+
+def evaluate_registered(output_path, source_path, *, manifest_path=None, mode="auto", dataset_id=None,
+                        allow_draft=False, allow_holdout=False, report_base=None):
+    """등록/승인/해시 검증 실패는 Excel 저장 성공과 별개로 반환한다."""
+    started = time.perf_counter()
+    if mode == "off":
+        return _unavailable("골든 평가 비활성", mode, status="disabled")
+    failure_status = "required_unavailable" if mode == "required" else "unassessed"
+    manifest_path = Path(manifest_path or ROOT / "data/evaluation/benchmark_manifest.json").resolve()
+    if not manifest_path.is_file():
+        return _unavailable("평가 매니페스트 없음", mode, status=failure_status)
     try:
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise EvaluationContractError(f"평가 매니페스트를 찾을 수 없습니다: {manifest}") from exc
-    except json.JSONDecodeError as exc:
-        raise EvaluationContractError(f"평가 매니페스트 JSON 오류: {exc}") from exc
-
-    raw_datasets = payload.get("datasets")
-    if not isinstance(raw_datasets, list):
-        raise EvaluationContractError("평가 매니페스트의 datasets는 배열이어야 합니다.")
-    datasets: list[EvaluationDataset] = []
-    for index, raw in enumerate(raw_datasets, start=1):
-        if not isinstance(raw, dict):
-            raise EvaluationContractError(f"datasets[{index}]는 객체여야 합니다.")
-        dataset_id = str(raw.get("id") or "").strip()
-        role = str(raw.get("role") or "").strip().lower()
-        if not dataset_id or role not in {"development", "holdout"}:
-            raise EvaluationContractError(
-                f"datasets[{index}]에 id와 role(development|holdout)이 필요합니다."
-            )
-        source_path = _resolve_path(manifest.parent, raw.get("source"))
-        if source_path is None:
-            raise EvaluationContractError(f"{dataset_id}: source 경로가 필요합니다.")
-        datasets.append(EvaluationDataset(
-            dataset_id=dataset_id,
-            role=role,
-            review_status=str(raw.get("review_status") or "draft").strip().lower(),
-            locked=bool(raw.get("locked", False)),
-            source_path=source_path,
-            source_sha256=str(raw.get("source_sha256") or "").strip().lower(),
-            golden_path=_resolve_path(manifest.parent, raw.get("golden")),
-            golden_sha256=str(raw.get("golden_sha256") or "").strip().lower(),
-            visual_inventory_path=_resolve_path(manifest.parent, raw.get("visual_inventory")),
-            visual_inventory_sha256=str(
-                raw.get("visual_inventory_sha256") or ""
-            ).strip().lower(),
-            routing_inventory_path=_resolve_path(manifest.parent, raw.get("routing_inventory")),
-            routing_inventory_sha256=str(
-                raw.get("routing_inventory_sha256") or ""
-            ).strip().lower(),
-            notes=str(raw.get("notes") or "").strip(),
-        ))
-    return datasets
-
-
-def select_evaluation_dataset(
-    datasets: list[EvaluationDataset],
-    source_path: str | Path,
-    *,
-    dataset_id: str | None = None,
-    allow_holdout: bool = False,
-) -> EvaluationDataset:
-    source = Path(source_path).expanduser().resolve()
-    source_hash = sha256_file(source)
-    if dataset_id:
-        matches = [dataset for dataset in datasets if dataset.dataset_id == dataset_id]
-    else:
-        matches = [
-            dataset for dataset in datasets
-            if dataset.source_sha256 and dataset.source_sha256 == source_hash
-        ]
-    if not matches:
-        marker = f"ID={dataset_id}" if dataset_id else f"원문 SHA256={source_hash}"
-        raise EvaluationContractError(f"일치하는 평가 데이터셋이 없습니다: {marker}")
-    if len(matches) > 1:
-        raise EvaluationContractError("평가 데이터셋이 둘 이상 일치합니다. ID를 명시하세요.")
-    dataset = matches[0]
-    if dataset.role == "holdout" and not allow_holdout:
-        raise EvaluationContractError(
-            f"{dataset.dataset_id}는 홀드아웃입니다. 일상 튜닝과 분리하기 위해 "
-            "--evaluate-holdout을 명시해야 합니다."
-        )
-    return dataset
-
-
-def _verify_file(path: Path | None, expected_hash: str, label: str) -> None:
-    if path is None:
-        raise EvaluationContractError(f"{label} 경로가 등록되지 않았습니다.")
-    if not path.exists():
-        raise EvaluationContractError(f"{label} 파일을 찾을 수 없습니다: {path}")
-    if not expected_hash:
-        raise EvaluationContractError(f"{label} SHA256이 매니페스트에 없습니다.")
-    actual = sha256_file(path)
-    if actual != expected_hash:
-        raise EvaluationContractError(
-            f"{label} 해시 불일치: 기대 {expected_hash}, 실제 {actual}. "
-            "파일을 조용히 수정하지 말고 새 데이터셋 버전을 등록하세요."
-        )
-
-
-def verify_evaluation_contract(
-    dataset: EvaluationDataset,
-    source_path: str | Path,
-    *,
-    allow_draft: bool = False,
-) -> None:
-    source = Path(source_path).expanduser().resolve()
-    if not dataset.locked:
-        raise EvaluationContractError(
-            f"{dataset.dataset_id}는 locked=false입니다. 고정 평가 기준으로 사용할 수 없습니다."
-        )
-    _verify_file(source, dataset.source_sha256, "입력 원문")
-    _verify_file(dataset.golden_path, dataset.golden_sha256, "골든셋")
-    if dataset.review_status != "verified" and not allow_draft:
-        raise EvaluationContractError(
-            f"{dataset.dataset_id}는 사람 확정 전({dataset.review_status})입니다. "
-            "테스트 목적이면 --allow-draft-evaluation을 명시하세요."
-        )
-    if dataset.visual_inventory_path is not None:
-        _verify_file(
-            dataset.visual_inventory_path,
-            dataset.visual_inventory_sha256,
-            "시각요소 인벤토리",
-        )
-    if dataset.routing_inventory_path is not None:
-        _verify_file(
-            dataset.routing_inventory_path,
-            dataset.routing_inventory_sha256,
-            "라우팅 인벤토리",
-        )
-
-
-def routing_metrics_from_workbook(
-    output_path: str | Path,
-    routing_inventory_path: str | Path | None = None,
-) -> dict[str, Any]:
-    if routing_inventory_path is not None:
-        metrics, _details = evaluate_fixed_routing_inventory(
-            output_path,
-            routing_inventory_path,
-        )
-        return metrics
-    workbook = load_workbook(output_path, read_only=True, data_only=True)
-    try:
-        if "21_원문객체인벤토리" not in workbook.sheetnames:
-            return {
-                "routing_error_rate": None,
-                "routing_evaluable_objects": 0,
-                "routing_mismatch_objects": 0,
-                "routing_missing_objects": 0,
-                "routing_fixed_denominator": False,
-            }
-        sheet = workbook["21_원문객체인벤토리"]
-        headers = [str(cell.value or "").strip() for cell in sheet[1]]
-        if "시트정합상태" not in headers:
-            return {
-                "routing_error_rate": None,
-                "routing_evaluable_objects": 0,
-                "routing_mismatch_objects": 0,
-                "routing_missing_objects": 0,
-                "routing_fixed_denominator": False,
-            }
-        status_index = headers.index("시트정합상태")
-        statuses = [
-            str(values[status_index] or "").strip()
-            for values in sheet.iter_rows(min_row=2, values_only=True)
-            if status_index < len(values)
-        ]
-        evaluable_statuses = {"일치", "오배치의심", "본문미연결"}
-        evaluable = sum(status in evaluable_statuses for status in statuses)
-        mismatches = sum(status in {"오배치의심", "본문미연결"} for status in statuses)
-        return {
-            "routing_error_rate": round(mismatches / evaluable, 4) if evaluable else None,
-            "routing_evaluable_objects": evaluable,
-            "routing_mismatch_objects": mismatches,
-            "routing_missing_objects": 0,
-            "routing_fixed_denominator": False,
-        }
-    finally:
-        workbook.close()
-
-
-def _visual_metrics(
-    dataset: EvaluationDataset,
-    output_path: Path,
-    source_path: Path,
-    report_dir: Path,
-) -> tuple[dict[str, Any], dict[str, str]]:
-    if dataset.visual_inventory_path is None:
-        return {
-            "object_recall": None,
-            "object_expected": 0,
-            "object_recorded": 0,
-        }, {}
-    reports = run_audit(AuditPaths(
-        inventory=dataset.visual_inventory_path,
-        pipeline_output=output_path,
-        source_pdf=source_path,
-        report_dir=report_dir / "visual",
-    ))
-    payload = json.loads(reports.json_path.read_text(encoding="utf-8"))
-    expected = int(payload.get("expected_rows", 0) or 0)
-    recorded = int(payload.get("recorded_rows", 0) or 0)
-    audit_metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
-    return {
-        "object_recall": round(recorded / expected, 4) if expected else None,
-        "object_expected": expected,
-        "object_recorded": recorded,
-        "visual_fixed_denominator": bool(audit_metrics.get("fixed_denominator")),
-        "visual_triage_evaluable_objects": int(
-            audit_metrics.get("triage_evaluable_objects", 0) or 0
-        ),
-        "visual_triage_missed_objects": int(
-            audit_metrics.get("triage_missed_objects", 0) or 0
-        ),
-        "visual_triage_miss_rate": round(
-            float(audit_metrics.get("triage_miss_rate", 0.0) or 0.0), 4
-        ),
-        "visual_vision_recall": round(
-            float(audit_metrics.get("vision_recall", 0.0) or 0.0), 4
-        ),
-        "visual_evidence_unresolved_rate": round(
-            float(audit_metrics.get("evidence_unresolved_rate", 0.0) or 0.0), 4
-        ),
-        "visual_negative_specificity": round(
-            float(audit_metrics.get("negative_specificity", 0.0) or 0.0), 4
-        ),
-    }, {
-        "visual_audit_json": str(reports.json_path),
-        "visual_audit_markdown": str(reports.markdown),
-    }
-
-
-def _safe_label(value: str) -> str:
-    return re.sub(r"[^0-9A-Za-z가-힣_.-]+", "_", value).strip("_") or "evaluation"
-
-
-def _routing_metrics(
-    dataset: EvaluationDataset,
-    output_path: Path,
-    report_dir: Path,
-) -> tuple[dict[str, Any], dict[str, str]]:
-    if dataset.routing_inventory_path is None:
-        return routing_metrics_from_workbook(output_path), {}
-    metrics, details = evaluate_fixed_routing_inventory(
-        output_path,
-        dataset.routing_inventory_path,
-    )
-    payload = {
-        "schema_version": 1,
-        "dataset_id": dataset.dataset_id,
-        "routing_inventory": str(dataset.routing_inventory_path),
-        "metrics": metrics,
-        "objects": [detail.to_dict() for detail in details],
-    }
-    json_path = report_dir / "routing_fixed_inventory.json"
-    markdown_path = report_dir / "routing_fixed_inventory.md"
-    json_path.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
-        encoding="utf-8",
-    )
-    lines = [
-        f"# 고정 라우팅 평가: {dataset.dataset_id}",
-        "",
-        "| 객체ID | 페이지 | 허용 시트 | 연결 본문 시트 | 판정 |",
-        "|---|---:|---|---|---|",
-    ]
-    lines.extend(
-        "| {id} | {page} | {allowed} | {linked} | {status} |".format(
-            id=detail.item_id,
-            page=detail.page,
-            allowed=", ".join(detail.allowed_sheets),
-            linked=", ".join(detail.linked_body_sheets) or "-",
-            status=detail.status,
-        )
-        for detail in details
-    )
-    markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return metrics, {
-        "routing_evaluation_json": str(json_path),
-        "routing_evaluation_markdown": str(markdown_path),
-    }
-
-
-def _markdown(payload: dict[str, Any]) -> str:
-    metrics = payload["metrics"]
-
-    def ratio(key: str) -> str:
-        value = metrics.get(key)
-        return "-" if value is None else f"{float(value):.2%}"
-
-    lines = [
-        f"# 고정 평가 리포트: {payload['dataset_id']}",
-        "",
-        f"- 역할: `{payload['role']}`",
-        f"- 골든 검토 상태: `{payload['review_status']}`",
-        f"- 출력: `{payload['output']}`",
-        f"- 원문: `{payload['source']}`",
-        "",
-        "## 독립 지표",
-        "",
-        "| 지표 | 결과 | 분모 |",
-        "|---|---:|---:|",
-        f"| 셀 정확도 | {ratio('cell_accuracy')} | {metrics.get('cell_expected', 0)}셀 |",
-        f"| 객체 재현율 | {ratio('object_recall')} | {metrics.get('object_expected', 0)}개 |",
-        f"| 시각 Triage 누락률 | {ratio('visual_triage_miss_rate')} | "
-        f"{metrics.get('visual_triage_evaluable_objects', 0)}개 |",
-        f"| 시각 판독 재현율 | {ratio('visual_vision_recall')} | 고정 시각 분모 |",
-        f"| 시각 근거 미결정률 | {ratio('visual_evidence_unresolved_rate')} | 고정 시각 분모 |",
-        f"| 시각 음성 특이도 | {ratio('visual_negative_specificity')} | 고정 음성 분모 |",
-        f"| 라우팅 오류율 | {ratio('routing_error_rate')} | {metrics.get('routing_evaluable_objects', 0)}개 |",
-        f"| 행 리콜 | {ratio('row_recall')} | {metrics.get('golden_rows', 0)}행 |",
-        f"| 행 정밀도 | {ratio('row_precision')} | {metrics.get('output_rows', 0)}행 |",
-        "",
-        "셀 정확도는 골든에 값이 있으나 출력에서 비어 있는 셀도 오답으로 계산합니다. "
-        "객체 재현율은 사람 확정 시각요소 인벤토리를 분모로 사용합니다. "
-        "라우팅 인벤토리가 등록된 데이터셋은 미추출 객체를 포함한 고정 분모를, "
-        "미등록 문서는 운영 객체의 동적 지표를 사용합니다.",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-def evaluate_benchmark(
-    output_path: str | Path,
-    source_path: str | Path,
-    *,
-    manifest_path: str | Path,
-    dataset_id: str | None = None,
-    allow_draft: bool = False,
-    allow_holdout: bool = False,
-    report_dir: str | Path | None = None,
-) -> BenchmarkEvaluationResult:
-    output = Path(output_path).expanduser().resolve()
-    source = Path(source_path).expanduser().resolve()
-    manifest = Path(manifest_path).expanduser().resolve()
-    datasets = load_evaluation_datasets(manifest)
-    dataset = select_evaluation_dataset(
-        datasets,
-        source,
-        dataset_id=dataset_id,
-        allow_holdout=allow_holdout,
-    )
-    verify_evaluation_contract(dataset, source, allow_draft=allow_draft)
-    if not output.exists():
-        raise EvaluationContractError(f"평가할 출력 파일이 없습니다: {output}")
-
-    target_dir = (
-        Path(report_dir).expanduser().resolve()
-        if report_dir is not None
-        else output.parent / f"{output.stem}_evaluation"
-    )
-    target_dir.mkdir(parents=True, exist_ok=True)
-    score = score_workbooks(
-        output,
-        dataset.golden_path,
-        report_dir=target_dir / "golden",
-        label=dataset.dataset_id,
-        write_json=True,
-    )
-    if score.get("형식오류"):
-        raise EvaluationContractError(
-            "골든셋 형식 오류: " + "; ".join(str(item) for item in score["형식오류"][:5])
-        )
-
-    cell_metrics = dict(score.get("독립평가지표") or {})
-    visual_metrics, visual_artifacts = _visual_metrics(
-        dataset, output, source, target_dir
-    )
-    routing_metrics, routing_artifacts = _routing_metrics(dataset, output, target_dir)
-    metrics = {**cell_metrics, **visual_metrics, **routing_metrics}
-    artifacts = {
-        "golden_score_json": str(score.get("리포트", {}).get("json", "")),
-        "golden_score_markdown": str(score.get("리포트", {}).get("md", "")),
-        **visual_artifacts,
-        **routing_artifacts,
-    }
-    payload = {
-        "schema_version": 1,
-        "dataset_id": dataset.dataset_id,
-        "role": dataset.role,
-        "review_status": dataset.review_status,
-        "locked": dataset.locked,
-        "evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "source": str(source),
-        "source_sha256": sha256_file(source),
-        "output": str(output),
-        "output_sha256": sha256_file(output),
-        "golden": str(dataset.golden_path),
-        "golden_sha256": dataset.golden_sha256,
-        "visual_inventory": (
-            str(dataset.visual_inventory_path)
-            if dataset.visual_inventory_path is not None
-            else None
-        ),
-        "routing_inventory": (
-            str(dataset.routing_inventory_path)
-            if dataset.routing_inventory_path is not None
-            else None
-        ),
-        "metrics": metrics,
-        "artifacts": artifacts,
-        "notes": dataset.notes,
-    }
-    label = _safe_label(dataset.dataset_id)
-    json_path = target_dir / f"benchmark_evaluation_{label}.json"
-    markdown_path = target_dir / f"benchmark_evaluation_{label}.md"
-    json_path.write_text(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            indent=2,
-            default=str,
-        ),
-        encoding="utf-8",
-    )
-    markdown_path.write_text(_markdown(payload), encoding="utf-8")
-    return BenchmarkEvaluationResult(
-        dataset=dataset,
-        metrics=metrics,
-        report_json=json_path,
-        report_markdown=markdown_path,
-        artifacts=artifacts,
-    )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        sha = document_hash(source_path)
+        datasets = [d for d in manifest["datasets"] if d.get("source_sha256") == sha and (not dataset_id or d.get("id") == dataset_id)]
+        if len(datasets) != 1:
+            return _unavailable("원문 SHA 일치 데이터셋 미등록 또는 중복 등록", mode, status=failure_status, dataset=dataset_id)
+        ds = datasets[0]
+        def unavailable(reason):
+            return _unavailable(reason, mode, status=failure_status, dataset=ds["id"])
+        if not ds.get("golden"):
+            return unavailable("등록된 골든 없음")
+        if not ds.get("locked"):
+            return unavailable("파일 해시/버전 잠금 미승인")
+        if ds.get("role") == "holdout" and not allow_holdout:
+            return unavailable("holdout 평가 명시 허용 필요")
+        if ds.get("role") not in {"development", "holdout"}:
+            return unavailable("알 수 없는 평가 데이터 역할")
+        if ds.get("review_status") != "approved" and not (ds.get("review_status") == "draft" and allow_draft):
+            return unavailable("골든 내용 검토 미승인 (draft는 --allow-draft-evaluation 필요)")
+        golden = (manifest_path.parent / ds["golden"]).resolve()
+        if not golden.is_file() or not ds.get("golden_sha256") or document_hash(golden) != ds["golden_sha256"]:
+            return unavailable("골든 파일 없음 또는 해시 불일치")
+        scope = ds.get("scope", {"kind": "document"})
+        if scope.get("kind") not in {"document", "partial"}:
+            return unavailable("지원하지 않는 평가 범위")
+        if scope.get("kind") == "partial" and not any(scope.get(k) for k in ("pages", "fields", "sheets")):
+            return unavailable("부분 골든의 공통 출력 범위 미지정")
+        if scope.get("kind", "document") == "document" and any(scope.get(k) for k in ("pages", "fields", "sheets")):
+            return unavailable("부분 필터가 있으면 kind=partial로 지정해야 함")
+        if scope.get("pages") and (not isinstance(scope["pages"], list) or any(type(p) is not int or p < 1 for p in scope["pages"])):
+            return unavailable("잘못된 평가 페이지 범위")
+        if scope.get("fields") and (not isinstance(scope["fields"], dict) or any(not isinstance(v, list) or not v for v in scope["fields"].values())):
+            return unavailable("범위 필드 필터는 필드명: [허용값] 형식이어야 함")
+        if scope.get("sheets"):
+            from utils.evaluation_v1.golden_score_contract import 데이터시트
+            if not isinstance(scope["sheets"], list) or set(scope["sheets"]) - set(데이터시트):
+                return unavailable("지원하지 않는 범위 시트")
+        result = score_v2(output_path, golden, scope=scope)
+        if result["format_errors"] or not result["counts"].get("cell_expected"):
+            return unavailable("골든 형식 오류 또는 범위 내 채점 가능 셀 없음: " + str(result["format_errors"]))
+        base = Path(report_base or output_path).with_suffix("")
+        base.parent.mkdir(parents=True, exist_ok=True)
+        detail_path = Path(str(base) + "_evaluation_v2_details.json")
+        save_json(detail_path, result)
+        result.pop("details")
+        legacy = {"status": "unassessed", "reason": "부분 범위는 v1 참조 채점 미지원"}
+        if scope.get("kind", "document") == "document":
+            from utils.evaluation_v1.score_against_golden import score_workbooks
+            legacy_result = score_workbooks(output_path, golden, report_dir=base.parent / (base.name + "_evaluation_v1"),
+                                            label="fixed-v1", write_json=True)
+            legacy = {"status": "evaluated", "contract_version": "golden-v1-frozen-20261026",
+                      "metrics": legacy_result["독립평가지표"], "reports": legacy_result["리포트"]}
+        result.update(status="evaluated", mode=mode, dataset_id=ds["id"], review_status=ds["review_status"],
+            model_accuracy_evaluated=True, source_sha256=sha, golden_sha256=ds["golden_sha256"],
+            manifest_path=str(manifest_path), manifest_sha256=document_hash(manifest_path),
+            excel_sha256=document_hash(output_path), legacy_v1=legacy,
+            details_path=str(detail_path), details_sha256=document_hash(detail_path))
+        result["elapsed_seconds"] = round(time.perf_counter() - started, 6)
+        result["implementation_sha256"] = {p.name: document_hash(p) for p in [Path(__file__), *sorted((ROOT / "utils/evaluation_v1").glob("*.py")), ROOT / "utils/evaluation_v1/headers.json", ROOT / "agents/organizer_agent.py"]}
+        evaluation_path = Path(str(base) + "_evaluation.json")
+        save_json(evaluation_path, result)
+        return {**result, "path": str(evaluation_path.resolve()), "sha256": document_hash(evaluation_path)}
+    except Exception as error:
+        return _unavailable(f"골든 평가 실패: {type(error).__name__}: {error}", mode, status="failed", dataset=dataset_id)
